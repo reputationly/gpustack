@@ -223,6 +223,9 @@ nav:
           - Load Images: cli-reference/load-images.md
           - Copy Images: cli-reference/copy-images.md
       - Environment Variables: environment-variables.md
+      - Secondary Development:
+          - Custom Build Pipeline: secondary-development-pipeline.md
+          - LightX2V Backend Design: lightx2v-backend-design.md
   - Inference Performance Lab:
       - Overview: performance-lab/overview.md
       - Optimizing Throughput:
