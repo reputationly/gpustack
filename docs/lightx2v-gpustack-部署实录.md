@@ -211,6 +211,10 @@ python -m lightx2v.server --model_cls z_image --task t2i --model_path {{model_pa
 | 10 | **aspect_ratio 转置 + 默认非 1:1** | config 写 1:1 仍出 928×1664 竖图 | aspect_ratio 按**请求体**传;要 16:9 横图填 `9:16`(runner 转置 bug),`1:1` 不受影响 |
 | 11 | **LightX2V 不自动建目录** | `save_result_path` 父目录不存在 → `FileNotFoundError`、任务 failed | **调用方(dispatcher/new-api)设置 save 路径前必须先 `mkdir -p` 父目录**;或引擎侧加 `os.makedirs(dirname, exist_ok=True)`(Phase A 先在调用方建) |
 | 12 | **worker 的 `-v` 会复制给推理容器** | 只在 UI「额外卷挂载」填了 `/nfs-models`,但推理容器里 `/nfs-output` 也在 | GPUStack 把 worker 容器的 `-v` 挂载复制给推理容器;所以 worker 命令里加 `-v /nfs-output:/nfs-output` 即可,不必重登 worker |
+| 13 | **多卡 Custom 后端 overcommit** | Wan `torchrun --nproc_per_node=4` 要 4 卡,但 GPUStack 估只需 15G→只想给 1 卡;Scheduling Auto 下手选 4 卡报「resource overcommit / Unable to find schedulable worker」 | **overcommit 只是警告,非阻塞**:Scheduling Mode 改 **Manual** → 手动勾该节点 4 张卡 → 直接 Save,GPUStack 照办(自定义后端无 TP 感知,靠手选卡) |
+| 14 | **Wan 被自动标成 LLM 类别** | Model Category=Auto 时 GPUStack 把 wan 猜成 LLM | 不影响出视频,只是标签;可在部署 Advanced 里显式选 video |
+| 15 | **配置内部路径 `/data` 在推理容器不存在** | 前团队 wan 配置内部写死 `/data/models/...`,GPUStack 推理容器只挂 `/nfs-models` 无 `/data` | 复制一份配置、把内部 ckpt 路径改成 `/nfs-models/...` 绝对路径(z_image/wan 都用 /nfs-models) |
+| 16 | **curl `-d` JSON 被粘贴换行截断** | 多行 `-d` 粘贴时字符串里混入换行 → JSON 坏 → 返回无 task_id | `-d '{...}'` 放**一行**;或先 `echo "$RESP"` 看原始返回排错 |
 
 ---
 
@@ -223,7 +227,8 @@ python -m lightx2v.server --model_cls z_image --task t2i --model_path {{model_pa
 1. ✅ **扩到 4 单卡副本**(已完成)——Replicas 1→4 + Spread,4 张 A100 各起一个实例(GPU 0/1/2/3 各 ~20G)。
 2. ✅ **`/nfs-output` 挂进推理容器**(已完成)——worker `-v /nfs-output` 已复制给推理容器,产物落 `/nfs-output/t2i-z_image/年月日/user/task.png`(调用方需先 `mkdir -p`,见坑#11)。
 3. ✅ **Generic Proxy 正式路由 + 负载均衡**(已完成)——见下。
-4. 后续:Wan2.2 视频、new-api 对接、238 私有 registry、前端体验区、dispatcher(轮询亲和/背压)。
+4. ✅ **Wan2.2 T2V(int8 4卡)第二节点部署**(已完成)——见 §12。
+5. 后续:new-api 对接、238 私有 registry、前端体验区、dispatcher(轮询亲和/背压)、Wan i2v/flf2v/s2v 与 720p 长视频。
 
 ### #2 Generic Proxy 访问方式(实测)
 - 路径:`http://<server>/model/proxy/<route_id>/<原生路径>`。本例 route_id=1(在 **Model Service → Routes** 看),提交 = `http://10.0.0.238/model/proxy/1/v1/tasks/image/`。
@@ -231,3 +236,32 @@ python -m lightx2v.server --model_cls z_image --task t2i --model_path {{model_pa
 - 路由:body 里 `"model":"z-image"` 或 Header `X-GPUStack-Model: z-image`(route_id 已绑定,双保险);UI 模板的 `n/size/response_format` 是 OpenAI 格式,**LightX2V 不认,要用它的原生 body**(prompt/save_result_path/...)。
 - **实测**:8 个并发提交经网关 → GPUStack 轮询分发给 4 个实例并行 → 8 张图同时落 NFS(~16s),4 张 A100 都被点亮。这就是报告 4×单卡 0.53 img/s 的来源。
 - **⚠️ 亲和限制**:proxy 轮询负载均衡,而 LightX2V 任务状态是**各实例进程内存态**——`GET /v1/tasks/{id}/status` 经 proxy 可能被打到别的实例查不到。生产取状态需 **dispatcher(§6)** 绑 task→实例;但**成品落 NFS(save_result_path)后 new-api 直接读文件**,简单场景不必轮询,已绕开该问题。
+
+---
+
+## 12. 第二模型:Wan2.2 T2V(int8 4 卡,第二节点)
+
+设计里**每节点 z_image / wan 二选一**。加一台 A100 节点 `dev-gpustack-a100-0002`(`10.0.0.109`)专跑 Wan,163 继续跑 z-image。
+
+### 12.1 新节点 onboarding(零下载复用)
+和 §1–5 完全一样,但镜像**全从 NFS load,不碰 ACR/quay**——这是"新节点秒复用"的兑现:
+- Docker + toolkit + `nfs-common`(apt);挂同一套 SFS(fstab 直接拷)+ 软链 `/data`、`/nfs-data` → `/nfs-models/wuhanjisuan894`。
+- **引擎镜像**:`docker load -i /nfs-output/_transfer/lightx2v-arm64.tar`(§6 存的 tar 还在,直接 load)。
+- **gpustack 镜像**:从 ACR 拉一次 `crpi-.../reputationly/gpustack:latest`(7G,稳)→ retag `quay.io/gpustack/gpustack:v2.2.0`;并**也 `docker save` 到 NFS**(`gpustack-arm64.tar`,1.6G),以后新节点两个镜像全 load,彻底零下载。
+- 加 worker:**复用 a100-cluster 的同一个 `GPUSTACK_TOKEN`**(注册令牌可加多 worker),只改 `--worker-ip 10.0.0.109`。worker 日志出现 `lightx2v-custom` 说明 Custom 后端是**集群级、新 worker 自动就有**。
+
+### 12.2 Wan 标定(实验报告 docs/Wan2.2-I2V-实验测试报告.md)
+- **生产最优 = int8 4 卡 ulysses**;int8 单卡能跑但慢(A100 无 INT8 算力,价值是省显存);**bf16 多卡必 CPU OOM**(4 rank ×(57G+11G)=276G>256G)→ 想多卡必须 int8。
+- 配置:`model_cls=wan2.2_moe`、`task=t2v`、`int8-torchao`、`self/cross_attn=flash_attn2`(Wan 用 flash_attn2,非 sage_attn2)、`rope_type=torch`、`boundary=0.875`(MoE 双专家 high/low)、`seq_p_size=4 ulysses`、`infer_steps=4`、帧=4n+1。
+- 分辨率:480p 可长视频(15s+),720p 天花板 161 帧(10s)。实测本机 4 卡加载 ~62s、720p/81帧生成 ~60s,4 卡 95-99% 满载 ~35G。
+- 配置文件见 `docs/configs/wan_t2v_int8_4card.json`(路径已改 `/nfs-models`),放到 `/nfs-models/wuhanjisuan894/lightx2v_configs/`。
+
+### 12.3 注册 wan-custom 后端 + 部署
+- 后端 `wan-custom`(同 z_image 的填法),**Execution Command 用 torchrun**:
+  ```
+  torchrun --nproc_per_node=4 --master_port=29524 -m lightx2v.server --model_cls wan2.2_moe --task t2v --model_path {{model_path}} --config_json /nfs-models/wuhanjisuan894/lightx2v_configs/wan_t2v_int8_4card.json --host 0.0.0.0 --port {{port}}
+  ```
+- 部署:Model Path `/nfs-models/wuhanjisuan894/models/Wan-AI/Wan2.2-T2V-A14B`、Backend `wan`、Replicas 1、**Scheduling Mode = Manual → 手动勾 0002 的 4 张卡**(overcommit 警告非阻塞,见坑#13)、Enable Generic Proxy。
+- 结果:torchrun 拉起 4 rank、`device_mesh(seq_p=4)`、health 200 → Running;`POST /v1/tasks/video/`(帧 4n+1)出 720p h264 mp4,4 卡满载。
+
+**至此:z-image(163,4×单卡)+ wan-t2v(0002,1×4卡)两模型同集群生产就绪。**
