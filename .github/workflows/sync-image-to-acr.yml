@@ -1,0 +1,44 @@
+name: Sync GPUStack image to ACR
+
+# 把 GPUStack 镜像(多架构 amd64+arm64)同步到内网阿里云 ACR,供 server/worker 快速拉取。
+#
+# 现阶段:纯镜像镜像化(官方 quay.io -> ACR)。GitHub runner 能高速连 quay,
+# skopeo --all 一次性把多架构 manifest 完整搬进 ACR。
+#
+# TODO(Phase A 代码落地后):改为基于官方基础层叠加我们改动的文件再推——
+#   见 pack/Dockerfile.acr;届时把本 job 换成 docker/build-push-action 的
+#   多架构矩阵(amd64 on ubuntu-latest / arm64 on ubuntu-24.04-arm,参照
+#   new-api 的 .github/workflows/docker-build.yml)。
+#
+# 需要在仓库 Settings → Secrets 配置(与 new-api 同名):
+#   ACR_REGISTRY  例: crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com
+#   ACR_USERNAME  ACR 账号
+#   ACR_PASSWORD  ACR 密码
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: '源镜像(含 tag)'
+        default: 'quay.io/gpustack/gpustack:latest'
+        required: true
+      dest_tag:
+        description: 'ACR 目标 tag'
+        default: 'latest'
+        required: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install skopeo
+        run: sudo apt-get update && sudo apt-get install -y skopeo
+
+      - name: Sync (all arches) quay -> ACR
+        run: |
+          set -euo pipefail
+          skopeo copy --all --retry-times 5 \
+            --dest-creds "${{ secrets.ACR_USERNAME }}:${{ secrets.ACR_PASSWORD }}" \
+            "docker://${{ github.event.inputs.source }}" \
+            "docker://${{ secrets.ACR_REGISTRY }}/reputationly/gpustack:${{ github.event.inputs.dest_tag }}"
+          echo "Synced to ${{ secrets.ACR_REGISTRY }}/reputationly/gpustack:${{ github.event.inputs.dest_tag }}"
