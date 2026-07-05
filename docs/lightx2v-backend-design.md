@@ -25,6 +25,21 @@
 
 ---
 
+## 0.1 实现状态(2026-07-03 更新)
+
+**new-api 侧 OBS 媒体存储已实现并上线。** 本文中所有"new-api 需新建 / 无对象存储 / day-one"的表述以此节为准更新(下文历史描述保留作设计依据):
+
+- **设计与实现**:见 new-api 仓 `docs/media-storage-obs-design.md`(v1.4)。
+- **已落地能力**:MediaStore(S3 兼容 OBS,AK/SK 加密入库 + 环境变量优先,presigned GET,§7.2 同款对象键)· `nfs_path` 读盘上传(自建 GPUStack 成品)· 第三方上游 URL 下载重传(统一入库,§7.8)· `obs://` 占位符落库、序列化层实时签名(永不落库)· 7 天生命周期(HCSO 桶级规则)· 桶用量监控/告警。
+- **渠道形态**:落地为 **GPUStackPlus 渠道(ChannelType=59)**——视频走任务子系统 `TaskAdaptor`(轮询 15s)、图片走同步 relay;成品统一落 OBS、对外只发签名 URL。§6.9/§7.8 早先"仿 sora channel"的设想即由此实现。
+- **交付路径(方案 B 落地)**:new-api 提交时拼含 `user_id` 的 `save_result_path`(§7.2 约定)并 `mkdir` 父目录(BMS **读写**挂载 SFS),上游据此写文件;完成后读 `nfs_path` → 上传 OBS → presigned。建目录由 new-api 做,不违背"SFS 对计算节点只读"设计。
+- **生产部署**:BMS `bms-newapi` 已挂 `100.125.40.2:/share-output → /nfs-output`(rw,`_netdev,nofail`);OBS 桶 `maas-obs-output`(endpoint `obs.cn-central-221.ovaijisuan.com`,region `cn-central-221`,私有 + 7 天生命周期);后台已启用并通过 PutObject/DeleteObject 连通性校验;图片生成/复制/下载已验证。
+- **一处安全修复**:隔离环境下 OBS 内网域名解析到 `100.64/10`(CGNAT)被通用 SSRF 误判私网 → 改为 validator 级 host 白名单精准放行(仅放松"我方 OBS 域名解析到私网"这一条,scheme/端口/黑白名单仍强制)。
+
+> GPUStack 侧(launcher / dispatcher / 中央队列)不在本次更新范围,仍以下文设计为准。
+
+---
+
 ## 1. 背景与目标
 
 把 LightX2V 接入 GPUStack,使其作为**可调度的推理后端**。硬件:每节点 **4×A100 40GB(鲲鹏 ARM,无 NVLink)**;**现 4 节点(16 卡),未来可达 300 节点(1200 卡)**(扩展性见 §6.6)。先做**生图(Z-Image)**,再做**生视频(Wan2.2-I2V)**,后续扩展同框架其它模型。要支持:
@@ -432,7 +447,7 @@ NFS 无对象生命周期,需自管。Janitor 三层组合(server 挂 RW NFS,本
 
 - 效果:**无论结果来自哪个上游,统一落进我们的 OBS、用统一路径**——可控、不依赖第三方易失链接、下载体验一致。GPUStack **不再是特例**,只是"读取方式最优(NFS 直读)"的一个上游。
 - 路径字段 new-api 都有:功能=task action、模型名、`user_id=Task.UserId`、task_id → 直接拼约定路径。
-- **new-api 需新建**(day-one,§2.4 核验其当前无对象存储):OBS 存储模块(AK/SK、多段上传、presigned、生命周期)+ master 节点挂 RW NFS。
+- **new-api OBS 存储模块已实现并上线(2026-07-03,见 §0.1 与 new-api 仓 `docs/media-storage-obs-design.md`)**:AK/SK、上传、presigned、生命周期均已落地;master(BMS)已读写挂载 RW NFS。§2.4 "无对象存储"为 2026-06 核验快照,已被此实现取代。
 
 ---
 
@@ -562,8 +577,8 @@ NFS 无对象生命周期,需自管。Janitor 三层组合(server 挂 RW NFS,本
 - **new-api ↔ GPUStack 不改、用现状**:视频轮询 **15s**(`task_polling.go:93`)、图片同步无延迟。
 - **GPUStack ↔ runner**:**Phase 1 用 A 轮询**(默认 **~2s**,可配;零改 LightX2V、复用 `/v1/tasks/{id}/status`),**性能需要时再升 B 推送**(§6.4)。
 
-**存储职责重划(已定,2026-06-30)**
-- **GPUStack 只写 NFS、状态返回 `nfs_path`(内网,不做可见性过滤);OBS 全部能力移入 new-api**(读 NFS→多段上传→presigned→生命周期,§7.3/§7.4/§7.8)。
+**存储职责重划(已定,2026-06-30;new-api 侧已上线,2026-07-03,见 §0.1)**
+- **GPUStack 只写 NFS、状态返回 `nfs_path`(内网,不做可见性过滤);OBS 全部能力移入 new-api**(读 NFS→多段上传→presigned→生命周期,§7.3/§7.4/§7.8)。**new-api 侧已实现并生产上线**(GPUStackPlus 渠道 + MediaStore 模块 + BMS 挂载 SFS)。
 - GPUStack 保 OpenAI 兼容:`/content` 从 NFS 流式、图片同步回 b64;`is_final` 概念从 GPUStack 删除(new-api 决定发布)。
 - 连带:§7.5 GPUStack 存储页仅剩 NFS;§7.6 Janitor 弃"OBS 已传"门控、改**最小年龄保护(<1h 不删)**;§6.4 方案 B 瘦身为纯推送;new-api master 节点挂 RW NFS(BMS 与 SFS 同 VPC,已确认)。
 
