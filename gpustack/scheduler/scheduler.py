@@ -29,6 +29,9 @@ from gpustack.policies.candidate_selectors import (
 from gpustack.policies.candidate_selectors.custom_backend_resource_fit_selector import (
     CustomBackendResourceFitSelector,
 )
+from gpustack.policies.candidate_selectors.lightx2v_resource_fit_selector import (
+    LightX2VResourceFitSelector,
+)
 from gpustack.policies.utils import ListMessageBuilder, should_skip_gpu_count_check
 from gpustack.policies.worker_filters.backend_framework_filter import (
     BackendFrameworkFilter,
@@ -458,6 +461,10 @@ async def find_candidate(
             candidates_selector = SGLangResourceFitSelector(
                 config, model, model_instances
             )
+        elif model.backend == BackendEnum.LIGHTX2V:
+            candidates_selector = LightX2VResourceFitSelector(
+                config, model, model_instances
+            )
         else:
             candidates_selector = CustomBackendResourceFitSelector(
                 config, model, model_instances
@@ -673,6 +680,16 @@ async def evaluate_pretrained_config(
     Returns:
         True if the model's categories are updated, False otherwise.
     """
+    # 0) LightX2V is a first-class built-in engine with a fixed profile and no
+    # standard HF architecture (z_image / wan). Skip pretrained-config detection
+    # entirely — loading a HF config would error and mis-tag the model as LLM.
+    # Categories are declared explicitly at deploy time (image for z_image,
+    # video for wan); default to video if unset so it never falls through to LLM.
+    if model.backend == BackendEnum.LIGHTX2V:
+        categories_modified = set_model_categories(model, CategoryEnum.VIDEO)
+        gpus_per_replica_modified = set_model_gpus_per_replica(model)
+        return categories_modified or gpus_per_replica_modified
+
     # 1) try to evaluate as diffusion model
     try:
         is_image_category = await evaluate_diffusion_model(model, workers=workers)

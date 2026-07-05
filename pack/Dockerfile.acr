@@ -1,0 +1,43 @@
+# Fast overlay image: take the official/ACR GPUStack image and lay our changed
+# Python files on top of the installed gpustack package. No CUDA/Higress rebuild
+# — builds in seconds — for iterating on the LightX2V built-in backend before a
+# full `make package`.
+#
+# Only the files changed by M1–M3 are copied. Keep this list in sync when more
+# files change. DB-schema/migration changes (M4) are NOT covered here — those
+# need a real `make package` + Alembic migration.
+#
+# Build (from repo root) and push to ACR:
+#   docker build -f pack/Dockerfile.acr \
+#     --build-arg BASE_IMAGE=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:latest \
+#     -t crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:lx2v-dev .
+#   docker push crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:lx2v-dev
+#
+# NOTE on arch: server=x86, compute worker=arm64. This overlay is arch-agnostic
+# (pure .py), but build it for each arch you deploy to (or build multi-arch with
+# buildx) so the base layers match the target node.
+
+ARG BASE_IMAGE=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:latest
+FROM ${BASE_IMAGE}
+
+# Stage the changed files, preserving their package-relative paths.
+COPY gpustack/schemas/models.py                                              /tmp/lx2v-overlay/schemas/models.py
+COPY gpustack/schemas/inference_backend.py                                   /tmp/lx2v-overlay/schemas/inference_backend.py
+COPY gpustack/worker/backends/lightx2v.py                                    /tmp/lx2v-overlay/worker/backends/lightx2v.py
+COPY gpustack/worker/serve_manager.py                                        /tmp/lx2v-overlay/worker/serve_manager.py
+COPY gpustack/worker/model_meta.py                                           /tmp/lx2v-overlay/worker/model_meta.py
+COPY gpustack/policies/candidate_selectors/lightx2v_resource_fit_selector.py /tmp/lx2v-overlay/policies/candidate_selectors/lightx2v_resource_fit_selector.py
+COPY gpustack/scheduler/scheduler.py                                         /tmp/lx2v-overlay/scheduler/scheduler.py
+
+# Copy them onto the installed gpustack package (path detected at build time),
+# then byte-compile the two new modules to fail fast on any import/syntax error.
+RUN set -eux; \
+    GP_DIR="$(python3 -c 'import gpustack, os; print(os.path.dirname(gpustack.__file__))')"; \
+    cp -rv /tmp/lx2v-overlay/. "${GP_DIR}/"; \
+    rm -rf /tmp/lx2v-overlay; \
+    python3 -m py_compile \
+        "${GP_DIR}/worker/backends/lightx2v.py" \
+        "${GP_DIR}/policies/candidate_selectors/lightx2v_resource_fit_selector.py" \
+        "${GP_DIR}/schemas/inference_backend.py" \
+        "${GP_DIR}/scheduler/scheduler.py"; \
+    python3 -c "from gpustack.schemas.models import BackendEnum, CategoryEnum; assert BackendEnum.LIGHTX2V and CategoryEnum.VIDEO; print('lx2v overlay OK')"

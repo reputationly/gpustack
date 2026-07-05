@@ -42,6 +42,7 @@ from gpustack.worker.backends.sglang import SGLangServer
 from gpustack.utils.command import resolve_executor_backend
 from gpustack.worker.backends.vllm import VLLMServer
 from gpustack.worker.backends.vox_box import VoxBoxServer
+from gpustack.worker.backends.lightx2v import LightX2VServer
 from gpustack.worker.backends.custom import CustomServer
 from gpustack.routes.worker.logs import (
     extract_container_restart_count,
@@ -78,6 +79,7 @@ _SERVER_CLASS_MAPPING = {
     BackendEnum.SGLANG: SGLangServer,
     BackendEnum.VOX_BOX: VoxBoxServer,
     BackendEnum.ASCEND_MINDIE: AscendMindIEServer,
+    BackendEnum.LIGHTX2V: LightX2VServer,
 }
 
 
@@ -1610,6 +1612,7 @@ def _get_inference_endpoint_and_payload(model: Model) -> tuple[str, dict] | None
     """
     skip_categories = {
         CategoryEnum.IMAGE,
+        CategoryEnum.VIDEO,
         CategoryEnum.SPEECH_TO_TEXT,
         CategoryEnum.TEXT_TO_SPEECH,
         CategoryEnum.UNKNOWN,

@@ -371,6 +371,50 @@ def get_built_in_backend() -> List[InferenceBackend]:
     return [
         InferenceBackend(backend_name=BackendEnum.VLLM.value, is_built_in=True),
         InferenceBackend(backend_name=BackendEnum.SGLANG.value, is_built_in=True),
+        # LightX2V is a first-class built-in backend but is self-contained:
+        # its image comes from the explicit version_configs below (resolved via
+        # InferenceBackend.get_image_name -> base._resolve_image step 2), NOT
+        # from gpustack-runner. Because ``built_in_frameworks`` is left None,
+        # get_image_name returns this explicit image even for a BUILT_IN row.
+        # Swapping the engine image = editing this row (or the DB row via UI),
+        # so profile calibration never requires rebuilding the GPUStack image.
+        # The container entrypoint (gpustack-lx2v-launcher) is constructed in
+        # worker/backends/lightx2v.py; it occupies {{port}} and self-answers
+        # ``/ready`` (503 before warmup) so scheduling never routes to a
+        # still-loading instance.
+        InferenceBackend(
+            backend_name=BackendEnum.LIGHTX2V.value,
+            is_built_in=True,
+            default_version="1.0.0",
+            version_configs=VersionConfigDict(
+                root={
+                    # LightX2V arm64/A100 engine image (reputationly/LightX2V).
+                    # Floating tag so a rebuilt image that bakes in
+                    # gpustack-lx2v-launcher is picked up without editing this
+                    # row. Pin to a dated tag (…-YYYYMMDD-…) for reproducibility.
+                    # Images are distributed to workers via docker save/load, so
+                    # the loaded tag on the arm64 worker must match this string.
+                    #
+                    # custom_framework="cuda" makes BackendFrameworkFilter accept
+                    # cuda workers WITHOUT a gpustack-runner "lightx2v" service
+                    # runner (this backend is self-contained). It must be
+                    # custom_framework, NOT built_in_frameworks: get_image_name
+                    # returns "" for a BUILT_IN row whose version has
+                    # built_in_frameworks set, which would defeat the explicit
+                    # image_name above. A100 nodes report gpu.type == "cuda".
+                    "1.0.0": VersionConfig(
+                        image_name=(
+                            "crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com"
+                            "/reputationly/lightx2v:arm64-a100-latest"
+                        ),
+                        custom_framework="cuda",
+                    ),
+                }
+            ),
+            health_check_path="/ready",
+            parameter_format=ParameterFormatEnum.SPACE,
+            description="LightX2V video/image generation engine (first-class built-in backend).",
+        ),
         InferenceBackend(
             backend_name=BackendEnum.ASCEND_MINDIE.value, is_built_in=True
         ),

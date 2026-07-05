@@ -22,6 +22,10 @@ def get_meta_from_running_instance(
         # SGLang Diffusion does not provide metadata endpoints at the moment.
         return {}
 
+    if backend == BackendEnum.LIGHTX2V:
+        # LightX2V exposes an async task API behind the launcher, not /v1/models.
+        return {}
+
     meta_path = "/v1/models"
     if backend == BackendEnum.ASCEND_MINDIE:
         # Ref: https://www.hiascend.com/document/detail/zh/mindie/21RC2/mindieservice/servicedev/mindie_service0066.html

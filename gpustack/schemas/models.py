@@ -45,6 +45,7 @@ class CategoryEnum(str, Enum):
     LLM = "llm"
     EMBEDDING = "embedding"
     IMAGE = "image"
+    VIDEO = "video"
     RERANKER = "reranker"
     SPEECH_TO_TEXT = "speech_to_text"
     TEXT_TO_SPEECH = "text_to_speech"
@@ -61,6 +62,7 @@ class BackendEnum(str, Enum):
     VOX_BOX = "VoxBox"
     ASCEND_MINDIE = "MindIE"
     SGLANG = "SGLang"
+    LIGHTX2V = "LightX2V"
     CUSTOM = "Custom"
 
 
