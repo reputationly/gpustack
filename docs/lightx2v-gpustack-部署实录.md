@@ -3,6 +3,8 @@
 > 记录 2026-07-02 首套环境从零到「Z-Image 在 GPUStack 里出图」的完整操作步骤与踩坑。
 > 配套设计见 [`lightx2v-backend-design.md`](lightx2v-backend-design.md)。
 > 一句话结论:**LightX2V 以 GPUStack Custom 后端接入,单卡 bf16 跑 Z-Image,全链路闭环成功。**
+>
+> ⚠️ **§1–§16 是 Custom 后端首套流程(2026-07-02)。后续已升级为「内置一等公民后端」——出包 + 部署新流程见 [§17](#17-内置后端化部署2026-07-05取代-custom-后端)(2026-07-05,已真机验证)。新部署走 §17。**
 
 ---
 
@@ -229,6 +231,101 @@ python -m lightx2v.server --model_cls z_image --task t2i --model_path {{model_pa
 3. ✅ **Generic Proxy 正式路由 + 负载均衡**(已完成)——见下。
 4. ✅ **Wan2.2 T2V(int8 4卡)第二节点部署**(已完成)——见 §12。
 5. 后续:new-api 对接、238 私有 registry、前端体验区、dispatcher(轮询亲和/背压)、Wan i2v/flf2v/s2v 与 720p 长视频。
+
+---
+
+# 17. 内置后端化部署(2026-07-05,取代 Custom 后端)
+
+> 上面 §1–§16 是 **Custom 后端**首套流程。本节记录把 LightX2V 做成 **GPUStack 内置一等公民后端**(`BackendEnum.LIGHTX2V`)后的**新出包 + 部署流程**,已在 238/163 真机端到端验证:z_image 单实例 RUNNING + curl 出图 2.3MB PNG。
+> 设计与实现见 [`lightx2v-builtin-backend-design`](lightx2v-builtin-backend-plan.md)、[`lightx2v-backend-design.md`](lightx2v-backend-design.md);launcher 源在 LightX2V 仓 `deploy/gpustack-lx2v-launcher/`。
+
+## 17.1 和 Custom 流程的核心差异
+
+| | Custom 后端(§9) | 内置后端(本节) |
+|---|---|---|
+| 后端 | UI 注册 Custom + 填 Execution Command | **Backend 直接选 `LightX2V`**(内置,零注册) |
+| 引擎启动 | GPUStack run_command 里写 `python -m lightx2v.server ...` | 镜像内 **`gpustack-lx2v-launcher`** 承载(数 GPU→选 profile→torchrun/server→占端口自答 `/ready`) |
+| profile/config | 部署时手填 `--config_json` | **镜像内 `profiles.yaml`** 按 (model_cls, GPU 数) 自动选,配置进镜像 |
+| 挂载 | UI「额外卷挂载」/ worker `-v` 复制 | worker `-e GPUSTACK_EXTRA_MOUNTS=...`(非 mirrored)或 mirrored 自动复制 worker 挂载 |
+| 健康检查 | `/health` | **`/ready`**(launcher 自答,预热前 503、后 200) |
+
+## 17.2 出包(两个镜像,都走 CI,不用手动 docker build)
+
+**① LightX2V 引擎镜像(含 launcher)** —— 在 `reputationly/LightX2V` 仓:
+- GitHub → Actions → **"Build ARM64 Docker Image"** → Run workflow(`Dockerfile_aarch64_app`,base 层不变、只叠 app 代码)。
+- 产物 `crpi-....../reputationly/lightx2v:arm64-a100-latest`(+ 带日期 sha 的不可变 tag)。launcher 在镜像 `/usr/local/bin/gpustack-lx2v-launcher`。
+
+**② GPUStack 叠加镜像(M1–M3 改动)** —— 在 `reputationly/gpustack` 仓:
+- GitHub → Actions → **"Pack GPUStack overlay to ACR"** → Run workflow(`pack/Dockerfile.acr`,把改的几个 `.py` 叠在官方 GPUStack 镜像上,**多架构 amd64+arm64、秒级、不重建 CUDA/Higress**)。
+- 产物 `crpi-....../reputationly/gpustack:lx2v-dev`(浮动)+ `gpustack:lx2v-<日期>-<sha>`(不可变)。
+- 复用 secrets `ACR_REGISTRY/USERNAME/PASSWORD`(同 `sync-image-to-acr.yml`)。
+
+## 17.3 部署
+
+**Server(238,x86)** —— 重装后需 `apt install docker.io` + 挂 NFS(§1/§3):
+```bash
+docker pull crpi-....../reputationly/gpustack:lx2v-dev
+docker run -d --name gpustack-server --restart unless-stopped -p 80:80 \
+  --volume gpustack-data:/var/lib/gpustack \
+  --volume /nfs-output:/nfs-output \
+  crpi-....../reputationly/gpustack:lx2v-dev \
+  --system-default-container-registry quay.io
+docker exec gpustack-server cat /var/lib/gpustack/initial_admin_password
+```
+> 日志出现 `Init built-in backend LightX2V in database` = M1 生效。
+
+**Worker(163,arm64)** —— 未重装则已有 docker/nvidia/NFS,只需换新镜像:
+```bash
+# 新 gpustack(2.79G,163 直拉稳):
+docker pull crpi-....../reputationly/gpustack:lx2v-dev
+# 新引擎(29G,走 238→NFS→163 load,见 §6);load 后新 image ID 应≠旧的
+docker load -i /nfs-output/_transfer/lightx2v-arm64-launcher.tar
+```
+UI **Resources → Clusters → Add Cluster(Docker)** → **Add Worker**:Worker IP=`10.0.0.163`、其余默认 → 步骤4 生成命令里**只取 `GPUSTACK_TOKEN`**,其余用下面这条(改镜像/内网 URL/加 env):
+```bash
+docker run -d --name gpustack-worker \
+  -e "GPUSTACK_RUNTIME_DEPLOY_MIRRORED_NAME=gpustack-worker" \
+  -e "GPUSTACK_TOKEN=gpustack_xxxxx" \
+  -e "GPUSTACK_EXTRA_MOUNTS=/nfs-models,/nfs-output" \
+  --restart=unless-stopped --privileged --network=host \
+  --volume /var/run/docker.sock:/var/run/docker.sock \
+  --volume gpustack-data:/var/lib/gpustack \
+  --volume /nfs-models:/nfs-models --volume /nfs-output:/nfs-output \
+  --runtime nvidia \
+  crpi-....../reputationly/gpustack:lx2v-dev \
+  --server-url http://10.0.0.238 --worker-ip 10.0.0.163
+```
+> 挂载双保险:mirrored 模式(`MIRRORED_NAME` 存在)下靠 worker 的 `-v` 被复制到引擎容器;非 mirrored 下靠 `GPUSTACK_EXTRA_MOUNTS`(内置后端代码 `worker/backends/lightx2v.py` 从 **worker 进程 env** 读,不是 model env——安全边界)。两者互斥不重复。
+
+**部署 z_image**(Models → Deploy Model):
+
+| 字段 | 值 |
+|---|---|
+| Name | `z-image` |
+| Source | Local Path |
+| Model Path | `/nfs-models/wuhanjisuan894/models/Z-Image-Turbo` |
+| Cluster | 你建的 docker cluster |
+| **Backend** | **`LightX2V`**(内置,从默认 vLLM 改) |
+| Backend Version | `Auto`(解析到内置 1.0.0) |
+| Replicas | `1` |
+| Advanced → Model Category | `image` |
+
+Save 后:调度到 1 张空闲卡 → launcher 起引擎 → `/ready` 503→200 → **Running**。冒烟同 §8(curl `10.0.0.163:<实例端口>/v1/tasks/image/`,`save_result_path` 用 `/nfs-output/...`,先 `mkdir -p` 父目录)。实测:首张含预热 ~14.5s、稳态 ~7.6s、2.3MB PNG。
+
+## 17.4 新踩的坑(内置流程专属)
+
+| # | 坑 | 现象 | 修法 |
+|---|---|---|---|
+| 17-1 | **GPU 残留进程 OOM**(同坑#7,这次是裸进程) | 引擎加载到 text-encoder 时 `CUDA out of memory`,本进程只用 18.86G 但卡只剩 25MiB | `nvidia-smi` 看 Processes,找占卡的裸 `python` PID(实验残留)→ `kill -9 <PID>`;GPUStack **看不到非它管理的外部显存占用**,共享卡环境部署前务必清空。清完 Auto-Restart 自动重载成功 |
+| 17-2 | **runtime 版本 UI 提示** | 部署页提示 `highest supported GPU runtime version (cuda 12.8) does not meet requirements for backend LightX2V` | **非阻塞**——该检查(`evaluator.evaluate_runtime_version`)只被 `routes/model_evaluations` 的 UI 预检接口调用,**不在调度器主路径**,照常 Save 即可。永久消除见 gpustack 侧 `evaluator.py` 让 LightX2V 跳过 |
+| 17-3 | **sage 注意力不可用、回退 sdpa** | 日志一串 `sageattention not found`,但继续跑 | A100 镜像没编 sageattention,`attn_type=sage_attn2` 自动回退 torch_sdpa,**能跑**(见 Z-Image 报告 §5.1)。permanent:`profiles.yaml` 指 `z_image_a100_sdpa.json`(torch_sdpa,诚实) |
+| 17-4 | **Advanced 无 Image 字段** | 想用 model.image_name 绕过检查,但内置后端部署表单没有 image 字段 | 镜像由内置后端行的 `version_configs` 提供(`_resolve_image` 第 2 条),不需要 model 级 image;Category 用 Advanced 的 Model Category 选 |
+
+## 17.5 验证结论
+
+**内置化 Phase A(最短链路)真机验证通过**:GPUStack 内置识别 → profile selector 选 1 卡 → LightX2VServer 拉起引擎 → launcher 选 profile + `/ready` 门控 → 引擎从 `/nfs-models` 读模型、写 `/nfs-output` → 出图。launcher 的端口防撞(engine/metrics/torchrun-master 各唯一)、`/health` 就绪探测、Host 保留等均实测生效。
+
+**未收口(下个包带上)**:引擎 `profiles.yaml` sage→sdpa、gpustack `evaluator.py` 跳过 runtime 检查(当前靠回退 + UI 提示无害);wan int8-4card config 标定;M4 dispatcher + `/v1/videos` 门面;M5 UI 原生 video 体验区。
 
 ### #2 Generic Proxy 访问方式(实测)
 - 路径:`http://<server>/model/proxy/<route_id>/<原生路径>`。本例 route_id=1(在 **Model Service → Routes** 看),提交 = `http://10.0.0.238/model/proxy/1/v1/tasks/image/`。
