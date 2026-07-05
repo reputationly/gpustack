@@ -1,0 +1,84 @@
+name: Pack GPUStack overlay to ACR
+
+# Fast overlay image: lay our changed .py files on top of the official/ACR
+# GPUStack base image (pack/Dockerfile.acr) and push a multi-arch (amd64+arm64)
+# manifest to Aliyun ACR. NO CUDA/Higress rebuild — this is the fork build for
+# the LightX2V built-in backend changes, and completes the TODO left in
+# sync-image-to-acr.yml.
+#
+# amd64 image serves the x86 server node; arm64 image serves the A100 worker.
+# The overlay is pure .py, so both arches are built in one job via buildx+QEMU
+# (the only emulated step is a trivial py_compile). If QEMU ever misbehaves,
+# switch to a native matrix (amd64 on ubuntu-latest / arm64 on ubuntu-24.04-arm)
+# with push-by-digest + `docker buildx imagetools create` to merge.
+#
+# Secrets (repo Settings → Secrets, same names as sync-image-to-acr.yml):
+#   ACR_REGISTRY / ACR_USERNAME / ACR_PASSWORD
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_image:
+        description: 'Base GPUStack image (multi-arch, already in ACR)'
+        default: 'crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:latest'
+        required: true
+      dest_tag:
+        description: 'Floating ACR tag to publish'
+        default: 'lx2v-dev'
+        required: true
+
+env:
+  ACR_REGISTRY: crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com
+  ACR_REPO: crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute immutable tag
+        id: tags
+        run: |
+          echo "version=lx2v-$(date -u +%Y%m%d-%H%M)-$(git rev-parse --short=8 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Aliyun ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and push overlay (amd64 + arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: pack/Dockerfile.acr
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          build-args: |
+            BASE_IMAGE=${{ github.event.inputs.base_image }}
+          tags: |
+            ${{ env.ACR_REPO }}:${{ github.event.inputs.dest_tag }}
+            ${{ env.ACR_REPO }}:${{ steps.tags.outputs.version }}
+
+      - name: Summary
+        run: |
+          {
+            echo "### GPUStack overlay pushed to ACR"
+            echo ""
+            echo "- \`${ACR_REPO}:${{ github.event.inputs.dest_tag }}\` (floating)"
+            echo "- \`${ACR_REPO}:${{ steps.tags.outputs.version }}\` (immutable)"
+            echo ""
+            echo "Pull on each node: \`docker pull ${ACR_REPO}:${{ github.event.inputs.dest_tag }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          ACR_REPO: ${{ env.ACR_REPO }}
