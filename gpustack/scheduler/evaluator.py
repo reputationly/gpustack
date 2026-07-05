@@ -367,6 +367,12 @@ async def evaluate_runtime_version(
     if is_custom_backend(backend_name):
         return True, []
 
+    if backend_name == BackendEnum.LIGHTX2V.value:
+        # LightX2V is a self-contained built-in backend (explicit image, no
+        # gpustack-runner entry), so there is no runner runtime-version matrix
+        # to check against — same rationale as the custom-backend skip above.
+        return True, []
+
     if is_built_in_backend_custom_version(
         backend_name, model.backend_version, model.image_name
     ):
