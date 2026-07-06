@@ -34,6 +34,7 @@ COPY gpustack/worker/serve_manager.py                                        /tm
 COPY gpustack/worker/model_meta.py                                           /tmp/lx2v-overlay/worker/model_meta.py
 COPY gpustack/policies/candidate_selectors/lightx2v_resource_fit_selector.py /tmp/lx2v-overlay/policies/candidate_selectors/lightx2v_resource_fit_selector.py
 COPY gpustack/scheduler/scheduler.py                                         /tmp/lx2v-overlay/scheduler/scheduler.py
+COPY gpustack/scheduler/evaluator.py                                         /tmp/lx2v-overlay/scheduler/evaluator.py
 # --- M4/M5: async video facade + sweeper + janitor + migration + metering ---
 COPY gpustack/api/middlewares.py                                             /tmp/lx2v-overlay/api/middlewares.py
 COPY gpustack/config/config.py                                               /tmp/lx2v-overlay/config/config.py
