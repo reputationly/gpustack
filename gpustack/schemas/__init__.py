@@ -190,6 +190,10 @@ from gpustack.schemas.gpu_instances import (
     GPUInstancePublic,
     GPUInstancesPublic,
 )
+from gpustack.schemas.video_generation_task import (  # noqa: F401  table registration
+    VideoGenerationTask,
+    VideoTaskStateEnum,
+)
 
 __all__ = [
     "ApiKey",

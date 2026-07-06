@@ -212,6 +212,31 @@ flowchart TB
 
 ## 6. 异步任务 Dispatcher(队列 / 调度 / 限流 / 对外 API)
 
+### 6.0 收敛决策(2026-07-06,实测三仓队列后)—— 本节多数是 300 节点前瞻,当前规模砍到「薄门面」
+
+> 内置化 Phase A 真机验证通过后,实读 **LightX2V / GPUStack / new-api** 三仓队列实现,重新评估本节的「重 dispatcher」是否当前必需。结论:**大部分是 300 节点的前瞻设计,当前 4 节点规模是伪需求**,砍到「薄门面 + least-pending + 亲和映射 + 死亡重派」。M4 落地以本节为准(下文 §6.1–§6.9 保留作 300 节点扩展时的设计依据)。
+
+**三仓队列实测(代码为证)**:
+- **LightX2V 引擎**(`server/task_manager.py`):每实例**进程内 FIFO**,`active(pending+processing) ≥ max_queue_size`(GPUStack 启动设 **10**)→ 抛错 → 端点 catch 返 **HTTP 503**;有 processing lock → **一次只跑 1 个**(单卡串行)。
+- **GPUStack 网关/LB**(`http_proxy/strategies.py` + `routes/openai.py`):取 **RUNNING 实例** → **`RoundRobinStrategy`**(`itertools.cycle`,**负载盲,不看队列深度**)。`openai_model_prefixes` 含 `/images/generations`/`/images/edits`,**无 `/videos`、无 `/v1/tasks/*`**。
+- **new-api**(`service/task_polling.go`):relay 转发,视频建 `Task` + 后台 `FetchTask` **轮询 15s**(任务间 sleep 1s);**提交侧不自限并发**,靠上游 503 背压。
+
+**高并发实况(100 并发 z_image `/images/generations`)**:new-api 全转 → 网关轮询摊 4 实例 → 每实例收 10、**第 11 起 503** → **约 40 收、60 被 503** → 收下的串行(7.6s/张)。四个真问题:①轮询**负载盲**(往满实例灌、不均、提前 503);②~40 在飞即 503(客户端需处理);③**`/videos` 根本没路由**(视频进不来);④**实例死→进程内队列全丢**(new-api 轮询拿 "task not found",作业静默丢失)。
+
+**收敛后 M4 真正要做的**:
+| 组件 | 现状已覆盖 | 缺口 / 要做 | 判断 |
+|---|---|---|---|
+| 中央 PG 队列 + SKIP-LOCKED 主调度循环 | 引擎每实例队列 + 网关轮询 | — | **砍**:主路径提交时直派,引擎队列缓冲;300 节点再上 |
+| **least-pending LB**(`LeastPendingStrategy`) | round-robin(负载盲) | 选在飞最少的实例(数 M4a 表) | **做**:治问题① |
+| **`/v1/videos` 门面** | 网关不路由 `/videos` | 提交/轮询/`/content`(poll-on-GET,无后台轮询器) | **做**:治问题③ |
+| **亲和映射** | 无(轮询会串) | job_id→(实例,原生 id),M4a 表 | **做**:治问题①③ 的轮询串 |
+| **死亡重派** | 实例 Auto-Restart(但队列已丢) | 实例死→非终态任务标回 QUEUED + 极小 sweeper 重派 | **做**:治问题④ |
+| 集群级限流 429 | 引擎 503 + new-api | — | **砍**:new-api 见 503 自限流 1 分钟 |
+| 提交参数校验(§6.8) | 引擎自校 + aspect bug 已修 | — | **砍**:new-api 校 |
+| NFS Janitor(§7.6) | — | 清旧产物 | **推迟**:先 cron `find -mtime +7 -delete` |
+
+> 净结果:M4 = **M4a 表 + `LeastPendingStrategy` + `/v1/videos` 薄门面(亲和映射 + 死亡重派 sweeper)**。下文 §6.1 起的重方案(中央队列骨架 / 限流 / 参数校验 / completion-source B 推送)**留作 300 节点扩展依据,当前不实现**。
+
 ### 6.1 组件(均在 GPUStack 侧)
 
 | 组件 | 职责 | 复用 |
@@ -403,6 +428,8 @@ z_image 单权重无此复杂度(`z_image` 单目录)。int8 ckpt 由离线 `con
 作用域:先全局一套;路径 `user_id` 段做用户隔离。
 
 ### 7.6 NFS 生命周期(Janitor 组件,APScheduler 周期任务)
+
+> **已实现(2026-07-06)**:`gpustack/server/video_storage_janitor.py`,leader-only、10min 一轮,只碰文件系统 + DB(无 HTTP)。三层保护如下全部落地;Config 字段 `lightx2v_retention_days` / `lightx2v_storage_high_watermark` / `lightx2v_storage_low_watermark`(经 `/config` 与存储设置页可配)。取代早先「先 cron `find -mtime`」的过渡方案——cron 是纯时间型,做不到 ③ 容量水位驱逐(防写满)与 ② DB 状态门控(防误删在飞任务)。②的「最小年龄」以「跳过今天整天目录」粗粒度实现。
 
 NFS 无对象生命周期,需自管。Janitor 三层组合(server 挂 RW NFS,本就要为 `/content` 流式与图片 b64 读盘,顺带删):
 

@@ -40,6 +40,8 @@ from gpustack.routes import (
     benchmark_profiles,
     model_provider,
     rerank,
+    videos,
+    video_tasks,
     model_routes,
     grafana,
     prometheus,
@@ -148,6 +150,11 @@ v1_base_router.include_router(
 # Workers are visible to anyone who can see their cluster; mutations gated
 # by an explicit is_admin check inside each handler.
 v1_base_router.include_router(workers.router, prefix="/workers", tags=["Workers"])
+# LightX2V video-job management list (admin task panel). Owner-scoped inside the
+# handler. Distinct from the OpenAI-compatible /v1/videos facade (inference).
+v1_base_router.include_router(
+    video_tasks.router, prefix="/video-tasks", tags=["Video Tasks"]
+)
 
 cluster_client_router = APIRouter()
 cluster_client_router.add_api_route(
@@ -416,6 +423,15 @@ inference_router.include_router(
     rerank.router,
     prefix="/v1",
     tags=["Rerank"],
+)
+# LightX2V async generation facade (§6.0). Server-native (like rerank): it does
+# NFS I/O + least-pending selection + affinity bookkeeping that can't happen at
+# the gateway layer, so it is NOT added to openai_model_prefixes (that would
+# wire /videos to the direct-to-instance proxy and bypass the facade).
+inference_router.include_router(
+    videos.router,
+    prefix="/v1",
+    tags=["Video Generation"],
 )
 
 # Following routes should not check api scope as it is publicly accessible and used for authentication by external services.

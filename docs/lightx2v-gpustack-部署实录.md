@@ -116,16 +116,19 @@ docker run -d --name gpustack-worker \
 
 163 直拉 ACR 的大 lightx2v 镜像(29GB)会中途超时。改用 238 转运:
 
+中转目录放 **`/nfs-models/_transfer/`**(20T 权重盘,不放 1T 产出盘 `/nfs-output`:①容量 ②语义——镜像 tar 是引擎制品非"产出" ③避开 §17.6 的 output cron)。tar 是一次性物,**load 完即删**。
+
 ```bash
 # ① 238:x86 主机也能拉 arm64 变体
 IMG=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/lightx2v:arm64-a100-latest
 docker pull --platform linux/arm64 "$IMG"
 # ② 238:save 到 NFS —— 必须用 > 重定向,不能用 -o(见坑#5)
-mkdir -p /nfs-output/_transfer
-nohup sh -c "docker save '$IMG' > /nfs-output/_transfer/lightx2v-arm64.tar" &   # nohup 防断线
-# ③ 163:从 NFS load
-docker load -i /nfs-output/_transfer/lightx2v-arm64.tar
+mkdir -p /nfs-models/_transfer
+nohup sh -c "docker save '$IMG' > /nfs-models/_transfer/lightx2v-arm64.tar" &   # nohup 防断线
+# ③ 163:从 NFS load,load 完删 tar(一次性转运物)
+docker load -i /nfs-models/_transfer/lightx2v-arm64.tar
 docker images | grep lightx2v
+rm -f /nfs-models/_transfer/lightx2v-arm64.tar
 ```
 > 长期方案:238 上架私有 `registry:2`,各节点走内网拉,免 save/load。
 
@@ -205,7 +208,7 @@ python -m lightx2v.server --model_cls z_image --task t2i --model_path {{model_pa
 | 2 | **163 直拉大镜像不稳** | quay/ACR 拉 lightx2v 中途 `connection reset/timed out` | 238 拉 → `docker save` → NFS → 163 `docker load`(§6);长期上私有 registry |
 | 3 | **混合架构** | server x86 / worker ARM | GPUStack 原生支持;引擎镜像必须 arm64;238 拉 arm64 用 `docker pull --platform linux/arm64` |
 | 4 | **fstab 顺序坑** | 先跑 `umount + mount -a` 验证但没先写 fstab → NFS 被卸载没挂回 | 先写 fstab 行,再 `mount -a` |
-| 5 | **`docker save -o` 失败** | `-o file` 方式 `Exit 1`、文件不出现 | 改 **`docker save IMG > file`**(shell 立刻建文件、能看增长);配 `nohup` 防断线 |
+| 5 | **`docker save -o` 失败** | `-o file` 方式 `Exit 1`、文件不出现 | 改 **`docker save IMG > file`**(shell 立刻建文件、能看增长);配 `nohup` 防断线。**⚠️ 失败的 `-o` 会留一个隐藏半截文件 `.tmp-<名字><随机数>`(几 G),`ls` 不带 `-a` 看不到、但占空间且让 `rmdir` 报"目录非空"**——`ls -la` 找出来 `rm -f` 即可(实测在 `/nfs-output/_transfer` 挂了 4 天) |
 | 6 | **z_image 两个必崩项** | 默认 `flash_attn3`(Hopper 专属,A100 崩)、默认 rope `flashinfer`(镜像没装,`NoneType not callable`) | config 改 `attn_type=sage_attn2`、`rope_type=torch` |
 | 7 | **GPUStack 部署 OOM** | `CUDA out of memory`,但本进程只用 18G / 卡快满 | standalone 冒烟容器 `zimg-smoke` 没删,占着 GPU 0 ~21G。`docker rm -f zimg-smoke` 后 Auto-Restart 自动重载成功。**教训:standalone 验完必删容器** |
 | 8 | **env 填错字段** | 环境变量填进了「Default Execution Command」 | Execution Command 留空,env 放「Default Environment Variables」的 Add Variable |
@@ -279,7 +282,7 @@ docker exec gpustack-server cat /var/lib/gpustack/initial_admin_password
 # 新 gpustack(2.79G,163 直拉稳):
 docker pull crpi-....../reputationly/gpustack:lx2v-dev
 # 新引擎(29G,走 238→NFS→163 load,见 §6);load 后新 image ID 应≠旧的
-docker load -i /nfs-output/_transfer/lightx2v-arm64-launcher.tar
+docker load -i /nfs-models/_transfer/lightx2v-arm64-launcher.tar
 ```
 UI **Resources → Clusters → Add Cluster(Docker)** → **Add Worker**:Worker IP=`10.0.0.163`、其余默认 → 步骤4 生成命令里**只取 `GPUSTACK_TOKEN`**,其余用下面这条(改镜像/内网 URL/加 env):
 ```bash
@@ -325,7 +328,21 @@ Save 后:调度到 1 张空闲卡 → launcher 起引擎 → `/ready` 503→200 
 
 **内置化 Phase A(最短链路)真机验证通过**:GPUStack 内置识别 → profile selector 选 1 卡 → LightX2VServer 拉起引擎 → launcher 选 profile + `/ready` 门控 → 引擎从 `/nfs-models` 读模型、写 `/nfs-output` → 出图。launcher 的端口防撞(engine/metrics/torchrun-master 各唯一)、`/health` 就绪探测、Host 保留等均实测生效。
 
-**未收口(下个包带上)**:引擎 `profiles.yaml` sage→sdpa、gpustack `evaluator.py` 跳过 runtime 检查(当前靠回退 + UI 提示无害);wan int8-4card config 标定;M4 dispatcher + `/v1/videos` 门面;M5 UI 原生 video 体验区。
+**未收口(下个包带上)**:引擎 `profiles.yaml` sage→sdpa、gpustack `evaluator.py` 跳过 runtime 检查(当前靠回退 + UI 提示无害);wan int8-4card config 标定;M4 薄门面 + `/v1/videos`;M5 UI 原生 video 体验区。
+
+## 17.6 NFS 产物清理(cron,先于 Janitor 组件)
+
+产物短命(new-api 15s 内读走传 OBS),但 `/nfs-output` 不清迟早写满。**Janitor 组件推迟**(300 节点规模再做),当前用 cron 兜底。在挂了 `/nfs-output` RW 的 **238(manager)**上装(一个节点跑即可,`-delete` 幂等):
+
+```bash
+crontab -e
+# 每天 04:17 清 >7 天产物 + 空目录(错峰避整点):
+17 4 * * * find /nfs-output -mindepth 1 -type f -mtime +7 -delete 2>/dev/null
+23 4 * * * find /nfs-output -mindepth 1 -type d -empty -mtime +7 -delete 2>/dev/null
+```
+- `-mtime +7` 远超「最小年龄保护」(1h),安全;`-mindepth 1` 保护挂载根。
+- 干跑核对:`find /nfs-output -mindepth 1 -type f -mtime +7 | head`。
+> 注:引擎镜像 tar 已改放 `/nfs-models/_transfer/` 并 load 后即删(§6),不落 `/nfs-output`,故此 cron 不会碰到它,无需白名单。
 
 ### #2 Generic Proxy 访问方式(实测)
 - 路径:`http://<server>/model/proxy/<route_id>/<原生路径>`。本例 route_id=1(在 **Model Service → Routes** 看),提交 = `http://10.0.0.238/model/proxy/1/v1/tasks/image/`。
@@ -343,7 +360,7 @@ Save 后:调度到 1 张空闲卡 → launcher 起引擎 → `/ready` 503→200 
 ### 12.1 新节点 onboarding(零下载复用)
 和 §1–5 完全一样,但镜像**全从 NFS load,不碰 ACR/quay**——这是"新节点秒复用"的兑现:
 - Docker + toolkit + `nfs-common`(apt);挂同一套 SFS(fstab 直接拷)+ 软链 `/data`、`/nfs-data` → `/nfs-models/wuhanjisuan894`。
-- **引擎镜像**:`docker load -i /nfs-output/_transfer/lightx2v-arm64.tar`(§6 存的 tar 还在,直接 load)。
+- **引擎镜像**:`docker load -i /nfs-models/_transfer/lightx2v-arm64.tar`(§6 转运的 tar;load 完即删)。
 - **gpustack 镜像**:从 ACR 拉一次 `crpi-.../reputationly/gpustack:latest`(7G,稳)→ retag `quay.io/gpustack/gpustack:v2.2.0`;并**也 `docker save` 到 NFS**(`gpustack-arm64.tar`,1.6G),以后新节点两个镜像全 load,彻底零下载。
 - 加 worker:**复用 a100-cluster 的同一个 `GPUSTACK_TOKEN`**(注册令牌可加多 worker),只改 `--worker-ip 10.0.0.109`。worker 日志出现 `lightx2v-custom` 说明 Custom 后端是**集群级、新 worker 自动就有**。
 

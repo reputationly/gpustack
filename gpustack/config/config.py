@@ -165,6 +165,18 @@ class Config(WorkerConfig, BaseSettings):
     disable_openapi_docs: bool = False
     update_check_url: Optional[str] = None
     model_catalog_file: Optional[str] = None
+    # LightX2V shared RW NFS output root (§7.5). Overridable via the standard
+    # GPUSTACK_LIGHTX2V_OUTPUT_ROOT env var (BaseSettings env_prefix) and
+    # editable at runtime via /config (Storage Settings page).
+    lightx2v_output_root: str = "/nfs-output"
+    # Days to keep generated results before the in-server Janitor deletes the
+    # expired day-partition directories (§7.6). None/<=0 disables TTL cleanup.
+    lightx2v_retention_days: Optional[int] = 7
+    # Capacity-watermark eviction (§7.6): when the output filesystem usage rises
+    # above the high watermark, the Janitor evicts oldest-first down to the low
+    # watermark (fractions in [0, 1]). Guards against the NFS filling before TTL.
+    lightx2v_storage_high_watermark: Optional[float] = 0.85
+    lightx2v_storage_low_watermark: Optional[float] = 0.70
     enable_cors: bool = False
     allow_origins: Optional[List[str]] = ['*']
     allow_credentials: bool = False

@@ -134,6 +134,16 @@ class ModelUsageMiddleware(BaseHTTPMiddleware):
                     RerankResponse,
                     OperationEnum.RERANK,
                 )
+            elif request.url.path == "/v1/videos" and request.method == "POST":
+                # Async video submission: there is no usage payload in the
+                # response (results are generated out-of-band), so record the
+                # request itself without buffering/parsing the body.
+                try:
+                    await record_model_usage(
+                        request, None, OperationEnum.VIDEO_GENERATION
+                    )
+                except Exception as e:
+                    logger.error(f"Error processing model usage: {e}")
 
         return response
 

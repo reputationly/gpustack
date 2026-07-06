@@ -9,6 +9,10 @@ from gpustack.config.config import Config
 WHITELIST_CONFIG_FIELDS = {
     "debug",
     "system_default_container_registry",
+    "lightx2v_output_root",
+    "lightx2v_retention_days",
+    "lightx2v_storage_high_watermark",
+    "lightx2v_storage_low_watermark",
 }
 
 READ_ONLY_CONFIG_FIELDS = WHITELIST_CONFIG_FIELDS.union(
@@ -33,6 +37,11 @@ def _unwrap_optional(tp):
 
 
 def coerce_value_by_field(field: str, v):
+    # None must pass through untouched: whitelisted Optional fields document
+    # null as a valid value (e.g. lightx2v_retention_days None disables TTL),
+    # and int(None)/float(None) would 500 the whole config update.
+    if v is None:
+        return None
     hints = get_type_hints(Config)
     tp = hints.get(field)
     if tp is None:
@@ -41,6 +50,9 @@ def coerce_value_by_field(field: str, v):
     origin = get_origin(tp)
     if tp is bool:
         return string_to_bool(v)
+    if tp in (int, float) and isinstance(v, str) and not v.strip():
+        # An emptied form field means "clear the value", not the number ''.
+        return None
     if tp is int:
         return int(v)
     if tp is float:

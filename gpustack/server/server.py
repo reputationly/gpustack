@@ -84,6 +84,8 @@ from gpustack.schemas.metered_usage import MeteredUsage, MeteredUsageArchive
 from gpustack.schemas.resource_events import ResourceEvent, ResourceEventArchive
 from gpustack.server.worker_instance_cleaner import WorkerInstanceCleaner
 from gpustack.server.worker_syncer import WorkerSyncer
+from gpustack.server.video_task_sweeper import VideoTaskSweeper
+from gpustack.server.video_storage_janitor import VideoStorageJanitor
 from gpustack.utils.process import add_signal_handlers_in_loop
 from gpustack.config.registration import write_registration_token
 from gpustack.exporter.exporter import MetricExporter
@@ -429,6 +431,20 @@ class Server:
         self._create_async_task(worker_syncer.start())
 
         logger.debug("Worker syncer started.")
+
+    def _start_video_task_sweeper(self, app: FastAPI):
+        sweeper = VideoTaskSweeper(
+            lambda: getattr(app.state, "http_client", None),
+            lambda: getattr(app.state, "http_client_no_proxy", None),
+        )
+        self._create_async_task(sweeper.start())
+
+        logger.debug("Video task sweeper started.")
+
+    def _start_video_storage_janitor(self):
+        self._create_async_task(VideoStorageJanitor().start())
+
+        logger.debug("Video storage janitor started.")
 
     def _start_worker_status_flusher(self):
         self._create_async_task(flush_worker_status_to_db())
@@ -1286,3 +1302,9 @@ class Server:
 
         # Worker Syncer (checks worker reachability and updates states)
         self._start_worker_syncer(self._app)
+
+        # Video task sweeper (LightX2V death-requeue + re-dispatch)
+        self._start_video_task_sweeper(self._app)
+
+        # Video storage janitor (LightX2V NFS TTL + watermark eviction)
+        self._start_video_storage_janitor()
