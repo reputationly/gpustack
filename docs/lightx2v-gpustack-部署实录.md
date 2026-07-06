@@ -323,6 +323,7 @@ Save 后:调度到 1 张空闲卡 → launcher 起引擎 → `/ready` 503→200 
 | 17-2 | **runtime 版本 UI 提示** | 部署页提示 `highest supported GPU runtime version (cuda 12.8) does not meet requirements for backend LightX2V` | **非阻塞**——该检查(`evaluator.evaluate_runtime_version`)只被 `routes/model_evaluations` 的 UI 预检接口调用,**不在调度器主路径**,照常 Save 即可。永久消除见 gpustack 侧 `evaluator.py` 让 LightX2V 跳过 |
 | 17-3 | **sage 注意力不可用、回退 sdpa** | 日志一串 `sageattention not found`,但继续跑 | A100 镜像没编 sageattention,`attn_type=sage_attn2` 自动回退 torch_sdpa,**能跑**(见 Z-Image 报告 §5.1)。permanent:`profiles.yaml` 指 `z_image_a100_sdpa.json`(torch_sdpa,诚实) |
 | 17-4 | **Advanced 无 Image 字段** | 想用 model.image_name 绕过检查,但内置后端部署表单没有 image 字段 | 镜像由内置后端行的 `version_configs` 提供(`_resolve_image` 第 2 条),不需要 model 级 image;Category 用 Advanced 的 Model Category 选 |
+| 17-5 | **overlay 迁移链断裂** | M4 升级启动即 `Database migration failed: 'c4d7e8f9a0b1'`(KeyError) | 我们迁移的 down_revision 指向 fork 链上一版,但官方 base 镜像只带发布版迁移链、没有该中间版本。**不能**把 upstream 中间迁移塞进镜像(对应代码不在);修法:Dockerfile.acr 构建时探测 base 实际 alembic head 并 sed 改写 down_revision,再断言链头=e1f2a3b4c5d6。迁移在链解析阶段就失败,未执行任何 SQL,DB 无损,换新镜像重启即可 |
 
 ## 17.5 验证结论
 

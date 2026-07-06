@@ -17,6 +17,12 @@ Also extends ``operationenum`` with VIDEO_GENERATION so /v1/videos submissions
 can be recorded by the usage middleware. Applied on server start via
 ``alembic upgrade``.
 
+NOTE: ``down_revision`` below is correct for THIS repo's full migration chain.
+The ACR overlay build (pack/Dockerfile.acr) rewrites it at image-build time to
+the base image's actual alembic head, because the released base image does not
+ship upstream-main migrations like c4d7e8f9a0b1 (KeyError at startup
+otherwise, 2026-07-06 deploy).
+
 Revision ID: e1f2a3b4c5d6
 Revises: c4d7e8f9a0b1
 Create Date: 2026-07-05 22:30:00.000000

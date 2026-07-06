@@ -55,10 +55,24 @@ COPY pack/ui-dist/ /tmp/lx2v-ui/
 
 # Copy them onto the installed gpustack package (path detected at build time),
 # then byte-compile the new modules to fail fast on any import/syntax error.
+#
+# Migration chain fix-up: our repo's migration declares down_revision =
+# <fork HEAD's previous migration>, but the BASE image ships only the released
+# migration chain, which may not contain that revision (upstream-main
+# migrations that never made the release must NOT be copied in — their code
+# isn't in the image). So detect the base image's actual alembic head BEFORE
+# overlaying, then rewrite our migration's down_revision to it, and assert the
+# resulting chain resolves to our revision as the single head.
 RUN set -eux; \
     GP_DIR="$(python3 -c 'import gpustack, os; print(os.path.dirname(gpustack.__file__))')"; \
+    BASE_HEAD="$(python3 -c "from alembic.config import Config; from alembic.script import ScriptDirectory; c=Config(); c.set_main_option('script_location', '${GP_DIR}/migrations'); print(ScriptDirectory.from_config(c).get_current_head())")"; \
+    echo "base image alembic head: ${BASE_HEAD}"; \
     cp -rv /tmp/lx2v-overlay/. "${GP_DIR}/"; \
     rm -rf /tmp/lx2v-overlay; \
+    MIG_FILE="${GP_DIR}/migrations/versions/2026_07_05_2230-e1f2a3b4c5d6_add_video_generation_tasks.py"; \
+    sed -i "s/^down_revision: Union\[str, None\] = .*/down_revision: Union[str, None] = '${BASE_HEAD}'/" "${MIG_FILE}"; \
+    grep -n "^down_revision" "${MIG_FILE}"; \
+    python3 -c "from alembic.config import Config; from alembic.script import ScriptDirectory; c=Config(); c.set_main_option('script_location', '${GP_DIR}/migrations'); h=ScriptDirectory.from_config(c).get_current_head(); assert h == 'e1f2a3b4c5d6', h; print('migration chain OK, head=' + h)"; \
     python3 -m py_compile \
         "${GP_DIR}/worker/backends/lightx2v.py" \
         "${GP_DIR}/policies/candidate_selectors/lightx2v_resource_fit_selector.py" \
