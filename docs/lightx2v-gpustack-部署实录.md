@@ -329,7 +329,7 @@ Save 后:调度到 1 张空闲卡 → launcher 起引擎 → `/ready` 503→200 
 
 **内置化 Phase A(最短链路)真机验证通过**:GPUStack 内置识别 → profile selector 选 1 卡 → LightX2VServer 拉起引擎 → launcher 选 profile + `/ready` 门控 → 引擎从 `/nfs-models` 读模型、写 `/nfs-output` → 出图。launcher 的端口防撞(engine/metrics/torchrun-master 各唯一)、`/health` 就绪探测、Host 保留等均实测生效。
 
-**未收口(下个包带上)**:引擎 `profiles.yaml` sage→sdpa、gpustack `evaluator.py` 跳过 runtime 检查(当前靠回退 + UI 提示无害);wan int8-4card config 标定;M4 薄门面 + `/v1/videos`;M5 UI 原生 video 体验区。
+**未收口(下个包带上)**:~~引擎 `profiles.yaml` sage→sdpa、gpustack `evaluator.py` 跳过 runtime 检查、wan int8-4card config 标定、M4 薄门面 + `/v1/videos`、M5 UI 原生 video 体验区~~ —— **全部已于 2026-07-06 收口**(M4/M5 见交接文档 §7.5,profiles/wan 见 §17.7)。
 
 ## 17.7 内置 profiles 补齐 + wan-t2v 内置上线(2026-07-06 晚)
 
