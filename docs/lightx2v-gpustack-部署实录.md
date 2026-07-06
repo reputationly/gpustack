@@ -331,6 +331,29 @@ Save 后:调度到 1 张空闲卡 → launcher 起引擎 → `/ready` 503→200 
 
 **未收口(下个包带上)**:引擎 `profiles.yaml` sage→sdpa、gpustack `evaluator.py` 跳过 runtime 检查(当前靠回退 + UI 提示无害);wan int8-4card config 标定;M4 薄门面 + `/v1/videos`;M5 UI 原生 video 体验区。
 
+## 17.7 内置 profiles 补齐 + wan-t2v 内置上线(2026-07-06 晚)
+
+**目标**:全模型走内置后端,弃用 custom(§12 的 wan-custom 后端流程作废)。集群扩到 5 台 A100(163/0002/0003/…)。
+
+**引擎侧**(LightX2V `f05bea81`+`c2f591b2`,镜像 `arm64-a100-latest` = `2d259627e8e1`):
+- `configs/deploy/` 四份 A100 生产配置进镜像:wan22 **t2v** int8-4卡(§12.2 实测原版)、wan22 **i2v** int8-4卡(I2V 报告 §4)、qwen **edit**/**t2i** lightning-merged-8步(均含 `qwen25vl_cpu_offload:false`);
+- profiles.yaml:`wan2.2_moe`(t2v)/`wan2.2_moe_distill`(i2v)/`qwen_image`(t2i+i2i);qwen 的 ~60G Shmem/实例、**单节点≤2副本**红线入注释;
+- launcher:路径含 i2v/flf2v→distill、qwen→qwen_image;同卡数多变体按 task 消歧(路径含 edit→i2i),歧义/卡数/task 不匹配一律 fail-loudly;新增 `--task` 后端参数。
+
+**部署要点(内置多卡的正确姿势)**:Deploy Model → Backend LightX2V → Scheduling **Manual 勾整机 4 卡**(或 GPUs per Replica=4)——selector 按 卡数÷副本 识别 4 卡 profile 并**整卡预订**(兼容性提示 160GiB=4×40G 即正确);无需任何 Backend Parameters(t2v 场景)。launcher 日志首行 `profile=wan2.2-t2v/int8-4card` 即选型正确。
+
+**i2v 未来部署**:无独立基座,Model Path 用 **T2V 目录**(VAE/T5 共用,I2V 报告 §2),Backend Parameters 加 `--model-cls wan2.2_moe_distill --task i2v`;int8 DiT 在 `models-int8/Wan2.2-I2V-720p-int8`(已核在位)。
+
+**镜像分发经验**:已有旧引擎镜像的节点直接 `docker pull`(base 层复用,只拉 app 增量层,分钟级);全新节点走 238 `docker save >` NFS tar + `docker load`(29G;tar 已留 `_transfer/lightx2v-arm64-profiles.tar` + `gpustack-lx2v-dev-arm64.tar` 给 0003/0004/0005)。
+
+**验收**:0002 上 wan2.2-t2v 1×4卡 Running(~35G/卡),`POST /v1/videos`(t2v,81帧)→ done → `/content` 出 MP4 全通。**内置后端能力矩阵:单卡图(z-image)+ 4卡视频(wan)均真机跑通。**
+
+**新坑**:
+| # | 坑 | 修法 |
+|---|---|---|
+| 17-6 | 0002 被清空过:worker 容器消失(§12 时代的部署全没了),但镜像/NFS/toolkit 还在 | 按新节点流程重新起 worker(token 复用);老 lightx2v 镜像在反而省了 29G(pull 只拉增量) |
+| 17-7 | 238 老 server 用的是**匿名卷**(§17.3 首装时 docker run 带了 -v 但实际没有?→ 实际是首装漏了 -v),升级换命名卷后"数据消失" | `docker rm` 不删卷,数据在匿名卷里;`cp -a` 迁回 `gpustack-data` 即恢复。升级前先 `docker inspect <容器> --format '{{json .Mounts}}'` 看真实卷名 |
+
 ## 17.6 NFS 产物清理(cron,先于 Janitor 组件)
 
 产物短命(new-api 15s 内读走传 OBS),但 `/nfs-output` 不清迟早写满。**Janitor 组件推迟**(300 节点规模再做),当前用 cron 兜底。在挂了 `/nfs-output` RW 的 **238(manager)**上装(一个节点跑即可,`-delete` 幂等):
