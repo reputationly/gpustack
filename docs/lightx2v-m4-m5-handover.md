@@ -119,7 +119,8 @@
 3. ~~【必做】用户统一代码检视 → 分批 commit~~ **✅ 已完成(2026-07-06)**:第 6 轮检视(§7.5)修复后,gpustack `808e8796`+`7847dba1`、gpustack-ui `54a7ff64` 均已 push main。
 4. 【可选】再跑一轮 `/codex:review` 确认第 5 轮两个 fix 收敛(轮次命中在收敛:3→2→2→1→2)。
 5. 【后续】new-api 侧 GPUStack channel + TaskAdaptor(`BuildRequestURL→/v1/videos`,`FetchTask→GET /v1/videos/{id}`,完成后读 `nfs_path` 直传 OBS)——设计 §6.9,**new-api 仓改动,本次未动**;new-api 仓有"Codex review + 用户确认才能 commit"的硬约定。
-6. 【后续】播放页表单字段与引擎精细对齐(`aspect_ratio`/`target_video_length`;当前透传+默认可用,低优先);LightX2V 品牌 logo 若有正式版可替换。
+6. 【可选 UX】Video Tasks 管理页对非终态行加轻量自动轮询(每 15s 对非终态任务 GET /v1/videos/{id} 一次):poll-on-GET 模型下,绕过播放页直接 curl 提交、只看管理页的人会看到状态停在 assigned、download 置灰(实际引擎已完成;10min 后 sweeper 兜底回填)。2026-07-06 真机验证时遇到,GET 一次即点亮,非 bug。
+7. 【后续】播放页表单字段与引擎精细对齐(`aspect_ratio`/`target_video_length`;当前透传+默认可用,低优先);LightX2V 品牌 logo 若有正式版可替换。
 
 ## 9. 环境速查
 
