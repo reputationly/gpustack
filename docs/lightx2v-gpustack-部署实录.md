@@ -331,6 +331,25 @@ Save 后:调度到 1 张空闲卡 → launcher 起引擎 → `/ready` 503→200 
 
 **未收口(下个包带上)**:~~引擎 `profiles.yaml` sage→sdpa、gpustack `evaluator.py` 跳过 runtime 检查、wan int8-4card config 标定、M4 薄门面 + `/v1/videos`、M5 UI 原生 video 体验区~~ —— **全部已于 2026-07-06 收口**(M4/M5 见交接文档 §7.5,profiles/wan 见 §17.7)。
 
+## 17.8 五机满编:0004/0005 脚本化接入 + qwen-edit / wan-i2v 上线(2026-07-06 深夜)
+
+**节点接入全自动化**:`docs/scripts/lx2v-node.sh`(4 轮 Codex + 8 角度全量检视,16 项修复后合入 `27925017`)在 0004(10.0.0.57)/0005(10.0.0.48)连续两台**零干预跑通**,各 ~16 分钟(大头是 toolkit deb 在线下载和 NFS load)。分发:Mac→scp 238→`cp` 进 `_transfer/`→scp 新节点;执行仅一条 `bash /root/lx2v-node.sh install --token <T>`。安全组提前加同组,一次通过。
+
+**qwen-image-edit @0004(2 实例 × 1 卡)**:Model Path=`models/Qwen-Image-Edit-2511`,零后端参数(路径含 Edit 自动选 i2i merged-8step profile),错峰起第 2 副本。**新坑 17-8:单卡模型必须显式 GPUs per Replica=1**——Manual 勾 2 卡+Replicas 1 时 selector 按 2÷1=2 卡/实例分配,launcher 找不到 2 卡 qwen 变体 fail-loudly(防呆正确工作)。口诀:单卡模型显式 =1,多卡模型 =4。
+
+**wan2.2-i2v @0005(1 实例 × 4 卡)**:Model Path=**T2V 目录**(I2V 无独立基座),Backend Parameters `--model-cls wan2.2_moe_distill` + `--task i2v`(空格写法 OK,`flatten_to_argv` 会正确拆 token)。
+
+**端到端验证(均含 base64 输入链路首证)**:qwen-edit i2i(加雪编辑)done→1664×928 PNG,输入图落 `inputs/i2i-qwen-image-edit/.../<task_id>-image.png`;wan-i2v(图生视频 81 帧)done→MP4,输入图落 `inputs/i2v-wan2.2-i2v/...`。`_persist_input`(base64→NFS→image_path)与 §7.7 设计逐字吻合。
+
+**最终拓扑(5 机 20 卡满编,全内置后端)**:
+
+| 节点 | 部署 |
+|---|---|
+| 163 (0001) | z-image ×4(1卡/实例) |
+| 0002 / 0003 | wan2.2-t2v ×2(4卡/实例) |
+| 0004 | qwen-image-edit ×2(1卡/实例,≤2副本红线) |
+| 0005 | wan2.2-i2v ×1(4卡) |
+
 ## 17.7 内置 profiles 补齐 + wan-t2v 内置上线(2026-07-06 晚)
 
 **目标**:全模型走内置后端,弃用 custom(§12 的 wan-custom 后端流程作废)。集群扩到 5 台 A100(163/0002/0003/…)。

@@ -2,7 +2,7 @@
 # lx2v-node.sh — LightX2V/GPUStack GPU 节点一键安装与升级(fork 运维脚本)
 #
 # 用法(在 GPU 节点上以 root 执行):
-#   ./lx2v-node.sh install --token <GPUSTACK_TOKEN> [--worker-ip <IP>] [--offline] [--clean-residue]
+#   ./lx2v-node.sh install --token <GPUSTACK_TOKEN> [--worker-ip <IP>] [--offline] [--clean-residue] [--force]
 #   ./lx2v-node.sh upgrade-gpustack [--offline]     # 换 gpustack:lx2v-dev 并原参数重启 worker
 #   ./lx2v-node.sh upgrade-engine   [--offline]     # 换 lightx2v 引擎镜像(实例需重建才生效)
 #   ./lx2v-node.sh clean [--purge-data] [--kill-gpu-procs]   # 清理卸载残留(见下)
@@ -10,8 +10,8 @@
 #   ./lx2v-node.sh prepare-transfer                  # (238/有 ACR 外网的机器)拉镜像存 NFS tar
 #
 # 残留环境(装过 GPUStack 又卸载/被清理过的节点):
-#   install 自带残留检测——旧 worker 容器自动移除重建;孤儿引擎实例容器默认只告警,
-#   加 --clean-residue 一并硬杀;旧 gpustack-data 卷默认**复用**(同集群重接入的正确姿势)。
+#   install 自带残留检测——异 token 的旧 worker 自动移除重建,同 token(同集群)需加 --force;
+#   孤儿引擎实例容器默认只告警,加 --clean-residue 一并硬杀;旧 gpustack-data 卷默认**复用**。
 #   要彻底重置节点:先 ./lx2v-node.sh clean --purge-data,再 install。
 #   GPU 上的野进程(非 GPUStack 管理,坑#7/#17-1)任何命令都只告警不自动杀,
 #   clean 加 --kill-gpu-procs 才会 kill -9。
@@ -119,7 +119,8 @@ old_cmd_value() { # old_cmd_value <flag>
     | awk -v k="$1" 'prev==k {print; exit} {prev=$0}' || true
 }
 
-# install/upgrade 起容器前才解析 worker IP:显式 --worker-ip > 旧容器参数 > 自动探测
+# 解析 worker IP:显式 --worker-ip > 旧容器参数 > 自动探测。
+# 继承依赖 docker inspect 旧容器,因此必须在旧容器被移除之前调用
 resolve_worker_ip() {
   [ -n "$WORKER_IP" ] && return 0
   WORKER_IP="$(old_cmd_value --worker-ip)"
@@ -153,9 +154,15 @@ parse_flags() {
   # 且非 10.x 网段机器上强行探测会失败。需要时由 resolve_worker_ip 按需解析。
 }
 
-# 孤儿引擎实例容器(mirrored 部署产物,形如 <model>-<hash>-run-N / -pause)
+# 孤儿引擎实例容器:优先按 gpustack-runtime 给容器打的 label 识别(稳定接口),
+# 并保留命名正则兜底(老版本 runtime 无 label 时),两者取并集。
+# 命名正则须覆盖 deployer 的全部产物:-run-N / -pause / -init-N / -unhealthy-restart
+INSTANCE_NAME_RE='-run-[0-9]+$|-pause$|-init-[0-9]+$|-unhealthy-restart$'
 list_instance_containers() {
-  docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E -- '-run-[0-9]+$|-pause$' || true
+  {
+    docker ps -a --filter label=runtime.gpustack.ai/workload --format '{{.Names}}' 2>/dev/null || true
+    docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E -- "$INSTANCE_NAME_RE" || true
+  } | grep -vx "$WORKER_NAME" | sort -u || true
 }
 
 # GPU 上非 GPUStack 管理的进程(实验残留裸进程等,坑#7/#17-1:不清会 OOM)
@@ -200,6 +207,7 @@ scan_residue() {
   if [ -n "$inst" ]; then
     found=1
     echo "    [有] 引擎实例容器(可能是上一次部署的孤儿):"
+    # shellcheck disable=SC2001  # 多行文本统一缩进,${var//} 参数展开不适用
     echo "$inst" | sed 's/^/         /'
     if [ "$CLEAN_RESIDUE" -eq 1 ]; then
       kill_instance_containers
@@ -326,6 +334,14 @@ collect_existing_envs() {
          "容器可能损坏;改用 install --token <T> --force 重建"
 }
 
+# 旧容器缺标准 env 时按 install 默认值补齐(§5 时代/UI 生成的命令只有 TOKEN;
+# 缺 EXTRA_MOUNTS 引擎容器会丢 /nfs-output 挂载,而注册/healthz 全正常——静默坏)
+ensure_env_present() { # ensure_env_present <KEY> <标准值>
+  printf '%s\n' "${WORKER_ENVS[@]}" | grep -q "^$1=" && return 0
+  echo "    ⚠️ 旧容器缺 $1,按标准值补齐: $2"
+  WORKER_ENVS+=("$1=$2")
+}
+
 run_worker() { # run_worker <worker_ip> <volume> <server_url>(env 取全局 WORKER_ENVS)
   local ip=$1 volume=$2 server_url=$3
   local env_flags=() e
@@ -342,17 +358,25 @@ run_worker() { # run_worker <worker_ip> <volume> <server_url>(env 取全局 WORK
 }
 
 verify_worker() {
-  local i
+  local i logs
   for i in $(seq 1 30); do
-    if docker logs "$WORKER_NAME" 2>&1 | grep -q "registered with worker_id"; then
-      docker logs "$WORKER_NAME" 2>&1 | grep -E "Registering|registered" | tail -2
+    # 先整体捕获日志再 grep:pipefail 下 docker logs | grep -q 会因 grep 匹配后
+    # 提前关管道,令 docker logs 收 SIGPIPE 非零退出,把已注册误判成未注册
+    logs="$(docker logs "$WORKER_NAME" 2>&1 || true)"
+    if grep -q "registered with worker_id" <<< "$logs"; then
+      grep -E "Registering|registered" <<< "$logs" | tail -2
       break
     fi
     sleep 2
-    [ "$i" -eq 30 ] && { docker logs "$WORKER_NAME" 2>&1 | tail -10; die "worker 60s 内未注册成功"; }
+    [ "$i" -eq 30 ] && { tail -10 <<< "$logs"; die "worker 60s 内未注册成功"; }
   done
-  curl -sf --max-time 3 "http://127.0.0.1:${WORKER_PORT}/healthz" > /dev/null \
-    || die "本机 healthz 不通"
+  # 注册日志先于 API server 绑定端口出现(worker.py 先 _register 后 _serve_apis),
+  # 单次探测会竞速端口 bind,须短重试
+  for i in $(seq 1 10); do
+    curl -sf --max-time 3 "http://127.0.0.1:${WORKER_PORT}/healthz" > /dev/null && break
+    sleep 2
+    [ "$i" -eq 10 ] && die "本机 healthz 20s 内不通"
+  done
   echo "    本机 healthz OK。⚠️ 若 UI 不转 Ready:检查云安全组(须与既有节点同组,"
   echo "    症状=server ping 通但 TCP ${WORKER_PORT} 超时,见全记录 §4.2 坑 C)"
 }
@@ -370,7 +394,11 @@ cmd_install() {
 
   step "残留检测(装过 GPUStack 又卸载/清理过的节点)"
   scan_residue
-  docker rm -f "$WORKER_NAME" 2>/dev/null || true
+  # 此时旧容器还在:worker IP 可从旧容器继承,且 IP 定不下来时秒级失败,
+  # 不浪费后面 30 分钟;旧容器要到 step 8 起新容器前一刻才移除,
+  # 中途任何一步失败节点上仍有原 worker
+  resolve_worker_ip
+  echo "    worker-ip=${WORKER_IP}"
 
   step "apt 基础包(逐个装,避免一包失败全中止)"
   apt-get update -q
@@ -381,15 +409,21 @@ cmd_install() {
   ensure_nfs
 
   step "nvidia-container-toolkit(源自 NFS ${NVIDIA_REPO_DIR})"
-  if ! command -v nvidia-ctk > /dev/null; then
-    [ -d "$NVIDIA_REPO_DIR" ] || die "缺 ${NVIDIA_REPO_DIR}(在既有节点: cp /etc/apt/sources.list.d/nvidia-container-toolkit.list 与 keyring 到该目录)"
-    cp "${NVIDIA_REPO_DIR}/nvidia-container-toolkit-keyring.gpg" /usr/share/keyrings/
-    cp "${NVIDIA_REPO_DIR}/nvidia-container-toolkit.list" /etc/apt/sources.list.d/
-    apt-get update -q && apt-get install -y -q nvidia-container-toolkit
+  # 已配置则整步跳过:systemctl restart docker 会杀掉节点上所有运行中的容器
+  # (含 scan_residue 承诺不动的引擎实例),只有首次配置才值得付这个代价
+  if docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q nvidia; then
+    echo "    nvidia runtime 已配置,跳过(不重启 docker,不影响运行中实例)"
+  else
+    if ! command -v nvidia-ctk > /dev/null; then
+      [ -d "$NVIDIA_REPO_DIR" ] || die "缺 ${NVIDIA_REPO_DIR}(在既有节点: cp /etc/apt/sources.list.d/nvidia-container-toolkit.list 与 keyring 到该目录)"
+      cp "${NVIDIA_REPO_DIR}/nvidia-container-toolkit-keyring.gpg" /usr/share/keyrings/
+      cp "${NVIDIA_REPO_DIR}/nvidia-container-toolkit.list" /etc/apt/sources.list.d/
+      apt-get update -q && apt-get install -y -q nvidia-container-toolkit
+    fi
+    nvidia-ctk runtime configure --runtime=docker
+    systemctl restart docker
+    docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q nvidia || die "docker nvidia runtime 未生效"
   fi
-  nvidia-ctk runtime configure --runtime=docker
-  systemctl restart docker
-  docker info 2>/dev/null | grep -q "nvidia" || die "docker nvidia runtime 未生效"
 
   step "镜像:gpustack(NFS tar 优先,无则在线拉)"
   fetch_image_prefer_tar "$GPUSTACK_IMAGE" "$GPUSTACK_TAR"
@@ -398,7 +432,7 @@ cmd_install() {
   fetch_image_prefer_tar "$ENGINE_IMAGE" "$ENGINE_TAR"
 
   step "起 worker 并验证注册"
-  resolve_worker_ip
+  docker rm -f "$WORKER_NAME" 2>/dev/null || true
   echo "    worker-ip=${WORKER_IP}  server-url=${SERVER_URL}"
   build_default_envs "$TOKEN"
   run_worker "$WORKER_IP" "gpustack-data" "$SERVER_URL"
@@ -458,6 +492,8 @@ cmd_upgrade_gpustack() {
   step "读取现有 worker 配置(GPUSTACK_* env / 卷 / server-url / IP 全部原样保留)"
   local volume old_server_url
   collect_existing_envs
+  ensure_env_present GPUSTACK_RUNTIME_DEPLOY_MIRRORED_NAME "$WORKER_NAME"
+  ensure_env_present GPUSTACK_EXTRA_MOUNTS "/nfs-models,/nfs-output"
   volume="$(current_worker_volume)"
   [ -n "$volume" ] || die "读不到数据卷名" \
     "匿名卷也会有 64 位卷名;完全为空说明容器没挂 /var/lib/gpustack,重建会丢状态,停止" \
@@ -517,7 +553,15 @@ cmd_status() {
   echo "--- GPU:"
   nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader 2>/dev/null | sed 's/^/  GPU /' || echo "  nvidia-smi 不可用"
   echo "--- 引擎实例容器:"
-  docker ps --format '  {{.Names}}  {{.Status}}' | grep -vE "${WORKER_NAME}" | grep -E "run-0|pause" || echo "  (无)"
+  local inst n
+  inst="$(list_instance_containers)"
+  if [ -n "$inst" ]; then
+    while IFS= read -r n; do
+      docker ps -a --filter "name=^${n}$" --format '  {{.Names}}  {{.Status}}'
+    done <<< "$inst"
+  else
+    echo "  (无)"
+  fi
   finish
 }
 
@@ -538,13 +582,19 @@ cmd_prepare_transfer() {
   docker save "$GPUSTACK_IMAGE" > "${GPUSTACK_TAR}.tmp" &
   local pid=$!; watch_size $pid "${GPUSTACK_TAR}.tmp"; wait $pid
   mv "${GPUSTACK_TAR}.tmp" "$GPUSTACK_TAR"
-  echo "    $(ls -lh "$GPUSTACK_TAR" | awk '{print $5, $9}')"
+  echo "    $(du -h "$GPUSTACK_TAR" | cut -f1)  ${GPUSTACK_TAR}"
+  if [ "$(uname -m)" = "x86_64" ]; then
+    # 238 的 server 容器与本 tag 同名:上面 --platform arm64 的 pull 已把本地 tag
+    # 指向 arm64 镜像,不恢复的话之后跳过 pull 直接 docker run 会 exec format error
+    echo "    恢复本地 amd64 tag(server 与本 tag 同名)..."
+    docker pull --platform linux/amd64 "$GPUSTACK_IMAGE"
+  fi
 
   step "save 引擎 tar(~29G,耐心)"
   docker save "$ENGINE_IMAGE" > "${ENGINE_TAR}.tmp" &
   pid=$!; watch_size $pid "${ENGINE_TAR}.tmp"; wait $pid
   mv "${ENGINE_TAR}.tmp" "$ENGINE_TAR"
-  echo "    $(ls -lh "$ENGINE_TAR" | awk '{print $5, $9}')"
+  echo "    $(du -h "$ENGINE_TAR" | cut -f1)  ${ENGINE_TAR}"
   cp -f "$0" "${TRANSFER_DIR}/lx2v-node.sh" && chmod +x "${TRANSFER_DIR}/lx2v-node.sh"
   echo "    脚本自身已同步到 ${TRANSFER_DIR}/lx2v-node.sh(已挂 NFS 的节点可直接执行)"
   echo "    提示:nvidia-repo/ 两件套如缺,在既有 GPU 节点执行:"
@@ -554,7 +604,8 @@ cmd_prepare_transfer() {
 }
 
 usage() {
-  sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+  # 打印文件头整段注释(到第一个非注释行为止),不硬编码行号避免头注释增删后截断
+  awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"
   exit 1
 }
 
