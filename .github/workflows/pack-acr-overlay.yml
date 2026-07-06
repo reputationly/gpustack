@@ -1,9 +1,10 @@
 name: Pack GPUStack overlay to ACR
 
-# Fast overlay image: lay our changed .py files on top of the official/ACR
-# GPUStack base image (pack/Dockerfile.acr) and push a multi-arch (amd64+arm64)
-# manifest to Aliyun ACR. NO CUDA/Higress rebuild — this is the fork build for
-# the LightX2V built-in backend changes, and completes the TODO left in
+# Fast overlay image: lay our changed .py files AND the freshly built
+# gpustack-ui dist on top of the official/ACR GPUStack base image
+# (pack/Dockerfile.acr) and push a multi-arch (amd64+arm64) manifest to Aliyun
+# ACR. NO CUDA/Higress rebuild — this is the fork build for the LightX2V
+# built-in backend changes, and completes the TODO left in
 # sync-image-to-acr.yml.
 #
 # amd64 image serves the x86 server node; arm64 image serves the A100 worker.
@@ -26,6 +27,10 @@ on:
         description: 'Floating ACR tag to publish'
         default: 'lx2v-dev'
         required: true
+      ui_ref:
+        description: 'gpustack-ui ref to build and bundle'
+        default: 'main'
+        required: true
 
 env:
   ACR_REGISTRY: crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com
@@ -42,6 +47,32 @@ jobs:
         id: tags
         run: |
           echo "version=lx2v-$(date -u +%Y%m%d-%H%M)-$(git rev-parse --short=8 HEAD)" >> "$GITHUB_OUTPUT"
+
+      # gpustack-ui is a separate public repo; build its dist here and stage it
+      # at pack/ui-dist/ where Dockerfile.acr overlays it onto <package>/ui/.
+      - name: Checkout gpustack-ui
+        uses: actions/checkout@v4
+        with:
+          repository: reputationly/gpustack-ui
+          ref: ${{ github.event.inputs.ui_ref }}
+          path: gpustack-ui-src
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build gpustack-ui dist
+        run: |
+          npm install -g pnpm@9.3.0
+          cd gpustack-ui-src
+          pnpm install --frozen-lockfile
+          pnpm build
+          rm -rf ../pack/ui-dist
+          mkdir -p ../pack/ui-dist
+          cp -r dist/. ../pack/ui-dist/
+          test -f ../pack/ui-dist/index.html
+          echo "ui_sha=$(git rev-parse --short=8 HEAD)" >> "$GITHUB_ENV"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -77,6 +108,7 @@ jobs:
             echo ""
             echo "- \`${ACR_REPO}:${{ github.event.inputs.dest_tag }}\` (floating)"
             echo "- \`${ACR_REPO}:${{ steps.tags.outputs.version }}\` (immutable)"
+            echo "- bundled gpustack-ui: \`${{ github.event.inputs.ui_ref }}\` @ \`${ui_sha}\`"
             echo ""
             echo "Pull on each node: \`docker pull ${ACR_REPO}:${{ github.event.inputs.dest_tag }}\`"
           } >> "$GITHUB_STEP_SUMMARY"

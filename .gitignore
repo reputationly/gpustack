@@ -174,3 +174,7 @@ charts/gpustack-chart/charts/
 # avoid ignoring var in rootfs
 !/pack/rootfs/var
 !/pack/rootfs/var/**
+
+# real UI dist staged by CI / local builds; only the README placeholder is tracked
+pack/ui-dist/*
+!pack/ui-dist/README.md

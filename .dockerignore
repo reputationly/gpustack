@@ -10,3 +10,7 @@ dist/
 .cache/
 .python-version
 .data
+
+# CI-only staging dirs (pack-acr-overlay checks out gpustack-ui here; keep the
+# docker build context lean)
+gpustack-ui-src/
