@@ -115,7 +115,7 @@
    - `pack/Dockerfile.acr` 已补齐全部 M4/M5 后端文件(含迁移,启动自动 upgrade)+ `pack/ui-dist/` UI 覆盖机制;
    - `pack-acr-overlay.yml` 已加 checkout `gpustack-ui` → pnpm build → dist 进镜像步骤(`ui_ref` 输入,默认 main);
    - 首次构建成功(run 28775282654):`gpustack:lx2v-dev` + 不可变 tag **`lx2v-20260706-0731-7847dba1`** 已推 ACR,双架构,镜像内断言(backend/M4 schema/UI dist)全过。
-2. **【必做】真机部署验证**(238 x86 server / 163 arm64 4×A100 worker,网络隔离,流程见部署实录 §17):升级两节点镜像 → 确认自动迁移建表 → `POST /v1/videos`(z_image t2i)→ 轮询 → `/content` 下载;并发提交看 least-pending;杀实例看重派;UI 看 video 类目/播放页/任务面板/存储设置。**注意 GPU 外部占用坑**(此前有残留进程占 21G 导致 OOM,先 `nvidia-smi` 清场)。
+2. ~~【必做】真机部署验证~~ **✅ 核心链路已验收(2026-07-06,镜像 lx2v-20260706-0809-46828d67)**:双节点升级完成;存量库自动迁移成功(`videotaskstateenum` 六值在 PG 建齐,老数据无损);`POST /v1/videos`(z-image t2i)→ 轮询 done → `/content` 下载 1664×928 PNG 全通;M5 UI(Video 菜单/任务面板/存储设置)生效;worker 重启后实例自动重拉。**途中踩的两个坑已记录**:迁移链断裂(坑 17-5,Dockerfile 构建期改写 down_revision 修复)、238 老 server 用的是匿名卷(数据靠 cp -a 迁回 gpustack-data)。**剩余可选项**:并发提交看 least-pending 分流、杀引擎容器验证死亡重派(-r1 后缀新路径)、用量面板确认 VIDEO_GENERATION 计数。
 3. ~~【必做】用户统一代码检视 → 分批 commit~~ **✅ 已完成(2026-07-06)**:第 6 轮检视(§7.5)修复后,gpustack `808e8796`+`7847dba1`、gpustack-ui `54a7ff64` 均已 push main。
 4. 【可选】再跑一轮 `/codex:review` 确认第 5 轮两个 fix 收敛(轮次命中在收敛:3→2→2→1→2)。
 5. 【后续】new-api 侧 GPUStack channel + TaskAdaptor(`BuildRequestURL→/v1/videos`,`FetchTask→GET /v1/videos/{id}`,完成后读 `nfs_path` 直传 OBS)——设计 §6.9,**new-api 仓改动,本次未动**;new-api 仓有"Codex review + 用户确认才能 commit"的硬约定。
