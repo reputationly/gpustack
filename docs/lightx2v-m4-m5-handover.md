@@ -13,8 +13,8 @@
 
 | 仓 | 路径 | 状态 |
 |---|---|---|
-| **gpustack**(后端) | `/Users/reputationly/Desktop/code/api/gpustack` | M4+M5 后端改动**未 commit**(15 文件,见 §4);M1–M3 已 commit 已部署 |
-| **gpustack-ui**(前端) | `/Users/reputationly/Desktop/code/api/gpustack-ui` | M5 前端改动**未 commit**(11 改 + 5 新,见 §5);**编译已本地验证**(2026-07-06:`pnpm@9.3.0 install && pnpm build` 一次通过,dist 26M;`tsc --noEmit` 与 HEAD 基线对比无 M5 引入的新类型错误——仅新文件继承了仓库既有的 core-ui 无类型声明 TS7016) |
+| **gpustack**(后端) | `/Users/reputationly/Desktop/code/api/gpustack` | M4+M5 后端**已 commit 并 push main**(2026-07-06:`808e8796` feat + `7847dba1` ci);M1–M3 已 commit 已部署 |
+| **gpustack-ui**(前端) | `/Users/reputationly/Desktop/code/api/gpustack-ui` | M5 前端**已 commit 并 push main**(2026-07-06:`54a7ff64`);编译已验证(本地 + CI:`pnpm@9.3.0 install && pnpm build` 通过,dist 26M;`tsc --noEmit` 与 HEAD 基线对比无 M5 引入的新类型错误——仅新文件继承了仓库既有的 core-ui 无类型声明 TS7016) |
 | **LightX2V**(引擎) | `/Users/reputationly/Desktop/code/api/LightX2V` | 干净,已 push(`ff2beee3`);launcher + profiles 已进 arm64 镜像 |
 
 ## 3. M4 —— 收敛后的异步门面(后端,已完成)
@@ -111,12 +111,12 @@
 
 ## 8. 待办(按优先级,接手从这里开始)
 
-1. **【必做】扩 ACR overlay 出包**(用户已拍板此方式):
-   - `pack/Dockerfile.acr`:COPY 列表**补齐 §4 全部 M4/M5 后端文件**(现在只有 M1–M3 的 7 个 .py;顶部注释"迁移不覆盖"已过时——迁移文件放进去即可,启动自动 upgrade);
-   - `.github/workflows/pack-acr-overlay.yml`(workflow_dispatch,buildx+QEMU 双架构):加步骤 checkout `gpustack-ui` → `pnpm i && pnpm build` → `dist/` COPY 进镜像 `gpustack/ui/`(覆盖 base 里 COS 拉的官方 UI)。前端编译已在本地验证通过(2026-07-06,pnpm@9.3.0 一次过,无 TS 报错),此步只是复现;
-   - ACR:`crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/`(gpustack:lx2v-dev);Docker Hub secrets 用户已配好。
+1. ~~【必做】扩 ACR overlay 出包~~ **✅ 已完成(2026-07-06)**:
+   - `pack/Dockerfile.acr` 已补齐全部 M4/M5 后端文件(含迁移,启动自动 upgrade)+ `pack/ui-dist/` UI 覆盖机制;
+   - `pack-acr-overlay.yml` 已加 checkout `gpustack-ui` → pnpm build → dist 进镜像步骤(`ui_ref` 输入,默认 main);
+   - 首次构建成功(run 28775282654):`gpustack:lx2v-dev` + 不可变 tag **`lx2v-20260706-0731-7847dba1`** 已推 ACR,双架构,镜像内断言(backend/M4 schema/UI dist)全过。
 2. **【必做】真机部署验证**(238 x86 server / 163 arm64 4×A100 worker,网络隔离,流程见部署实录 §17):升级两节点镜像 → 确认自动迁移建表 → `POST /v1/videos`(z_image t2i)→ 轮询 → `/content` 下载;并发提交看 least-pending;杀实例看重派;UI 看 video 类目/播放页/任务面板/存储设置。**注意 GPU 外部占用坑**(此前有残留进程占 21G 导致 OOM,先 `nvidia-smi` 清场)。
-3. **【必做】用户统一代码检视 → 分批 commit**(gpustack 一批、gpustack-ui 一批;等用户点头)。
+3. ~~【必做】用户统一代码检视 → 分批 commit~~ **✅ 已完成(2026-07-06)**:第 6 轮检视(§7.5)修复后,gpustack `808e8796`+`7847dba1`、gpustack-ui `54a7ff64` 均已 push main。
 4. 【可选】再跑一轮 `/codex:review` 确认第 5 轮两个 fix 收敛(轮次命中在收敛:3→2→2→1→2)。
 5. 【后续】new-api 侧 GPUStack channel + TaskAdaptor(`BuildRequestURL→/v1/videos`,`FetchTask→GET /v1/videos/{id}`,完成后读 `nfs_path` 直传 OBS)——设计 §6.9,**new-api 仓改动,本次未动**;new-api 仓有"Codex review + 用户确认才能 commit"的硬约定。
 6. 【后续】播放页表单字段与引擎精细对齐(`aspect_ratio`/`target_video_length`;当前透传+默认可用,低优先);LightX2V 品牌 logo 若有正式版可替换。
