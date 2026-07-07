@@ -37,6 +37,7 @@ COPY gpustack/scheduler/scheduler.py                                         /tm
 COPY gpustack/scheduler/evaluator.py                                         /tmp/lx2v-overlay/scheduler/evaluator.py
 # --- M4/M5: async video facade + sweeper + janitor + migration + metering ---
 COPY gpustack/api/middlewares.py                                             /tmp/lx2v-overlay/api/middlewares.py
+COPY gpustack/api/exceptions.py                                              /tmp/lx2v-overlay/api/exceptions.py
 COPY gpustack/config/config.py                                               /tmp/lx2v-overlay/config/config.py
 COPY gpustack/http_proxy/strategies.py                                       /tmp/lx2v-overlay/http_proxy/strategies.py
 COPY gpustack/migrations/versions/2026_07_05_2230-e1f2a3b4c5d6_add_video_generation_tasks.py /tmp/lx2v-overlay/migrations/versions/2026_07_05_2230-e1f2a3b4c5d6_add_video_generation_tasks.py
