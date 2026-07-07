@@ -13,6 +13,10 @@ WHITELIST_CONFIG_FIELDS = {
     "lightx2v_retention_days",
     "lightx2v_storage_high_watermark",
     "lightx2v_storage_low_watermark",
+    "lightx2v_admission_enabled",
+    "lightx2v_image_max_queue_wait_seconds",
+    "lightx2v_video_max_queue_wait_seconds",
+    "lightx2v_model_latency_seconds",
 }
 
 READ_ONLY_CONFIG_FIELDS = WHITELIST_CONFIG_FIELDS.union(

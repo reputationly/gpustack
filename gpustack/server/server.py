@@ -257,6 +257,10 @@ class Server:
         self._run_migrations()
         await self._prepare_data()
 
+        # Fail-fast NFS check (runs on every server — the /videos facade serves
+        # everywhere and reads pre-materialized inputs off the shared mount).
+        self._probe_lightx2v_nfs()
+
         init_model_catalog(self._config.model_catalog_file)
         # it's safe to determine server_role after migration
         if self._config.server_role() == Config.ServerRole.BOTH:
@@ -445,6 +449,54 @@ class Server:
         self._create_async_task(VideoStorageJanitor().start())
 
         logger.debug("Video storage janitor started.")
+
+    def _probe_lightx2v_nfs(self):
+        """Verify the LightX2V shared NFS root (<output_root>/inputs) is mounted
+        and read/write-able. new-api writes inputs there and the facade reads
+        them, so both sides must mount the SAME absolute path (§6). Fatal only
+        when lightx2v_require_nfs is set (production video deployments); otherwise
+        a loud warning so a vanilla/dev server without NFS still boots."""
+        from gpustack.routes.videos import _output_root
+
+        root = _output_root()
+        inputs_dir = os.path.join(root, "inputs")
+        require = bool(getattr(self._config, "lightx2v_require_nfs", False))
+
+        def _fail(reason: str):
+            msg = (
+                f"LightX2V NFS check failed at {root}: {reason}. Generation "
+                "inputs and results need this shared NFS mounted and writable "
+                "(must match new-api's NFSRoot)."
+            )
+            if require:
+                logger.error(msg + " lightx2v_require_nfs is set — aborting.")
+                raise SystemExit(1)
+            logger.warning(msg + " Continuing (set lightx2v_require_nfs to enforce).")
+
+        # The root itself must ALREADY exist as a mounted directory — we only
+        # auto-create the inputs/ SUBdir. Auto-creating a missing root would let
+        # a server whose NFS failed to mount silently pass on local disk (then
+        # gpustack and new-api are no longer sharing the same filesystem).
+        if not os.path.isdir(root):
+            return _fail("root directory does not exist (NFS not mounted?)")
+        if not os.path.ismount(root):
+            # A leftover local dir at <root> would let the read/write probe below
+            # pass on local disk while the NFS is actually unmounted (split
+            # storage vs new-api). In require mode this is fatal; otherwise warn.
+            # The deployment bind-mounts <root> as a real mountpoint (lx2v-node.sh
+            # ensure_mount /nfs-output), so ismount is the positive check.
+            return _fail("root is not a mount point (NFS not mounted?)")
+        try:
+            os.makedirs(inputs_dir, exist_ok=True)
+            probe = os.path.join(inputs_dir, f".probe-{os.urandom(8).hex()}")
+            with open(probe, "wb") as f:
+                f.write(b"ok")
+            with open(probe, "rb") as f:
+                f.read()
+            os.remove(probe)
+        except Exception as e:
+            return _fail(f"inputs/ not read/write-able: {e}")
+        logger.info(f"LightX2V NFS root OK: {inputs_dir}")
 
     def _start_worker_status_flusher(self):
         self._create_async_task(flush_worker_status_to_db())

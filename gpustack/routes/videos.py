@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import json
 import logging
 import os
@@ -7,11 +6,13 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, NamedTuple, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import aiohttp
 from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse
+from sqlalchemy import func
+from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack.api.exceptions import (
@@ -19,6 +20,7 @@ from gpustack.api.exceptions import (
     InternalServerErrorException,
     NotFoundException,
     ServiceUnavailableException,
+    TooManyRequestsException,
 )
 from gpustack.config.config import get_global_config
 from gpustack.gateway.utils import model_instance_prefix, router_header_key
@@ -81,9 +83,12 @@ _VIDEO_TASK_TYPES = {"t2v", "i2v", "flf2v", "s2v"}
 # "../../tmp/x" would let save_result_path / input writes escape the output root.
 _VALID_TASK_TYPES = _IMAGE_TASK_TYPES | _VIDEO_TASK_TYPES
 
-# Facade input field -> (engine request field, default extension). The facade
-# accepts a URL (passed through — the engine downloads it) or base64 bytes,
-# which the server persists to NFS and hands the engine a local path (§7.7).
+# Facade input field -> (engine request field, default extension). Inputs are
+# NOT sent as base64/URL anymore: new-api (the trusted caller) pre-materializes
+# every input onto the shared NFS and passes a relative path under <root>/inputs
+# in the request's "input_refs"; the facade validates and maps it to the engine
+# path field here (see docs/lightx2v-nfs-input-design.md §4). The extension is
+# retained only for documentation of the expected content per field.
 _INPUT_FIELDS = {
     "image": ("image_path", ".png"),
     "last_frame": ("last_frame_path", ".png"),
@@ -91,8 +96,20 @@ _INPUT_FIELDS = {
     "audio": ("audio_path", ".wav"),
 }
 
+# The "image" facade field alone may be a LIST (multi-image edit, e.g.
+# qwen-image-edit i2i): each item is persisted and the engine gets a
+# comma-separated image_path (LightX2V splits on "," and reads each). Other
+# fields stay single. Cap the count as a facade backstop — the engine has no
+# hard limit but many images blow VRAM.
+_MAX_INPUT_IMAGES = 5
+
 # Control keys consumed by the facade; never forwarded verbatim to the engine.
-_CONTROL_KEYS = {"model", "task_type", "user_id"} | set(_INPUT_FIELDS.keys())
+# "input_refs" carries the pre-materialized NFS input paths (validated, then
+# mapped to engine path fields); the raw _INPUT_FIELDS keys are rejected outright
+# (see _parse_video_request) but kept here so a stray one can't leak downstream.
+_CONTROL_KEYS = {"model", "task_type", "user_id", "input_refs"} | set(
+    _INPUT_FIELDS.keys()
+)
 
 # Engine-native path fields the facade OWNS. They must never come from the
 # request body: input paths are set only by the facade after materializing
@@ -117,7 +134,11 @@ _ENGINE_STATE_MAP = {
     "cancelled": VideoTaskStateEnum.CANCELED,
 }
 
-_DATA_URI_RE = re.compile(r"^data:[^;]*;base64,", re.IGNORECASE)
+# Admission-control fallback latency (seconds) when a model isn't in the config's
+# lightx2v_model_latency_seconds table — per engine kind (image is fast, video
+# slow). Deliberately conservative so an unknown model doesn't over-admit.
+_DEFAULT_IMAGE_LATENCY = 20
+_DEFAULT_VIDEO_LATENCY = 90
 
 
 def _engine_kind(task_type: str) -> str:
@@ -141,16 +162,6 @@ def _rel_path(
         f"{task_type}-{_sanitize(model_name)}/"
         f"{now:%Y/%m/%d}/{user_id}/{task_id}{ext}"
     )
-
-
-def _is_url(value: str) -> bool:
-    return isinstance(value, str) and value.lower().startswith(("http://", "https://"))
-
-
-def _write_bytes(path: str, data: bytes) -> None:
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "wb") as f:
-        f.write(data)
 
 
 def _ensure_parent_dir(path: str) -> None:
@@ -217,36 +228,177 @@ def _instance_headers(instance: ModelInstance) -> Dict[str, str]:
     }
 
 
-async def _persist_input(
-    body: Dict[str, Any],
-    task_type: str,
-    model_name: str,
-    user_id: int,
-    task_id: str,
-) -> Dict[str, str]:
-    """Materialize any base64 inputs onto shared NFS and return the engine-field
-    overrides (URLs are passed through untouched)."""
+def _validate_input_ref(ref: Any, root: str, user_id: int, field: str) -> str:
+    """Validate one caller-supplied relative input ref and return the absolute
+    engine-visible path.
+
+    new-api (the only holder of the facade key) has already written the file to
+    the shared NFS under the §3 convention
+    (inputs/<task_type>-<model>/YYYY/MM/DD/<user_id>/<gid>-<field>[-i].<ext>).
+    The facade never trusts a raw absolute path (IDOR): it only accepts a path
+    RELATIVE to <root> and re-derives the absolute path itself. Rejects (400):
+    non-string/empty; absolute; anything that (after normpath/realpath) escapes
+    <root>/inputs; a user_id segment != the request user (cross-tenant read); a
+    missing file.
+    """
+    if not isinstance(ref, str) or not ref.strip():
+        raise BadRequestException(
+            message=f"Invalid input ref for '{field}'", is_openai_exception=True
+        )
+    ref = ref.strip()
+    if os.path.isabs(ref) or ref.startswith("/"):
+        raise BadRequestException(
+            message=f"Input ref for '{field}' must be relative to the NFS root",
+            is_openai_exception=True,
+        )
+    norm = os.path.normpath(ref)
+    # inputs/ subtree only: results live under <root>/<feature>/... (not inputs/),
+    # so this also blocks using another task's OUTPUT as an input.
+    if norm != "inputs" and not norm.startswith("inputs" + os.sep):
+        raise BadRequestException(
+            message=f"Input ref for '{field}' must be under inputs/",
+            is_openai_exception=True,
+        )
+    abs_path = os.path.join(root, norm)
+    resolved = os.path.realpath(abs_path)
+    inputs_root = os.path.realpath(os.path.join(root, "inputs"))
+    if not resolved.startswith(inputs_root + os.sep):
+        raise BadRequestException(
+            message=f"Input ref for '{field}' escapes the inputs root",
+            is_openai_exception=True,
+        )
+    # Tenant binding: the file's immediate parent dir is the owning user_id (§3).
+    # Check it on the REALPATH-resolved target, not the raw ref — otherwise a
+    # symlink under inputs/<user>/ pointing into another tenant's dir would pass
+    # (it stays under inputs_root and the raw segment reads as this user) yet the
+    # engine would read the other tenant's file. Resolving first closes that.
+    if Path(resolved).parent.name != str(user_id):
+        raise BadRequestException(
+            message=f"Input ref for '{field}' does not match the request user",
+            is_openai_exception=True,
+        )
+    if not os.path.isfile(resolved):
+        raise BadRequestException(
+            message=f"Input file for '{field}' not found on storage",
+            is_openai_exception=True,
+        )
+    return abs_path
+
+
+def _as_ref_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [v for v in value if v]
+    return [value]
+
+
+def _resolve_input_refs(input_refs: Any, user_id: int) -> Dict[str, str]:
+    """Validate the caller's pre-materialized NFS input refs and map them to
+    engine path fields → {engine_field: comma-joined absolute path(s)}.
+
+    input_refs shape: {"image": [rel, ...], "last_frame": [rel], ...} with keys
+    in _INPUT_FIELDS. Only "image" may carry up to _MAX_INPUT_IMAGES paths
+    (multi-image edit → comma-separated image_path); all other fields are single.
+    A mask edits a single image.
+    """
+    if input_refs is None:
+        return {}
+    if not isinstance(input_refs, dict):
+        raise BadRequestException(
+            message="input_refs must be an object", is_openai_exception=True
+        )
+    root = _output_root()
     overrides: Dict[str, str] = {}
-    for field, (engine_field, ext) in _INPUT_FIELDS.items():
-        value = body.get(field)
-        if not value:
+    image_refs = _as_ref_list(input_refs.get("image"))
+    if len(image_refs) > _MAX_INPUT_IMAGES:
+        raise BadRequestException(
+            message=f"Too many images: {len(image_refs)} (max {_MAX_INPUT_IMAGES})",
+            is_openai_exception=True,
+        )
+    if input_refs.get("image_mask") and len(image_refs) != 1:
+        # A mask edits exactly one base image — reject both "mask + many images"
+        # and "mask + no image" (the latter would submit image_mask_path with no
+        # image_path, wasting queue/GPU before failing in the engine).
+        raise BadRequestException(
+            message="image_mask requires exactly one image",
+            is_openai_exception=True,
+        )
+    for field, (engine_field, _ext) in _INPUT_FIELDS.items():
+        refs = _as_ref_list(input_refs.get(field))
+        if not refs:
             continue
-        if _is_url(value):
-            overrides[engine_field] = value
-            continue
-        raw = _DATA_URI_RE.sub("", value) if isinstance(value, str) else value
-        try:
-            data = base64.b64decode(raw)
-        except Exception as e:
+        if field != "image" and len(refs) > 1:
             raise BadRequestException(
-                message=f"Invalid base64 for input '{field}': {e}",
+                message=f"'{field}' accepts a single input, got {len(refs)}",
                 is_openai_exception=True,
             )
-        rel = f"inputs/{_rel_path(task_type, model_name, user_id, f'{task_id}-{field}', ext)}"
-        abs_path = os.path.join(_output_root(), rel)
-        await asyncio.to_thread(_write_bytes, abs_path, data)
-        overrides[engine_field] = abs_path
+        overrides[engine_field] = ",".join(
+            _validate_input_ref(r, root, user_id, field) for r in refs
+        )
     return overrides
+
+
+def _model_latency(cfg, model_name: str, task_type: str) -> int:
+    """Per-model single-instance latency (seconds) for the admission estimate.
+    Config table keyed by model name (case-insensitive substring match); falls
+    back to a per-kind default for unknown models."""
+    table = getattr(cfg, "lightx2v_model_latency_seconds", None) or {}
+    name = (model_name or "").lower()
+    for key, val in table.items():
+        if key and str(key).lower() in name:
+            try:
+                return int(val)
+            except (TypeError, ValueError):
+                continue
+    return (
+        _DEFAULT_IMAGE_LATENCY
+        if _engine_kind(task_type) == "image"
+        else _DEFAULT_VIDEO_LATENCY
+    )
+
+
+async def _check_admission(
+    session: AsyncSession,
+    model_id,
+    model_name: str,
+    task_type: str,
+    running: list,
+) -> None:
+    """Admission control (backpressure): reject with 429 when the estimated queue
+    wait for this model exceeds the configured tolerance, so a saturated cluster
+    fails fast instead of letting the task sit QUEUED until an upstream sync poll
+    times out. estimated_wait = floor(non_terminal / instances) * latency."""
+    cfg = get_global_config()
+    if not cfg or not getattr(cfg, "lightx2v_admission_enabled", True):
+        return
+    instances = len(running)
+    if instances <= 0:
+        # No capacity to reason about; the no-running-instance 503 handles it.
+        return
+    stmt = (
+        select(func.count())
+        .select_from(VideoGenerationTask)
+        .where(
+            VideoGenerationTask.model_id == model_id,
+            VideoGenerationTask.state.notin_(list(VIDEO_TASK_TERMINAL_STATES)),
+        )
+    )
+    depth = (await session.exec(stmt)).first() or 0
+    latency = _model_latency(cfg, model_name, task_type)
+    est_wait = (int(depth) // instances) * latency
+    if _engine_kind(task_type) == "image":
+        max_wait = getattr(cfg, "lightx2v_image_max_queue_wait_seconds", 25)
+    else:
+        max_wait = getattr(cfg, "lightx2v_video_max_queue_wait_seconds", 150)
+    if est_wait > int(max_wait):
+        raise TooManyRequestsException(
+            message=(
+                "系统繁忙,请稍后再试 "
+                f"(estimated queue wait {est_wait}s > {max_wait}s)"
+            ),
+            is_openai_exception=True,
+        )
 
 
 async def _parse_video_request(
@@ -274,6 +426,18 @@ async def _parse_video_request(
             message=(
                 f"Invalid task_type '{task_type}'. "
                 f"Expected one of: {', '.join(sorted(_VALID_TASK_TYPES))}"
+            ),
+            is_openai_exception=True,
+        )
+    # Raw base64/URL inputs are no longer accepted — inputs must be
+    # pre-materialized onto shared NFS and passed via "input_refs" (§4.1). Fail
+    # loud so a mis-integrated caller doesn't silently lose its images.
+    raw_inputs = [f for f in _INPUT_FIELDS if body.get(f)]
+    if raw_inputs:
+        raise BadRequestException(
+            message=(
+                f"Raw inputs {raw_inputs} are no longer accepted; pass "
+                "pre-materialized NFS paths via 'input_refs'"
             ),
             is_openai_exception=True,
         )
@@ -307,6 +471,9 @@ async def create_video_task(request: Request, user: CurrentUserDep):
     async with async_session() as session:
         model = await _resolve_target_model(session, request, user, model_name)
         running = await ModelInstanceService(session).get_running_instances(model.id)
+        # Backpressure: reject fast (429) before creating any row if the queue
+        # for this model is already too deep (§4.1).
+        await _check_admission(session, model.id, model_name, task_type, running)
         instance = await select_least_pending_instance(session, running)
         if instance is None:
             raise ServiceUnavailableException(
@@ -321,11 +488,9 @@ async def create_video_task(request: Request, user: CurrentUserDep):
             )
 
     # Build the engine body: pass request fields through untouched (no
-    # validation), override the input fields with resolved NFS/URL locations,
-    # and dictate the output path so the result lands at our §7.2 NFS path.
-    input_overrides = await _persist_input(
-        body, task_type, model_name, user_id, public_id
-    )
+    # validation), map the validated NFS input refs to engine path fields, and
+    # dictate the output path so the result lands at our §7.2 NFS path.
+    input_overrides = _resolve_input_refs(body.get("input_refs"), user_id)
     engine_body: Dict[str, Any] = {
         k: v
         for k, v in body.items()
@@ -680,6 +845,73 @@ async def get_video_task_content(task_id: str, user: CurrentUserDep):
             message="Result file missing on storage", is_openai_exception=True
         )
     return FileResponse(resolved, filename=os.path.basename(resolved))
+
+
+async def _cancel_on_engine(
+    proxy_client,
+    no_proxy_client,
+    worker: Worker,
+    instance: ModelInstance,
+    native_task_id: str,
+) -> None:
+    """Best-effort: ask the mapped instance to abort a running/pending task
+    (engine DELETE /v1/tasks/{id}). Failure is non-fatal — the row is already
+    CANCELED (authoritative) and any orphan output is reaped by the janitor."""
+    try:
+        await request_to_worker(
+            worker=worker,
+            method="DELETE",
+            path=f"v1/tasks/{native_task_id}",
+            proxy_client=proxy_client,
+            no_proxy_client=no_proxy_client,
+            headers={router_header_key: f"{model_instance_prefix(instance)}.static"},
+            timeout=aiohttp.ClientTimeout(total=_STATUS_TIMEOUT),
+            raise_on_error=False,
+        )
+    except Exception as e:
+        logger.debug(f"Engine cancel for native task {native_task_id} failed: {e}")
+
+
+@router.post("/videos/{task_id}/cancel")
+async def cancel_video_task(task_id: str, request: Request, user: CurrentUserDep):
+    """Cancel a non-terminal task. Marks the row CANCELED (authoritative: the
+    sweeper won't re-dispatch a terminal task, GET returns canceled, content
+    404s) and best-effort tells the mapped instance to abort so the GPU stops.
+    Idempotent on already-terminal tasks. Used by new-api on client disconnect /
+    sync timeout to stop wasted generation (§4.2)."""
+    async with async_session() as session:
+        task = await VideoGenerationTask.one_by_field(session, "task_id", task_id)
+        if not task:
+            raise NotFoundException(message="Task not found", is_openai_exception=True)
+        _authorize_task(task, user)
+        if task.state in VIDEO_TASK_TERMINAL_STATES:
+            return _public(task)
+        instance = None
+        worker = None
+        native_task_id = task.native_task_id
+        if task.instance_id and native_task_id:
+            instance = await ModelInstanceService(session).get_by_id(task.instance_id)
+            if instance and instance.state == ModelInstanceStateEnum.RUNNING:
+                worker = await WorkerService(session).get_by_id(instance.worker_id)
+        await task.update(
+            session,
+            {
+                "state": VideoTaskStateEnum.CANCELED,
+                "state_message": "canceled by client",
+            },
+        )
+    # Engine abort outside the DB session (round-trip must not pin a connection).
+    if worker and instance and native_task_id:
+        await _cancel_on_engine(
+            request.app.state.http_client,
+            request.app.state.http_client_no_proxy,
+            worker,
+            instance,
+            native_task_id,
+        )
+    async with async_session() as session:
+        task = await VideoGenerationTask.one_by_field(session, "task_id", task_id)
+    return _public(task)
 
 
 def _public(task: VideoGenerationTask) -> Dict[str, Any]:

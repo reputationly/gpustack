@@ -177,6 +177,31 @@ class Config(WorkerConfig, BaseSettings):
     # watermark (fractions in [0, 1]). Guards against the NFS filling before TTL.
     lightx2v_storage_high_watermark: Optional[float] = 0.85
     lightx2v_storage_low_watermark: Optional[float] = 0.70
+    # LightX2V admission control (backpressure). The facade rejects a submit with
+    # 429 when the estimated queue wait for the target model exceeds the tolerance
+    # below, so a saturated cluster fails fast instead of letting the task sit
+    # QUEUED until an upstream sync poll times out (see
+    # new-api docs/gpustackplus-sync-image-backpressure.md §4.1). Editable at
+    # runtime via /config (Storage Settings page).
+    #   estimated_wait = floor(non_terminal_tasks / running_instances) * latency
+    # where latency comes from lightx2v_model_latency_seconds (per public model
+    # name; falls back to the image/video default below).
+    lightx2v_admission_enabled: bool = True
+    # Tolerated queue wait (seconds) before rejecting. Image is the sync link
+    # (aligned with new-api's ~25s QUEUED timeout); video is async (poll-based),
+    # so it tolerates much longer.
+    lightx2v_image_max_queue_wait_seconds: int = 25
+    lightx2v_video_max_queue_wait_seconds: int = 150
+    # Per-model single-instance hot-state latency (seconds), keyed by public model
+    # name (substring match, case-insensitive). Defaults from the LightX2V test
+    # reports. Unknown models fall back to a per-kind default (image/video).
+    lightx2v_model_latency_seconds: Optional[Dict[str, int]] = None
+    # When set, the server aborts at startup if the LightX2V shared NFS root
+    # (<lightx2v_output_root>/inputs) isn't mounted+writable. Off by default so a
+    # vanilla/dev server (no NFS) still boots — production video deployments set
+    # it True to fail fast on a mis-mounted/mismatched NFS (must equal new-api's
+    # NFSRoot). See docs/lightx2v-nfs-input-design.md §6.
+    lightx2v_require_nfs: bool = False
     enable_cors: bool = False
     allow_origins: Optional[List[str]] = ['*']
     allow_credentials: bool = False

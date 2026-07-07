@@ -74,6 +74,9 @@ InternalServerErrorException = http_exception_factory(
     "InternalServerError",
     "Internal server error",
 )
+TooManyRequestsException = http_exception_factory(
+    status.HTTP_429_TOO_MANY_REQUESTS, "TooManyRequests", "Too many requests"
+)
 ServiceUnavailableException = http_exception_factory(
     status.HTTP_503_SERVICE_UNAVAILABLE, "ServiceUnavailable", "Service unavailable"
 )

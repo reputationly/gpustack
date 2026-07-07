@@ -151,10 +151,16 @@ class VideoStorageJanitor:
             if isinstance(params, dict):
                 for key in _INPUT_PATH_PARAM_KEYS:
                     value = params.get(key)
-                    # Only local NFS paths (base64-materialized inputs); URL
-                    # inputs are downloaded by the engine, not on our disk.
-                    if isinstance(value, str) and value.startswith("/"):
-                        protected.add(Path(value).parent.parent)
+                    if not isinstance(value, str):
+                        continue
+                    # image_path may hold multiple comma-separated local paths
+                    # (multi-image edit). Protect each one's day dir. Only local
+                    # NFS paths (base64-materialized inputs) — URL inputs are
+                    # downloaded by the engine, not on our disk.
+                    for one in value.split(","):
+                        one = one.strip()
+                        if one.startswith("/"):
+                            protected.add(Path(one).parent.parent)
         return protected
 
     def _sweep_ttl(
