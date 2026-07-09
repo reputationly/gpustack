@@ -16,14 +16,15 @@ bash /root/lx2v-node.sh install --token <GPUSTACK_TOKEN>
 # 升级本节点的 gpustack worker 镜像(token/卷/IP/server-url 全自动继承):
 bash /root/lx2v-node.sh upgrade-gpustack
 
-# 升级本节点的 lightx2v 引擎镜像(之后到 UI 逐个删实例重建生效):
-bash /root/lx2v-node.sh upgrade-engine
+# 升级本节点的引擎镜像(之后到 UI 逐个删实例重建生效):
+bash /root/lx2v-node.sh upgrade-engine                     # lightx2v(默认)
+bash /root/lx2v-node.sh upgrade-engine --engine indextts   # IndexTTS-2 语音引擎
 
 # 节点健康速览 / 清理残留:
 bash /root/lx2v-node.sh status
 bash /root/lx2v-node.sh clean [--purge-data] [--kill-gpu-procs]
 
-# (238 上)出了新包之后,更新 NFS 上的 tar 和脚本副本:
+# (238 上)出了新包之后,更新 NFS 上的 tar(三镜像)和脚本副本:
 bash /root/lx2v-node.sh prepare-transfer
 ```
 
@@ -32,6 +33,8 @@ bash /root/lx2v-node.sh prepare-transfer
 - 任何失败都会打印**原因分析和操作建议**,先照建议做,再看日志。
 
 **当前版本基线**(2026-07-06):gpustack `lx2v-dev` = `lx2v-20260706-0854-cb10ba09`(镜像 ID `1454d55e522d`);引擎 `arm64-a100-latest` = `2d259627e8e1`。节点上 `docker images` 对得上这两个 ID 即为最新。
+
+> **2026-07-09 起**:gpustack `lx2v-dev` 重新出包(含 IndexTTS-2 内置后端 + 语音反压 UI),并新增第三镜像 **`indextts2:arm64-a100-latest`**(IndexTTS-2 语音引擎,tar ~10G;tag 必须与 gpustack 内置后端注册表一致,勿改名)。集群升级后请以 `docker images` 实际 ID 刷新本行基线。
 
 ---
 
@@ -70,7 +73,7 @@ token 是**集群级注册令牌,所有 worker 复用同一个**;忘了就在任
 - `--clean-residue`:残留扫描发现孤儿引擎容器时一并硬杀;
 - `--force`:检测到**同 token** 的现有 worker 时才需要(见 1.5)。
 
-### 1.4 八个步骤与耗时参照(0004/0005 实测)
+### 1.4 九个步骤与耗时参照(1-8 为 0004/0005 实测;step 8 为 2026-07-09 新增)
 
 | step | 内容 | 参考耗时 | 说明 |
 |---|---|---|---|
@@ -80,8 +83,9 @@ token 是**集群级注册令牌,所有 worker 复用同一个**;忘了就在任
 | 4 | 挂 NFS + `/data`、`/nfs-data` 软链 | 秒级 | fstab 两行 + mount |
 | 5 | nvidia-container-toolkit | **5-8min** | 源配置来自 NFS `nvidia-repo/`,deb 包从 nvidia.github.io 在线下载(慢是网络,不是卡死) |
 | 6 | gpustack 镜像(NFS tar load) | ~1.5min | 4.4G |
-| 7 | 引擎镜像(NFS tar load) | ~4min | 9.8G(docker 29 containerd 存储的压缩导出,比虚拟大小小是正常的) |
-| 8 | 起 worker + 注册/healthz 验证 | ~2min | 旧容器(如有)到这一步才移除,前面失败节点仍有原 worker |
+| 7 | lightx2v 引擎镜像(NFS tar load) | ~4min | 9.8G(docker 29 containerd 存储的压缩导出,比虚拟大小小是正常的) |
+| 8 | indextts2 引擎镜像(NFS tar load) | ~4min(预估) | ~10G;全节点预载,TTS 整卡单实例可落任意空闲卡 |
+| 9 | 起 worker + 注册/healthz 验证 | ~2min | 旧容器(如有)到这一步才移除,前面失败节点仍有原 worker |
 
 **成功标志**:`Worker dev-gpustack-a100-000N registered with worker_id N` + `本机 healthz OK`,UI Resources → Workers 转 **Ready**。
 
@@ -116,13 +120,17 @@ bash /root/lx2v-node.sh upgrade-gpustack --offline  # 或从 NFS tar load(需先
 
 **server(238)不用这个脚本**——它是 x86 且参数不同,按全记录 §3.1 的三条命令手工升级(pull → stop/rm → 原参数 run;数据卷是 `gpustack-data`,迁移自动跑)。
 
-### 2.2 升级 lightx2v 引擎镜像(upgrade-engine)
+### 2.2 升级引擎镜像(upgrade-engine)
 
-**何时用**:LightX2V 仓改了 profiles/configs/launcher、CI 出了新 `arm64-a100-latest` 之后。
+**何时用**:LightX2V 仓改了 profiles/configs/launcher、或 index-tts 仓 CI 出了新引擎包之后。
 
 ```bash
-bash /root/lx2v-node.sh upgrade-engine    # 打印 旧ID -> 新ID
+bash /root/lx2v-node.sh upgrade-engine                     # lightx2v(默认),打印 旧ID -> 新ID
+bash /root/lx2v-node.sh upgrade-engine --engine indextts   # IndexTTS-2 语音引擎
 ```
+
+IndexTTS-2 引擎镜像 tag(`indextts2:arm64-a100-latest`)必须与 gpustack 内置后端注册表
+(`schemas/inference_backend.py` 的 image_name)完全一致——worker 按名匹配本地镜像。
 
 **⚠️ 关键**:换镜像**不影响正在运行的实例**(它们锁旧镜像 ID)。生效方式:UI → Instance List → **逐个删除实例**让其自动重建(先删一个、等新的 Running 再删下一个,服务不断)。
 
@@ -133,7 +141,7 @@ bash /root/lx2v-node.sh upgrade-engine    # 打印 旧ID -> 新ID
 bash /root/lx2v-node.sh prepare-transfer
 ```
 
-做四件事:拉双镜像 arm64 变体 → save 两个 tar 到 NFS(带写入进度,`.tmp`+`mv` 防半截)→ **x86 机器上自动把本地 gpustack tag 拉回 amd64**(否则 238 之后重建 server 容器会 exec format error——坑 §5.5)→ 把脚本自身同步到 `_transfer/`。
+做四件事:拉**三镜像**(gpustack / lightx2v / indextts2)arm64 变体 → save **三个 tar** 到 NFS(带写入进度,`.tmp`+`mv` 防半截)→ **x86 机器上自动把本地 gpustack tag 拉回 amd64**(否则 238 之后重建 server 容器会 exec format error——坑 §5.5)→ 把脚本自身同步到 `_transfer/`。
 
 ---
 
@@ -142,7 +150,7 @@ bash /root/lx2v-node.sh prepare-transfer
 ```bash
 bash /root/lx2v-node.sh status
 ```
-一屏看:worker 容器状态/healthz、两镜像 ID(与 §0 基线比对)、NFS 挂载、每卡显存、引擎实例容器(按 runtime label 精确识别,含 -init/-unhealthy-restart)。
+一屏看:worker 容器状态/healthz、三镜像 ID(gpustack/lightx2v/indextts2,与 §0 基线比对)、NFS 挂载、每卡显存、引擎实例容器(按 runtime label 精确识别,含 -init/-unhealthy-restart)。
 
 ```bash
 bash /root/lx2v-node.sh clean                     # 删 worker + 硬杀全部引擎实例容器(kill+sleep+rm -f)
@@ -156,17 +164,18 @@ bash /root/lx2v-node.sh clean --kill-gpu-procs    # 追加 kill -9 GPU 上全部
 
 ## 4. 部署后操作:上模型(UI)
 
-### 4.1 四模型部署参数速查
+### 4.1 模型部署参数速查
 
-统一部分:Source=Local Path,Backend=**LightX2V**,Version=Auto,Scheduling=Manual 勾卡。
+统一部分:Source=Local Path,Version=Auto,Scheduling=Manual 勾卡;Backend 视模型:图片/视频=**LightX2V**,语音=**IndexTTS**。
 
-| 模型 | Model Path(`/nfs-models/wuhanjisuan894/` 下) | GPUs/Replica | Category | Backend Parameters | 显存/加载参考 |
-|---|---|---|---|---|---|
-| z-image(t2i) | `models/Z-Image-Turbo` | **1** | Image | 无 | ~20G,秒级出图 |
-| wan2.2-t2v | `models/Wan-AI/Wan2.2-T2V-A14B` | **4** | Video | 无 | ~35G/卡,载入~60s,720p/81帧~60s |
-| wan2.2-i2v | **同上 T2V 目录**(I2V 无独立基座) | **4** | Video | **`--model-cls wan2.2_moe_distill` + `--task i2v`(必填)** | ~33G/卡,720p~87s |
-| qwen-image-edit(i2i) | `models/Qwen-Image-Edit-2511` | **1** | Image | 无(路径含 Edit 自动选型) | ~20G,载入~86s,热态~22-38s |
-| qwen-image(t2i,未上) | `models/Qwen-Image`(以实际为准) | **1** | Image | `--task t2i` | 热态~17s |
+| 模型 | Model Path(`/nfs-models/wuhanjisuan894/` 下) | Backend | GPUs/Replica | Category | Backend Parameters | 显存/加载参考 |
+|---|---|---|---|---|---|---|
+| z-image(t2i) | `models/Z-Image-Turbo` | LightX2V | **1** | Image | 无 | ~20G,秒级出图 |
+| wan2.2-t2v | `models/Wan-AI/Wan2.2-T2V-A14B` | LightX2V | **4** | Video | 无 | ~35G/卡,载入~60s,720p/81帧~60s |
+| wan2.2-i2v | **同上 T2V 目录**(I2V 无独立基座) | LightX2V | **4** | Video | **`--model-cls wan2.2_moe_distill` + `--task i2v`(必填)** | ~33G/卡,720p~87s |
+| qwen-image-edit(i2i) | `models/Qwen-Image-Edit-2511` | LightX2V | **1** | Image | 无(路径含 Edit 自动选型) | ~20G,载入~86s,热态~22-38s |
+| qwen-image(t2i,未上) | `models/Qwen-Image`(以实际为准) | LightX2V | **1** | Image | `--task t2i` | 热态~17s |
+| **IndexTTS-2(tts)** | `models/IndexTTS-2`(权重目录,含 config.yaml/gpt.pth/s2mel.pth/qwen0.6bemo4-merge 等,来源 `indextts2-checkpoints.tar.gz` 解压) | **IndexTTS** | **1** | 自动打 text_to_speech | **无(会被忽略并告警——引擎全部 env 配置,如 `INDEXTTS_MAX_QUEUE`)** | 空载 ~8-10G 但**整卡预订**(长文本峰值设计);载入 ~1-2min,`/ready` 200 才 Running |
 
 **部署口诀**:
 - **单卡模型显式设 GPUs per Replica=1**——Manual 勾 N 卡 + M 副本时调度器按 N÷M 分卡,勾 2 卡 1 副本会分成 2 卡/实例,launcher 找不到 2 卡变体直接失败(坑 17-8,防呆按设计工作);
@@ -181,26 +190,29 @@ bash /root/lx2v-node.sh clean --kill-gpu-procs    # 追加 kill -9 GPU 上全部
 # ① launcher 选型(实例容器日志第一行,最重要的验收点):
 docker logs $(docker ps --format '{{.Names}}' | grep <模型名> | grep run) 2>&1 | grep lx2v-launcher | head -2
 # 必须命中预期 profile,如: model_cls=wan2.2_moe_distill gpus=4 profile=wan2.2-i2v/int8-4card
+# IndexTTS 实例无 launcher,验收点是模型加载完成 + /ready 转 200:
+#   docker logs <实例容器> 2>&1 | grep -E "task worker started|Uvicorn running" | head -2
+#   curl -s -o /dev/null -w '%{http_code}\n' http://<节点IP>:<实例端口>/ready   # 200=就绪,503=加载中
 
 # ② 资源就位:watch nvidia-smi 看显存爬到参考值;qwen 系再看主机内存:
 grep -E 'Shmem|MemAvailable' /proc/meminfo    # 别用 free 的 used 列,不计 Shmem 会严重低估
 
 # ③ 端到端冒烟(238 上,$KEY 为 All models 权限的 API key):
-# 文生:
+# 文生(t2v/t2i,无输入文件,可直连门面):
 curl -s -X POST http://10.0.0.238/v1/videos -H "Authorization: Bearer $KEY" \
   -H "Content-Type: application/json" \
   -d '{"model":"<模型名>","task_type":"t2v","prompt":"...","target_video_length":81,"user_id":1}'
-# 图生(i2i/i2v,带 base64 输入):
-b64=$(base64 -w0 <本地图>.png)
-cat > /tmp/req.json <<EOF
-{"model":"<模型名>","task_type":"i2v","prompt":"...","image":"data:image/png;base64,${b64}","target_video_length":81,"user_id":1}
-EOF
-curl -s -X POST http://10.0.0.238/v1/videos -H "Authorization: Bearer $KEY" \
-  -H "Content-Type: application/json" --data @/tmp/req.json
 # → 轮询: GET /v1/videos/<task_id>;done 后: GET /v1/videos/<task_id>/content 下载
+#
+# ⚠️ 带输入文件的任务(i2i/i2v 的图、tts 的参考音)门面已改走 input_refs:
+#   raw base64/URL 字段会被 400 拒(NFS input 改造后契约,见 lightx2v-nfs-input-design.md)。
+#   直连门面冒烟需先把输入手工放到 /nfs-output/inputs/<task_type>-<模型>/YYYY/MM/DD/<user_id>/
+#   再在请求里传 input_refs 相对路径——繁琐,**推荐直接走 new-api(体验区或 API)冒烟**,
+#   由 new-api 自动物化输入。tts 示例(new-api 侧):
+#   POST /pg/videos {"model":"<TTS模型>","prompt":"你好","metadata":{"task_type":"tts","voice":"<base64 wav>"}}
 ```
 
-产物路径约定:输出 `/nfs-output/<task_type>-<模型名>/YYYY/MM/DD/<user_id>/<task_id>.{png,mp4}`;base64 输入持久化在 `/nfs-output/inputs/<同结构>/<task_id>-image.png`。
+产物路径约定:输出 `/nfs-output/<task_type>-<模型名>/YYYY/MM/DD/<user_id>/<task_id>.{png,mp4,wav}`;输入(经 new-api 物化)在 `/nfs-output/inputs/<同结构>/<gid>-<字段>.{png,wav}`。
 
 ---
 
