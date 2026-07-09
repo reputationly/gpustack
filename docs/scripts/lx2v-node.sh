@@ -4,10 +4,11 @@
 # 用法(在 GPU 节点上以 root 执行):
 #   ./lx2v-node.sh install --token <GPUSTACK_TOKEN> [--worker-ip <IP>] [--offline] [--clean-residue] [--force]
 #   ./lx2v-node.sh upgrade-gpustack [--offline]     # 换 gpustack:lx2v-dev 并原参数重启 worker
-#   ./lx2v-node.sh upgrade-engine   [--offline]     # 换 lightx2v 引擎镜像(实例需重建才生效)
+#   ./lx2v-node.sh upgrade-engine   [--engine lightx2v|indextts] [--offline]
+#                                                    # 换引擎镜像(默认 lightx2v;实例需重建才生效)
 #   ./lx2v-node.sh clean [--purge-data] [--kill-gpu-procs]   # 清理卸载残留(见下)
 #   ./lx2v-node.sh status                            # 节点健康速览
-#   ./lx2v-node.sh prepare-transfer                  # (238/有 ACR 外网的机器)拉镜像存 NFS tar
+#   ./lx2v-node.sh prepare-transfer                  # (238/有 ACR 外网的机器)拉三镜像(gpustack/lightx2v/indextts2)存 NFS tar
 #
 # 残留环境(装过 GPUStack 又卸载/被清理过的节点):
 #   install 自带残留检测——异 token 的旧 worker 自动移除重建,同 token(同集群)需加 --force;
@@ -33,6 +34,9 @@ set -Eeuo pipefail
 REGISTRY="crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly"
 GPUSTACK_IMAGE="${REGISTRY}/gpustack:lx2v-dev"
 ENGINE_IMAGE="${REGISTRY}/lightx2v:arm64-a100-latest"
+# IndexTTS-2 语音合成引擎(独立 CI 出包)。tag 必须与 gpustack 内置后端注册表
+# (schemas/inference_backend.py 的 image_name)完全一致——worker 本地 load 后按名匹配。
+INDEXTTS_IMAGE="${REGISTRY}/indextts2:arm64-a100-latest"
 SERVER_URL="${SERVER_URL:-http://10.0.0.238}"
 NFS_SERVER="100.125.40.2"
 NFS_MODELS_EXPORT="/share-LLM"
@@ -40,6 +44,7 @@ NFS_OUTPUT_EXPORT="/share-output"
 TRANSFER_DIR="/nfs-models/_transfer"
 GPUSTACK_TAR="${TRANSFER_DIR}/gpustack-lx2v-dev-arm64.tar"
 ENGINE_TAR="${TRANSFER_DIR}/lightx2v-arm64-profiles.tar"
+INDEXTTS_TAR="${TRANSFER_DIR}/indextts2-arm64-a100.tar"
 NVIDIA_REPO_DIR="${TRANSFER_DIR}/nvidia-repo"
 WORKER_NAME="gpustack-worker"
 WORKER_PORT=10150
@@ -133,6 +138,7 @@ resolve_worker_ip() {
 parse_flags() {
   TOKEN="${GPUSTACK_TOKEN:-}"
   WORKER_IP=""
+  ENGINE_SEL="lightx2v"
   OFFLINE=0
   CLEAN_RESIDUE=0
   PURGE_DATA=0
@@ -142,6 +148,7 @@ parse_flags() {
     case "$1" in
       --token) TOKEN="$2"; shift 2 ;;
       --worker-ip) WORKER_IP="$2"; shift 2 ;;
+      --engine) ENGINE_SEL="$2"; shift 2 ;;
       --offline) OFFLINE=1; shift ;;
       --clean-residue) CLEAN_RESIDUE=1; shift ;;
       --purge-data) PURGE_DATA=1; shift ;;
@@ -386,7 +393,7 @@ cmd_install() {
   [ -n "$TOKEN" ] || die "install 需要 --token" \
     "在既有 worker 节点上取: docker inspect ${WORKER_NAME} --format '{{range .Config.Env}}{{println .}}{{end}}' | grep GPUSTACK_TOKEN" \
     "同一集群的注册令牌可复用于多台 worker"
-  STEP_TOTAL=8
+  STEP_TOTAL=9
 
   step "预检:GPU 驱动 / 架构"
   nvidia-smi -L || die "nvidia-smi 不可用" "先安装 GPU 驱动(A100 节点镜像通常自带,重装过系统的机器需补装)"
@@ -395,7 +402,7 @@ cmd_install() {
   step "残留检测(装过 GPUStack 又卸载/清理过的节点)"
   scan_residue
   # 此时旧容器还在:worker IP 可从旧容器继承,且 IP 定不下来时秒级失败,
-  # 不浪费后面 30 分钟;旧容器要到 step 8 起新容器前一刻才移除,
+  # 不浪费后面 30 分钟;旧容器要到 step 9 起新容器前一刻才移除,
   # 中途任何一步失败节点上仍有原 worker
   resolve_worker_ip
   echo "    worker-ip=${WORKER_IP}"
@@ -430,6 +437,11 @@ cmd_install() {
 
   step "镜像:lightx2v 引擎(NFS tar 优先,无则在线拉)"
   fetch_image_prefer_tar "$ENGINE_IMAGE" "$ENGINE_TAR"
+
+  step "镜像:indextts2 引擎(NFS tar 优先,无则在线拉)"
+  # 全节点预载(同 lightx2v 思路):TTS 整卡单实例,调度器可落任意空闲卡,
+  # 新节点装完即可被调度,免去"记得补跑 upgrade-engine --engine indextts"的人为坑
+  fetch_image_prefer_tar "$INDEXTTS_IMAGE" "$INDEXTTS_TAR"
 
   step "起 worker 并验证注册"
   docker rm -f "$WORKER_NAME" 2>/dev/null || true
@@ -518,16 +530,23 @@ cmd_upgrade_gpustack() {
 
 cmd_upgrade_engine() {
   parse_flags "$@"
+  # --engine 选择要换的引擎镜像;默认 lightx2v,与历史行为一致
+  local img tar
+  case "$ENGINE_SEL" in
+    lightx2v) img="$ENGINE_IMAGE";   tar="$ENGINE_TAR" ;;
+    indextts) img="$INDEXTTS_IMAGE"; tar="$INDEXTTS_TAR" ;;
+    *) die "未知引擎: $ENGINE_SEL" "--engine 只支持 lightx2v | indextts" ;;
+  esac
   STEP_TOTAL=2
-  step "当前引擎镜像"
+  step "当前引擎镜像(${ENGINE_SEL})"
   local old_id
-  old_id="$(docker images --format '{{.ID}}' "$ENGINE_IMAGE" | head -1 || true)"
+  old_id="$(docker images --format '{{.ID}}' "$img" | head -1 || true)"
   echo "    old=${old_id:-<无>}"
 
   step "拉取/加载新引擎镜像"
-  fetch_image "$ENGINE_IMAGE" "$ENGINE_TAR"
+  fetch_image "$img" "$tar"
   local new_id
-  new_id="$(docker images --format '{{.ID}}' "$ENGINE_IMAGE" | head -1)"
+  new_id="$(docker images --format '{{.ID}}' "$img" | head -1)"
   if [ "$old_id" = "$new_id" ]; then
     echo "    镜像未变化(已是最新)"
   else
@@ -546,7 +565,7 @@ cmd_status() {
   echo "--- 本机 healthz:"
   curl -sf --max-time 3 "http://127.0.0.1:${WORKER_PORT}/healthz" && echo "  OK" || echo "  不通"
   echo "--- 镜像:"
-  docker images --format '  {{.ID}}  {{.Repository}}:{{.Tag}}' | grep -E "gpustack|lightx2v" || true
+  docker images --format '  {{.ID}}  {{.Repository}}:{{.Tag}}' | grep -E "gpustack|lightx2v|indextts" || true
   echo "--- NFS:"
   mountpoint -q /nfs-models && echo "  /nfs-models OK" || echo "  /nfs-models 未挂载"
   mountpoint -q /nfs-output && echo "  /nfs-output OK" || echo "  /nfs-output 未挂载"
@@ -567,16 +586,17 @@ cmd_status() {
 
 cmd_prepare_transfer() {
   parse_flags "$@"
-  STEP_TOTAL=3
+  STEP_TOTAL=4
   # tar 必须落在共享 NFS 上;未挂载时 mkdir -p 会静默建本地目录,
   # 29G tar 写进根盘且其他节点拿不到
   mountpoint -q /nfs-models || die "/nfs-models 未挂载,拒绝把 tar 写到本地盘" \
     "先挂 NFS(fstab 两行 + mount -a,见 install 的 ② 或全记录 §4.2)再重试"
   mkdir -p "$TRANSFER_DIR"
 
-  step "拉取 arm64 双镜像(x86 机器亦可)"
+  step "拉取 arm64 三镜像(x86 机器亦可)"
   docker pull --platform linux/arm64 "$GPUSTACK_IMAGE"
   docker pull --platform linux/arm64 "$ENGINE_IMAGE"
+  docker pull --platform linux/arm64 "$INDEXTTS_IMAGE"
 
   step "save gpustack tar(必须 > 重定向,不能 -o,坑#5)"
   docker save "$GPUSTACK_IMAGE" > "${GPUSTACK_TAR}.tmp" &
@@ -595,6 +615,12 @@ cmd_prepare_transfer() {
   pid=$!; watch_size $pid "${ENGINE_TAR}.tmp"; wait $pid
   mv "${ENGINE_TAR}.tmp" "$ENGINE_TAR"
   echo "    $(du -h "$ENGINE_TAR" | cut -f1)  ${ENGINE_TAR}"
+
+  step "save indextts2 tar(~10G)"
+  docker save "$INDEXTTS_IMAGE" > "${INDEXTTS_TAR}.tmp" &
+  pid=$!; watch_size $pid "${INDEXTTS_TAR}.tmp"; wait $pid
+  mv "${INDEXTTS_TAR}.tmp" "$INDEXTTS_TAR"
+  echo "    $(du -h "$INDEXTTS_TAR" | cut -f1)  ${INDEXTTS_TAR}"
   cp -f "$0" "${TRANSFER_DIR}/lx2v-node.sh" && chmod +x "${TRANSFER_DIR}/lx2v-node.sh"
   echo "    脚本自身已同步到 ${TRANSFER_DIR}/lx2v-node.sh(已挂 NFS 的节点可直接执行)"
   echo "    提示:nvidia-repo/ 两件套如缺,在既有 GPU 节点执行:"
