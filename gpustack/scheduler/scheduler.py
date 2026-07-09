@@ -32,6 +32,9 @@ from gpustack.policies.candidate_selectors.custom_backend_resource_fit_selector 
 from gpustack.policies.candidate_selectors.lightx2v_resource_fit_selector import (
     LightX2VResourceFitSelector,
 )
+from gpustack.policies.candidate_selectors.indextts_resource_fit_selector import (
+    IndexTTSResourceFitSelector,
+)
 from gpustack.policies.utils import ListMessageBuilder, should_skip_gpu_count_check
 from gpustack.policies.worker_filters.backend_framework_filter import (
     BackendFrameworkFilter,
@@ -465,6 +468,11 @@ async def find_candidate(
             candidates_selector = LightX2VResourceFitSelector(
                 config, model, model_instances
             )
+        elif model.backend == BackendEnum.INDEXTTS:
+            # IndexTTS-2: whole-GPU exclusive, 1 instance/card (see selector).
+            candidates_selector = IndexTTSResourceFitSelector(
+                config, model, model_instances
+            )
         else:
             candidates_selector = CustomBackendResourceFitSelector(
                 config, model, model_instances
@@ -687,6 +695,15 @@ async def evaluate_pretrained_config(
     # video for wan); default to video if unset so it never falls through to LLM.
     if model.backend == BackendEnum.LIGHTX2V:
         categories_modified = set_model_categories(model, CategoryEnum.VIDEO)
+        gpus_per_replica_modified = set_model_gpus_per_replica(model)
+        return categories_modified or gpus_per_replica_modified
+
+    # 0b) IndexTTS-2 is a first-class built-in TTS engine with a custom
+    # architecture (config.yaml, not a standard HF transformer config). Loading
+    # a HF pretrained config would error and mis-tag it as LLM, so skip
+    # detection entirely and declare text_to_speech.
+    if model.backend == BackendEnum.INDEXTTS:
+        categories_modified = set_model_categories(model, CategoryEnum.TEXT_TO_SPEECH)
         gpus_per_replica_modified = set_model_gpus_per_replica(model)
         return categories_modified or gpus_per_replica_modified
 

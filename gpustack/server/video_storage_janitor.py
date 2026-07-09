@@ -35,6 +35,11 @@ _INPUT_PATH_PARAM_KEYS = (
     "image_mask_path",
     "audio_path",
     "video_path",
+    # TTS (IndexTTS): reference voice + optional emotion clip. Without these a
+    # queued/requeued tts task's reference-audio day dir could be TTL/watermark
+    # evicted, making the re-dispatch fail on a missing input.
+    "spk_audio_path",
+    "emo_audio_path",
 )
 
 # DONE tasks stay protected for this long after their last update so watermark

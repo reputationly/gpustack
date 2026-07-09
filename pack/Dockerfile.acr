@@ -35,6 +35,13 @@ COPY gpustack/worker/model_meta.py                                           /tm
 COPY gpustack/policies/candidate_selectors/lightx2v_resource_fit_selector.py /tmp/lx2v-overlay/policies/candidate_selectors/lightx2v_resource_fit_selector.py
 COPY gpustack/scheduler/scheduler.py                                         /tmp/lx2v-overlay/scheduler/scheduler.py
 COPY gpustack/scheduler/evaluator.py                                         /tmp/lx2v-overlay/scheduler/evaluator.py
+# --- IndexTTS built-in backend (TTS) ---
+COPY gpustack/worker/backends/indextts.py                                    /tmp/lx2v-overlay/worker/backends/indextts.py
+COPY gpustack/policies/candidate_selectors/indextts_resource_fit_selector.py /tmp/lx2v-overlay/policies/candidate_selectors/indextts_resource_fit_selector.py
+COPY gpustack/assets/model-catalog.yaml                                      /tmp/lx2v-overlay/assets/model-catalog.yaml
+# Catalog icon lands under the installed UI static dir (copy_extra_static
+# equivalent); staged separately because it's outside the gpustack/ pkg tree.
+COPY static/catalog_icons/index-tts.png                                      /tmp/lx2v-static/catalog_icons/index-tts.png
 # --- M4/M5: async video facade + sweeper + janitor + migration + metering ---
 COPY gpustack/api/middlewares.py                                             /tmp/lx2v-overlay/api/middlewares.py
 COPY gpustack/api/exceptions.py                                              /tmp/lx2v-overlay/api/exceptions.py
@@ -76,7 +83,9 @@ RUN set -eux; \
     python3 -c "from alembic.config import Config; from alembic.script import ScriptDirectory; c=Config(); c.set_main_option('script_location', '${GP_DIR}/migrations'); h=ScriptDirectory.from_config(c).get_current_head(); assert h == 'e1f2a3b4c5d6', h; print('migration chain OK, head=' + h)"; \
     python3 -m py_compile \
         "${GP_DIR}/worker/backends/lightx2v.py" \
+        "${GP_DIR}/worker/backends/indextts.py" \
         "${GP_DIR}/policies/candidate_selectors/lightx2v_resource_fit_selector.py" \
+        "${GP_DIR}/policies/candidate_selectors/indextts_resource_fit_selector.py" \
         "${GP_DIR}/schemas/inference_backend.py" \
         "${GP_DIR}/scheduler/scheduler.py" \
         "${GP_DIR}/routes/videos.py" \
@@ -86,6 +95,11 @@ RUN set -eux; \
         "${GP_DIR}/server/video_storage_janitor.py" \
         "${GP_DIR}/migrations/versions/2026_07_05_2230-e1f2a3b4c5d6_add_video_generation_tasks.py"; \
     python3 -c "from gpustack.schemas.models import BackendEnum, CategoryEnum; assert BackendEnum.LIGHTX2V and CategoryEnum.VIDEO; print('lx2v backend overlay OK')"; \
+    python3 -c "from gpustack.schemas.models import BackendEnum; assert BackendEnum.INDEXTTS; print('indextts backend overlay OK')"; \
+    grep -q "IndexTTS-2" "${GP_DIR}/assets/model-catalog.yaml" && echo "catalog overlay OK"; \
+    mkdir -p "${GP_DIR}/ui/static/catalog_icons"; \
+    cp -v /tmp/lx2v-static/catalog_icons/index-tts.png "${GP_DIR}/ui/static/catalog_icons/"; \
+    rm -rf /tmp/lx2v-static; \
     python3 -c "from gpustack.schemas.video_generation_task import VideoGenerationTask; from gpustack.schemas.model_usage import OperationEnum; assert OperationEnum.VIDEO_GENERATION; print('M4 schema overlay OK')"; \
     if [ -f /tmp/lx2v-ui/index.html ]; then \
         cp -a /tmp/lx2v-ui/. "${GP_DIR}/ui/"; \

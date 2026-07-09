@@ -185,16 +185,18 @@ class Config(WorkerConfig, BaseSettings):
     # runtime via /config (Storage Settings page).
     #   estimated_wait = floor(non_terminal_tasks / running_instances) * latency
     # where latency comes from lightx2v_model_latency_seconds (per public model
-    # name; falls back to the image/video default below).
+    # name; falls back to the image/video/audio default below).
     lightx2v_admission_enabled: bool = True
-    # Tolerated queue wait (seconds) before rejecting. Image is the sync link
-    # (aligned with new-api's ~25s QUEUED timeout); video is async (poll-based),
-    # so it tolerates much longer.
+    # Tolerated queue wait (seconds) before rejecting, per engine kind. Image is
+    # the sync link (aligned with new-api's ~25s QUEUED timeout); video is async
+    # (poll-based), so it tolerates much longer; audio (IndexTTS TTS) is async too
+    # — short lines at RTF~3 behind a per-instance FIFO of 8, 60s is a sane default.
     lightx2v_image_max_queue_wait_seconds: int = 25
     lightx2v_video_max_queue_wait_seconds: int = 150
+    lightx2v_audio_max_queue_wait_seconds: int = 60
     # Per-model single-instance hot-state latency (seconds), keyed by public model
     # name (substring match, case-insensitive). Defaults from the LightX2V test
-    # reports. Unknown models fall back to a per-kind default (image/video).
+    # reports. Unknown models fall back to a per-kind default (image/video/audio).
     lightx2v_model_latency_seconds: Optional[Dict[str, int]] = None
     # When set, the server aborts at startup if the LightX2V shared NFS root
     # (<lightx2v_output_root>/inputs) isn't mounted+writable. Off by default so a

@@ -22,8 +22,10 @@ def get_meta_from_running_instance(
         # SGLang Diffusion does not provide metadata endpoints at the moment.
         return {}
 
-    if backend == BackendEnum.LIGHTX2V:
-        # LightX2V exposes an async task API behind the launcher, not /v1/models.
+    if backend in (BackendEnum.LIGHTX2V, BackendEnum.INDEXTTS):
+        # LightX2V exposes an async task API behind the launcher, and IndexTTS
+        # an async task API + /v1/audio/speech — neither serves /v1/models, so
+        # probing would only produce a spurious warning per RUNNING transition.
         return {}
 
     meta_path = "/v1/models"

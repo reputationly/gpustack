@@ -415,6 +415,42 @@ def get_built_in_backend() -> List[InferenceBackend]:
             parameter_format=ParameterFormatEnum.SPACE,
             description="LightX2V video/image generation engine (first-class built-in backend).",
         ),
+        # IndexTTS-2 is a first-class built-in TTS engine, self-contained the
+        # same way LightX2V is: the engine image bakes in the HTTP server
+        # (server.py: async task API for the M4 facade + sync
+        # /v1/audio/speech), so its image comes from the explicit version_config
+        # below (NOT gpustack-runner). worker/backends/indextts.py launches
+        # ``python3 -m uvicorn server:app`` on {{port}}; the container
+        # self-answers ``/ready`` (503 while the model loads, 200 after) so
+        # scheduling never routes to a still-loading instance. Swapping the
+        # engine image = editing this row (or the DB row via UI).
+        InferenceBackend(
+            backend_name=BackendEnum.INDEXTTS.value,
+            is_built_in=True,
+            default_version="1.0.0",
+            version_configs=VersionConfigDict(
+                root={
+                    # IndexTTS-2 arm64/A100 engine image (reputationly/index-tts,
+                    # built by the independent CI -> ACR). Floating tag so a
+                    # rebuilt image is picked up without editing this row; pin to
+                    # a dated tag for reproducibility. custom_framework="cuda"
+                    # (NOT built_in_frameworks) makes BackendFrameworkFilter
+                    # accept cuda workers without a gpustack-runner service and
+                    # keeps get_image_name returning this explicit image for a
+                    # BUILT_IN row. A100 nodes report gpu.type == "cuda".
+                    "1.0.0": VersionConfig(
+                        image_name=(
+                            "crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com"
+                            "/reputationly/indextts2:arm64-a100-latest"
+                        ),
+                        custom_framework="cuda",
+                    ),
+                }
+            ),
+            health_check_path="/ready",
+            parameter_format=ParameterFormatEnum.SPACE,
+            description="IndexTTS-2 zero-shot voice-clone TTS engine (first-class built-in backend).",
+        ),
         InferenceBackend(
             backend_name=BackendEnum.ASCEND_MINDIE.value, is_built_in=True
         ),

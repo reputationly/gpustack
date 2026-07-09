@@ -3578,3 +3578,35 @@ model_sets:
       backend: VoxBox
       env:
         GPUSTACK_MODEL_VRAM_CLAIM: "12884901888" # 12 GiB, it depends on the audio length. This value works for ~10 minutes audio input.
+- name: IndexTTS-2
+  description: IndexTTS-2 is a zero-shot voice-cloning TTS model with emotion control (8-dim emotion vector or natural-language emotion). First-class built-in engine with an async task API for long-text dubbing; runs whole-GPU exclusive (1 instance/card).
+  home: https://github.com/index-tts/index-tts
+  icon: /static/catalog_icons/index-tts.png
+  size: 2
+  categories:
+    - text_to_speech
+  licenses:
+    - apache-2.0
+  release_date: "2025-09-08"
+  # Whole-GPU exclusive: the IndexTTSResourceFitSelector books each chosen GPU's
+  # whole free VRAM (1 instance/card), so NO GPUSTACK_MODEL_VRAM_CLAIM is needed
+  # or wanted here — long-text peaks (AR KV cache + one-shot BigVGAN vocoding)
+  # get the whole card. The engine image is resolved from the built-in backend
+  # registry (schemas/inference_backend.py), not gpustack-runner.
+  specs:
+    - mode: standard
+      gpu_filters:
+        vendor: nvidia
+      quantization: FP16
+      source: model_scope
+      model_scope_model_id: IndexTeam/IndexTTS-2
+      backend: IndexTTS
+      backend_version: "1.0.0"
+    - mode: standard
+      gpu_filters:
+        vendor: nvidia
+      quantization: FP16
+      source: huggingface
+      huggingface_repo_id: IndexTeam/IndexTTS-2
+      backend: IndexTTS
+      backend_version: "1.0.0"

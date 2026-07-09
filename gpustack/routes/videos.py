@@ -78,10 +78,14 @@ _MAX_DISPATCH_RETRIES = 5
 # /v1/tasks/video/. Everything else (t2v/i2v/flf2v/s2v) is a video task.
 _IMAGE_TASK_TYPES = {"t2i", "i2i"}
 _VIDEO_TASK_TYPES = {"t2v", "i2v", "flf2v", "s2v"}
+# Audio (TTS) task types served by the IndexTTS-2 built-in engine. "tts" is the
+# facade task_type; it maps to the engine's POST /v1/tasks/audio/ (engine kind
+# "audio"). Zero-shot voice clone + emotion control, async like video.
+_AUDIO_TASK_TYPES = {"tts"}
 # Finite set of accepted actions. task_type is the first path component of the
 # §7.2 NFS layout, so it MUST be constrained — an unsanitized value like
 # "../../tmp/x" would let save_result_path / input writes escape the output root.
-_VALID_TASK_TYPES = _IMAGE_TASK_TYPES | _VIDEO_TASK_TYPES
+_VALID_TASK_TYPES = _IMAGE_TASK_TYPES | _VIDEO_TASK_TYPES | _AUDIO_TASK_TYPES
 
 # Facade input field -> (engine request field, default extension). Inputs are
 # NOT sent as base64/URL anymore: new-api (the trusted caller) pre-materializes
@@ -94,6 +98,12 @@ _INPUT_FIELDS = {
     "last_frame": ("last_frame_path", ".png"),
     "image_mask": ("image_mask_path", ".png"),
     "audio": ("audio_path", ".wav"),
+    # TTS (IndexTTS-2, task_type "tts"): the zero-shot reference voice and an
+    # optional emotion reference clip. Kept distinct from "audio" (video s2v's
+    # driving audio) so a TTS voice maps to the engine's spk_audio_path, not
+    # audio_path. Both are single NFS refs materialized by new-api.
+    "voice": ("spk_audio_path", ".wav"),
+    "emotion_audio": ("emo_audio_path", ".wav"),
 }
 
 # The "image" facade field alone may be a LIST (multi-image edit, e.g.
@@ -121,6 +131,8 @@ _ENGINE_OWNED_FIELDS = {
     "last_frame_path",
     "image_mask_path",
     "audio_path",
+    "spk_audio_path",
+    "emo_audio_path",
     "video_path",
     "save_result_path",
 }
@@ -139,14 +151,26 @@ _ENGINE_STATE_MAP = {
 # slow). Deliberately conservative so an unknown model doesn't over-admit.
 _DEFAULT_IMAGE_LATENCY = 20
 _DEFAULT_VIDEO_LATENCY = 90
+# IndexTTS-2 at RTF~3 does a short line (5-8s audio) in a handful of seconds;
+# 20s is a conservative per-instance fallback that also absorbs longer lines.
+_DEFAULT_AUDIO_LATENCY = 20
 
 
 def _engine_kind(task_type: str) -> str:
-    return "image" if task_type in _IMAGE_TASK_TYPES else "video"
+    if task_type in _IMAGE_TASK_TYPES:
+        return "image"
+    if task_type in _AUDIO_TASK_TYPES:
+        return "audio"
+    return "video"
 
 
 def _output_ext(task_type: str) -> str:
-    return ".png" if _engine_kind(task_type) == "image" else ".mp4"
+    kind = _engine_kind(task_type)
+    if kind == "image":
+        return ".png"
+    if kind == "audio":
+        return ".wav"
+    return ".mp4"
 
 
 def _sanitize(name: str) -> str:
@@ -351,11 +375,12 @@ def _model_latency(cfg, model_name: str, task_type: str) -> int:
                 return int(val)
             except (TypeError, ValueError):
                 continue
-    return (
-        _DEFAULT_IMAGE_LATENCY
-        if _engine_kind(task_type) == "image"
-        else _DEFAULT_VIDEO_LATENCY
-    )
+    kind = _engine_kind(task_type)
+    if kind == "image":
+        return _DEFAULT_IMAGE_LATENCY
+    if kind == "audio":
+        return _DEFAULT_AUDIO_LATENCY
+    return _DEFAULT_VIDEO_LATENCY
 
 
 async def _check_admission(
@@ -387,8 +412,11 @@ async def _check_admission(
     depth = (await session.exec(stmt)).first() or 0
     latency = _model_latency(cfg, model_name, task_type)
     est_wait = (int(depth) // instances) * latency
-    if _engine_kind(task_type) == "image":
+    kind = _engine_kind(task_type)
+    if kind == "image":
         max_wait = getattr(cfg, "lightx2v_image_max_queue_wait_seconds", 25)
+    elif kind == "audio":
+        max_wait = getattr(cfg, "lightx2v_audio_max_queue_wait_seconds", 60)
     else:
         max_wait = getattr(cfg, "lightx2v_video_max_queue_wait_seconds", 150)
     if est_wait > int(max_wait):

@@ -63,6 +63,7 @@ class BackendEnum(str, Enum):
     ASCEND_MINDIE = "MindIE"
     SGLANG = "SGLang"
     LIGHTX2V = "LightX2V"
+    INDEXTTS = "IndexTTS"
     CUSTOM = "Custom"
 
 

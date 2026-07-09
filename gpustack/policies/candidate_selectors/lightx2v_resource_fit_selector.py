@@ -47,6 +47,11 @@ class LightX2VResourceFitSelector(CustomBackendResourceFitSelector):
     Manual GPU selection is delegated to the inherited machinery.
     """
 
+    # Diagnostic label used in the no-candidates scheduling message. Subclasses
+    # that reuse this whole-GPU placement for another built-in engine (e.g.
+    # IndexTTS) override it so ops sees the right engine name.
+    _ENGINE_LABEL = "LightX2V"
+
     def __init__(self, cfg: Config, model: Model, model_instances: List[ModelInstance]):
         super().__init__(cfg, model, model_instances)
         self._gpus_per_replica = self._resolve_gpus_per_replica(model)
@@ -168,7 +173,7 @@ class LightX2VResourceFitSelector(CustomBackendResourceFitSelector):
                 EVENT_ACTION_PROFILE_FIT,
                 str(
                     ListMessageBuilder(
-                        f"LightX2V profile needs {need} free GPU(s) on a single worker; "
+                        f"{self._ENGINE_LABEL} profile needs {need} free GPU(s) on a single worker; "
                         f"the largest available worker has {largest_free_count} free GPU(s)."
                     )
                 ),
