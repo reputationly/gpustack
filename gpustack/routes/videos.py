@@ -75,9 +75,13 @@ _STATUS_TIMEOUT = 15
 _MAX_DISPATCH_RETRIES = 5
 
 # Engine task actions (§7.2) that go to /v1/tasks/image/ rather than
-# /v1/tasks/video/. Everything else (t2v/i2v/flf2v/s2v) is a video task.
+# /v1/tasks/video/. Everything else is a video task:
+#   t2v/i2v/flf2v — Wan2.2 generation
+#   s2v           — InfiniteTalk digital human (image + driving audio)
+#   sr            — SeedVR2 video super-resolution (video in, sr_ratio out-scale)
+#   vace          — Wan2.2 VACE video editing (src_video/src_mask/src_ref_images)
 _IMAGE_TASK_TYPES = {"t2i", "i2i"}
-_VIDEO_TASK_TYPES = {"t2v", "i2v", "flf2v", "s2v"}
+_VIDEO_TASK_TYPES = {"t2v", "i2v", "flf2v", "s2v", "sr", "vace"}
 # Audio (TTS) task types served by the IndexTTS-2 built-in engine. "tts" is the
 # facade task_type; it maps to the engine's POST /v1/tasks/audio/ (engine kind
 # "audio"). Zero-shot voice clone + emotion control, async like video.
@@ -104,18 +108,48 @@ _INPUT_FIELDS = {
     # audio_path. Both are single NFS refs materialized by new-api.
     "voice": ("spk_audio_path", ".wav"),
     "emotion_audio": ("emo_audio_path", ".wav"),
+    # SeedVR2 super-resolution (task_type "sr"): the low-res source video.
+    "video": ("video_path", ".mp4"),
+    # VACE video editing (task_type "vace"). The engine fields carry no _path
+    # suffix — VideoTaskRequest names them src_video/src_mask/src_ref_images
+    # verbatim (LightX2V server schema; empty strings are normalized to None
+    # engine-side). src_mask is a mask VIDEO (white=repaint, gray=fill);
+    # src_ref_images is a comma-joined image list (R2V reference mode).
+    "src_video": ("src_video", ".mp4"),
+    "src_mask": ("src_mask", ".mp4"),
+    "src_ref_images": ("src_ref_images", ".png"),
 }
 
-# The "image" facade field alone may be a LIST (multi-image edit, e.g.
-# qwen-image-edit i2i): each item is persisted and the engine gets a
-# comma-separated image_path (LightX2V splits on "," and reads each). Other
-# fields stay single. Cap the count as a facade backstop — the engine has no
-# hard limit but many images blow VRAM.
+# Facade fields that may carry a LIST of refs; each item is persisted and the
+# engine gets a comma-separated path field (LightX2V splits on "," and reads
+# each): "image" (multi-image edit, e.g. qwen-image-edit i2i) and
+# "src_ref_images" (VACE R2V references). Other fields stay single. Cap the
+# count as a facade backstop — the engine has no hard limit but many images
+# blow VRAM.
+_MULTI_INPUT_FIELDS = {"image", "src_ref_images"}
 _MAX_INPUT_IMAGES = 5
 
+# Max bytes for a single streamed input upload (POST /v1/videos/inputs). The UI
+# streams browser file bytes here rather than inlining base64 (which inflates by
+# ~33% and would balloon the JSON submit body — a source video for sr/vace is
+# tens of MB). Enforced while streaming so an oversized file is cut off, not
+# buffered whole. The production path (new-api) pre-materializes and never uses
+# this endpoint.
+_MAX_UPLOAD_BYTES = 256 * 1024 * 1024
+_UPLOAD_CHUNK = 1024 * 1024
+# Total multipart body ceiling for POST /v1/videos/inputs, checked against
+# Content-Length BEFORE the body is read so an oversized upload is refused
+# without spooling to the API server's temp disk. Sized to roughly one
+# _MAX_UPLOAD_BYTES file plus framing: this makes the per-file cap effective at
+# ingress for single-file fields, and multi-file fields (src_ref_images) are
+# reference IMAGES that comfortably fit — a request can never spool more than
+# ~one max file to temp regardless of field.
+_UPLOAD_MAX_BODY = _MAX_UPLOAD_BYTES + 4 * 1024 * 1024
+
 # Control keys consumed by the facade; never forwarded verbatim to the engine.
-# "input_refs" carries the pre-materialized NFS input paths (validated, then
-# mapped to engine path fields); the raw _INPUT_FIELDS keys are rejected outright
+# "input_refs" carries the pre-materialized NFS input paths — either written by
+# new-api (production) or by this server's POST /v1/videos/inputs upload endpoint
+# (the gpustack-ui admin path). The raw _INPUT_FIELDS keys are rejected outright
 # (see _parse_video_request) but kept here so a stray one can't leak downstream.
 _CONTROL_KEYS = {"model", "task_type", "user_id", "input_refs"} | set(
     _INPUT_FIELDS.keys()
@@ -134,6 +168,9 @@ _ENGINE_OWNED_FIELDS = {
     "spk_audio_path",
     "emo_audio_path",
     "video_path",
+    "src_video",
+    "src_mask",
+    "src_ref_images",
     "save_result_path",
 }
 
@@ -317,14 +354,51 @@ def _as_ref_list(value: Any) -> List[Any]:
     return [value]
 
 
+def _check_input_constraints(counts: Dict[str, int]) -> None:
+    """Cross-field + per-field cardinality constraints on a submit's input_refs.
+    ``counts`` maps a facade field to how many items it carries.
+
+    A mask edits exactly one base image; a VACE src_mask masks a src_video;
+    only _MULTI_INPUT_FIELDS may carry more than one item (up to
+    _MAX_INPUT_IMAGES). Enforced BEFORE any expensive work so a bad combo fails
+    fast instead of wasting queue/GPU.
+    """
+    if counts.get("image_mask", 0) and counts.get("image", 0) != 1:
+        # Reject both "mask + many images" and "mask + no image" (the latter
+        # would submit image_mask_path with no image_path).
+        raise BadRequestException(
+            message="image_mask requires exactly one image",
+            is_openai_exception=True,
+        )
+    if counts.get("src_mask", 0) and not counts.get("src_video", 0):
+        # VACE MV2V: the mask video selects regions OF the source video.
+        raise BadRequestException(
+            message="src_mask requires src_video",
+            is_openai_exception=True,
+        )
+    for field, n in counts.items():
+        if field in _MULTI_INPUT_FIELDS:
+            if n > _MAX_INPUT_IMAGES:
+                raise BadRequestException(
+                    message=(
+                        f"Too many '{field}' inputs: {n} (max {_MAX_INPUT_IMAGES})"
+                    ),
+                    is_openai_exception=True,
+                )
+        elif n > 1:
+            raise BadRequestException(
+                message=f"'{field}' accepts a single input, got {n}",
+                is_openai_exception=True,
+            )
+
+
 def _resolve_input_refs(input_refs: Any, user_id: int) -> Dict[str, str]:
     """Validate the caller's pre-materialized NFS input refs and map them to
     engine path fields → {engine_field: comma-joined absolute path(s)}.
 
     input_refs shape: {"image": [rel, ...], "last_frame": [rel], ...} with keys
-    in _INPUT_FIELDS. Only "image" may carry up to _MAX_INPUT_IMAGES paths
-    (multi-image edit → comma-separated image_path); all other fields are single.
-    A mask edits a single image.
+    in _INPUT_FIELDS. Used by the new-api path, which pre-materializes every
+    input onto shared NFS.
     """
     if input_refs is None:
         return {}
@@ -333,30 +407,13 @@ def _resolve_input_refs(input_refs: Any, user_id: int) -> Dict[str, str]:
             message="input_refs must be an object", is_openai_exception=True
         )
     root = _output_root()
+    per_field = {f: _as_ref_list(input_refs.get(f)) for f in _INPUT_FIELDS}
+    _check_input_constraints({f: len(v) for f, v in per_field.items()})
     overrides: Dict[str, str] = {}
-    image_refs = _as_ref_list(input_refs.get("image"))
-    if len(image_refs) > _MAX_INPUT_IMAGES:
-        raise BadRequestException(
-            message=f"Too many images: {len(image_refs)} (max {_MAX_INPUT_IMAGES})",
-            is_openai_exception=True,
-        )
-    if input_refs.get("image_mask") and len(image_refs) != 1:
-        # A mask edits exactly one base image — reject both "mask + many images"
-        # and "mask + no image" (the latter would submit image_mask_path with no
-        # image_path, wasting queue/GPU before failing in the engine).
-        raise BadRequestException(
-            message="image_mask requires exactly one image",
-            is_openai_exception=True,
-        )
     for field, (engine_field, _ext) in _INPUT_FIELDS.items():
-        refs = _as_ref_list(input_refs.get(field))
+        refs = per_field[field]
         if not refs:
             continue
-        if field != "image" and len(refs) > 1:
-            raise BadRequestException(
-                message=f"'{field}' accepts a single input, got {len(refs)}",
-                is_openai_exception=True,
-            )
         overrides[engine_field] = ",".join(
             _validate_input_ref(r, root, user_id, field) for r in refs
         )
@@ -517,7 +574,10 @@ async def create_video_task(request: Request, user: CurrentUserDep):
 
     # Build the engine body: pass request fields through untouched (no
     # validation), map the validated NFS input refs to engine path fields, and
-    # dictate the output path so the result lands at our §7.2 NFS path.
+    # dictate the output path so the result lands at our §7.2 NFS path. Inputs
+    # always arrive as pre-materialized relative paths in "input_refs" — written
+    # by new-api (production) or by this server's /v1/videos/inputs upload
+    # endpoint (gpustack-ui admin); the submit body itself never carries bytes.
     input_overrides = _resolve_input_refs(body.get("input_refs"), user_id)
     engine_body: Dict[str, Any] = {
         k: v
@@ -588,6 +648,193 @@ async def create_video_task(request: Request, user: CurrentUserDep):
         f"(native={native_task_id}, model={model_name})"
     )
     return _public(task)
+
+
+def _stream_upload_to_nfs(src, abs_path: str) -> int:
+    """Copy an upload's spooled bytes to abs_path in _UPLOAD_CHUNK pieces,
+    enforcing _MAX_UPLOAD_BYTES as it goes (never buffers the whole file).
+    Runs in a worker thread — all blocking IO. Raises ValueError on overflow."""
+    src.seek(0)
+    written = 0
+    with open(abs_path, "wb") as out:
+        while True:
+            chunk = src.read(_UPLOAD_CHUNK)
+            if not chunk:
+                break
+            written += len(chunk)
+            if written > _MAX_UPLOAD_BYTES:
+                raise ValueError("upload too large")
+            out.write(chunk)
+    return written
+
+
+def _safe_remove(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _validate_upload_field(task_type: str, model: str, field: str, files: list) -> bool:
+    """Validate an upload request; return whether the field is multi-valued.
+    Raises BadRequestException on any invalid input."""
+    if task_type not in _VALID_TASK_TYPES:
+        raise BadRequestException(
+            message=f"Invalid task_type '{task_type}'", is_openai_exception=True
+        )
+    if field not in _INPUT_FIELDS:
+        raise BadRequestException(
+            message=(
+                f"Invalid input field '{field}'. "
+                f"Expected one of: {', '.join(sorted(_INPUT_FIELDS))}"
+            ),
+            is_openai_exception=True,
+        )
+    if not (model or "").strip():
+        raise BadRequestException(
+            message="Missing 'model' field", is_openai_exception=True
+        )
+    if not files:
+        raise BadRequestException(
+            message=f"No files for '{field}'", is_openai_exception=True
+        )
+    multi = field in _MULTI_INPUT_FIELDS
+    if not multi and len(files) > 1:
+        raise BadRequestException(
+            message=f"'{field}' accepts a single file, got {len(files)}",
+            is_openai_exception=True,
+        )
+    if multi and len(files) > _MAX_INPUT_IMAGES:
+        raise BadRequestException(
+            message=f"Too many '{field}' files: {len(files)} (max {_MAX_INPUT_IMAGES})",
+            is_openai_exception=True,
+        )
+    return multi
+
+
+async def _persist_upload_files(
+    files: list, task_type: str, model: str, field: str, multi: bool, user_id: int
+) -> Tuple[List[str], str]:
+    """Stream each uploaded file to NFS under the §3 inputs convention, rolling
+    back every write if any file fails (so a later-file error doesn't orphan
+    earlier NFS writes — no task owns them). Returns (relative refs, group id)."""
+    _, ext = _INPUT_FIELDS[field]
+    root = _output_root()
+    now = datetime.now(timezone.utc)
+    gid = uuid.uuid4().hex
+    base_dir = f"inputs/{task_type}-{_sanitize(model)}/{now:%Y/%m/%d}/{user_id}"
+    rels: List[str] = []
+    written_abs: List[str] = []
+    try:
+        for i, up in enumerate(files):
+            name = f"{gid}-{field}-{i}{ext}" if multi else f"{gid}-{field}{ext}"
+            rel = f"{base_dir}/{name}"
+            abs_path = os.path.join(root, rel)
+            await asyncio.to_thread(_ensure_parent_dir, abs_path)
+            try:
+                written = await asyncio.to_thread(
+                    _stream_upload_to_nfs, up.file, abs_path
+                )
+            except ValueError:
+                await asyncio.to_thread(_safe_remove, abs_path)
+                raise BadRequestException(
+                    message=(
+                        f"Upload for '{field}' exceeds "
+                        f"{_MAX_UPLOAD_BYTES // (1024 * 1024)} MiB"
+                    ),
+                    is_openai_exception=True,
+                )
+            if written == 0:
+                await asyncio.to_thread(_safe_remove, abs_path)
+                raise BadRequestException(
+                    message=f"Upload for '{field}' is empty",
+                    is_openai_exception=True,
+                )
+            written_abs.append(abs_path)
+            rels.append(rel)
+    except BaseException:
+        for p in written_abs:
+            await asyncio.to_thread(_safe_remove, p)
+        raise
+    return rels, gid
+
+
+@router.post("/videos/inputs")
+async def upload_video_input(request: Request, user: CurrentUserDep):
+    """Materialize one input field's file(s) onto shared NFS and return their
+    relative refs for a subsequent POST /v1/videos.
+
+    This is the gpustack-ui admin path: that UI talks only to this server and has
+    no new-api materialization layer, so it streams browser file bytes here (NOT
+    inline base64 in the submit body — a source video is tens of MB and base64
+    inflates it ~33%). The server — which mounts the same RW NFS — writes them
+    under the §3 convention, mirroring what new-api does for production traffic;
+    the returned input_refs then flow through the exact same _resolve_input_refs
+    validation on submit. One field per call (the UI calls once per input);
+    cross-field constraints (mask needs video, etc.) are enforced at submit.
+
+    Returns {"input_refs": {field: [rel, ...]}, "user_id": <id>, "group_id": <id>}.
+    The caller MUST submit /v1/videos with the SAME user_id so the ref's tenant
+    segment matches (see _validate_input_ref).
+    """
+    # Bound request ingestion BEFORE Starlette spools the multipart to the API
+    # server's temp disk (the per-file _stream_upload_to_nfs cap only bounds the
+    # NFS copy, and Starlette's max_part_size does NOT limit FILE parts — only
+    # text fields). The guarantee is Content-Length: require it (a browser
+    # FormData upload always sends it) and cap it, so a chunked/omitted-length
+    # client can't spool an unbounded part and an honest body can't exceed
+    # _UPLOAD_MAX_BODY. The fronting gateway should also cap body size.
+    declared = request.headers.get("content-length")
+    if not declared or not declared.isdigit():
+        raise BadRequestException(
+            message="Content-Length is required for uploads",
+            is_openai_exception=True,
+        )
+    if int(declared) > _UPLOAD_MAX_BODY:
+        raise BadRequestException(
+            message=(
+                f"Upload too large (max ~{_UPLOAD_MAX_BODY // (1024 * 1024)} MiB "
+                "per request)"
+            ),
+            is_openai_exception=True,
+        )
+    # max_part_size still caps the small text fields (task_type/model/field);
+    # file parts are bounded by the Content-Length ceiling above.
+    try:
+        form = await request.form(max_part_size=_UPLOAD_CHUNK)
+    except Exception as e:
+        raise BadRequestException(
+            message=f"Invalid multipart upload: {e}", is_openai_exception=True
+        )
+    # form.close() in the finally frees every spooled UploadFile on ANY exit —
+    # success or a validation error — so a rejected large upload can't leave temp
+    # files/FDs dangling until GC (Starlette only auto-closes when the form is
+    # used as an async context manager).
+    try:
+        task_type = str(form.get("task_type") or "").strip()
+        model = str(form.get("model") or "")
+        field = str(form.get("field") or "")
+        # File parts are UploadFile (have .file); text parts are str — keep files.
+        files = [f for f in form.getlist("files") if hasattr(f, "file")]
+        multi = _validate_upload_field(task_type, model, field, files)
+        # Authorize the model BEFORE writing anything to NFS — otherwise any
+        # authenticated caller could name an arbitrary/forbidden model and fill
+        # shared storage with orphaned uploads (they're never tied to a task).
+        # 404 (not 403) to avoid confirming a model the caller can't see exists.
+        async with async_session() as session:
+            allowed = await UserService(session).model_allowed_for_user(
+                model_name=model,
+                user_id=user.id,
+                api_key=getattr(request.state, "api_key", None),
+            )
+        if not allowed:
+            raise NotFoundException(message="Model not found", is_openai_exception=True)
+        rels, gid = await _persist_upload_files(
+            files, task_type, model, field, multi, user.id
+        )
+        return {"input_refs": {field: rels}, "user_id": user.id, "group_id": gid}
+    finally:
+        await form.close()
 
 
 class _SubmitError(NamedTuple):

@@ -29,17 +29,24 @@ _DAY_GLOBS = (
 
 # Engine input-path fields persisted in a task's params (materialized under
 # <root>/inputs/...). Their day dirs must be protected too, not just the output.
+# Must list EVERY engine path field the facade maps inputs to (routes/videos.py
+# _INPUT_FIELDS) — a missing one lets a queued/requeued job's input day dir get
+# TTL/watermark evicted, so the re-dispatch fails on a vanished input.
 _INPUT_PATH_PARAM_KEYS = (
     "image_path",
     "last_frame_path",
     "image_mask_path",
     "audio_path",
     "video_path",
-    # TTS (IndexTTS): reference voice + optional emotion clip. Without these a
-    # queued/requeued tts task's reference-audio day dir could be TTL/watermark
-    # evicted, making the re-dispatch fail on a missing input.
+    # TTS (IndexTTS): reference voice + optional emotion clip.
     "spk_audio_path",
     "emo_audio_path",
+    # VACE (video editing) — these engine fields carry no _path suffix. src_video
+    # / src_mask are single NFS paths; src_ref_images is comma-separated (handled
+    # by the split("," ) below like multi-image image_path).
+    "src_video",
+    "src_mask",
+    "src_ref_images",
 )
 
 # DONE tasks stay protected for this long after their last update so watermark
