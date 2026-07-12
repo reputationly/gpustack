@@ -28,6 +28,7 @@ from gpustack.schemas.models import (
     is_embedding_model,
     is_image_model,
     is_reranker_model,
+    is_video_model,
 )
 from gpustack.schemas.workers import Worker
 from gpustack.server.db import async_session
@@ -288,6 +289,7 @@ async def validate_and_mutate_benchmark_in(
 
     if (
         is_image_model(model)
+        or is_video_model(model)
         or is_audio_model(model)
         or is_embedding_model(model)
         or is_reranker_model(model)

@@ -281,7 +281,7 @@ docker exec gpustack-server cat /var/lib/gpustack/initial_admin_password
 ```bash
 # 新 gpustack(2.79G,163 直拉稳):
 docker pull crpi-....../reputationly/gpustack:lx2v-dev
-# 新引擎(29G,走 238→NFS→163 load,见 §6);load 后新 image ID 应≠旧的
+# 新引擎(~10G,旧 build 曾 29G,走 238→NFS→163 load,见 §6);load 后新 image ID 应≠旧的
 docker load -i /nfs-models/_transfer/lightx2v-arm64-launcher.tar
 ```
 UI **Resources → Clusters → Add Cluster(Docker)** → **Add Worker**:Worker IP=`10.0.0.163`、其余默认 → 步骤4 生成命令里**只取 `GPUSTACK_TOKEN`**,其余用下面这条(改镜像/内网 URL/加 env):
@@ -363,7 +363,7 @@ Save 后:调度到 1 张空闲卡 → launcher 起引擎 → `/ready` 503→200 
 
 **i2v 未来部署**:无独立基座,Model Path 用 **T2V 目录**(VAE/T5 共用,I2V 报告 §2),Backend Parameters 加 `--model-cls wan2.2_moe_distill --task i2v`;int8 DiT 在 `models-int8/Wan2.2-I2V-720p-int8`(已核在位)。
 
-**镜像分发经验**:已有旧引擎镜像的节点直接 `docker pull`(base 层复用,只拉 app 增量层,分钟级);全新节点走 238 `docker save >` NFS tar + `docker load`(29G;tar 已留 `_transfer/lightx2v-arm64-profiles.tar` + `gpustack-lx2v-dev-arm64.tar` 给 0003/0004/0005)。
+**镜像分发经验**:已有旧引擎镜像的节点直接 `docker pull`(base 层复用,只拉 app 增量层,分钟级);全新节点走 238 `docker save >` NFS tar + `docker load`(现引擎 ~10G,旧 build 曾 29G;tar 留在 `_transfer/lightx2v-arm64-profiles.tar` + `gpustack-lx2v-dev-arm64.tar` + `indextts2-arm64-a100.tar`)。
 
 **验收**:0002 上 wan2.2-t2v 1×4卡 Running(~35G/卡),`POST /v1/videos`(t2v,81帧)→ done → `/content` 出 MP4 全通。**内置后端能力矩阵:单卡图(z-image)+ 4卡视频(wan)均真机跑通。**
 

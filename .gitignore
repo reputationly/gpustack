@@ -178,3 +178,7 @@ charts/gpustack-chart/charts/
 # real UI dist staged by CI / local builds; only the README placeholder is tracked
 pack/ui-dist/*
 !pack/ui-dist/README.md
+
+# Codex 指南(本地) + 部署专属内网节点清单(含真实 IP,勿入库)
+AGENTS.md
+docs/scripts/lx2v-nodes.txt

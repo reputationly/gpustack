@@ -235,8 +235,6 @@ class IndexTTSServer(InferenceServer):
             arguments, ("--host", self._worker.ip), ("--port", str(port))
         )
 
-        injected = self._get_injected_backend_parameters(
-            arguments, [], entrypoint
-        )
+        injected = self._get_injected_backend_parameters(arguments, [], entrypoint)
 
         return arguments, injected

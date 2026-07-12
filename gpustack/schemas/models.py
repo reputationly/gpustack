@@ -855,6 +855,15 @@ def is_image_model(model: Model):
     return "image" in model.categories
 
 
+def is_video_model(model: Model):
+    """
+    Check if the model is a video model.
+    Args:
+        model: Model to check.
+    """
+    return "video" in model.categories
+
+
 def is_embedding_model(model: Model):
     """
     Check if the model is an embedding model.

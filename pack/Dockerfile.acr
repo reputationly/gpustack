@@ -32,6 +32,7 @@ COPY gpustack/schemas/inference_backend.py                                   /tm
 COPY gpustack/worker/backends/lightx2v.py                                    /tmp/lx2v-overlay/worker/backends/lightx2v.py
 COPY gpustack/worker/serve_manager.py                                        /tmp/lx2v-overlay/worker/serve_manager.py
 COPY gpustack/worker/model_meta.py                                           /tmp/lx2v-overlay/worker/model_meta.py
+COPY gpustack/worker/runtime_metrics_aggregator.py                           /tmp/lx2v-overlay/worker/runtime_metrics_aggregator.py
 COPY gpustack/policies/candidate_selectors/lightx2v_resource_fit_selector.py /tmp/lx2v-overlay/policies/candidate_selectors/lightx2v_resource_fit_selector.py
 COPY gpustack/scheduler/scheduler.py                                         /tmp/lx2v-overlay/scheduler/scheduler.py
 COPY gpustack/scheduler/evaluator.py                                         /tmp/lx2v-overlay/scheduler/evaluator.py
@@ -51,8 +52,10 @@ COPY gpustack/migrations/versions/2026_07_05_2230-e1f2a3b4c5d6_add_video_generat
 COPY gpustack/routes/routes.py                                               /tmp/lx2v-overlay/routes/routes.py
 COPY gpustack/routes/video_tasks.py                                          /tmp/lx2v-overlay/routes/video_tasks.py
 COPY gpustack/routes/videos.py                                               /tmp/lx2v-overlay/routes/videos.py
+COPY gpustack/routes/benchmarks.py                                           /tmp/lx2v-overlay/routes/benchmarks.py
 COPY gpustack/schemas/__init__.py                                            /tmp/lx2v-overlay/schemas/__init__.py
 COPY gpustack/schemas/model_usage.py                                         /tmp/lx2v-overlay/schemas/model_usage.py
+COPY gpustack/schemas/model_routes.py                                        /tmp/lx2v-overlay/schemas/model_routes.py
 COPY gpustack/schemas/video_generation_task.py                               /tmp/lx2v-overlay/schemas/video_generation_task.py
 COPY gpustack/server/server.py                                               /tmp/lx2v-overlay/server/server.py
 COPY gpustack/server/video_storage_janitor.py                                /tmp/lx2v-overlay/server/video_storage_janitor.py

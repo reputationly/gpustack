@@ -330,7 +330,7 @@ build_default_envs() { # build_default_envs <token>
   WORKER_ENVS=(
     "GPUSTACK_RUNTIME_DEPLOY_MIRRORED_NAME=${WORKER_NAME}"
     "GPUSTACK_TOKEN=$1"
-    "GPUSTACK_EXTRA_MOUNTS=/nfs-models,/nfs-output"
+    "GPUSTACK_EXTRA_MOUNTS=/nfs-models,/nfs-output,/nfs-data"
   )
 }
 collect_existing_envs() {
@@ -349,6 +349,25 @@ ensure_env_present() { # ensure_env_present <KEY> <标准值>
   WORKER_ENVS+=("$1=$2")
 }
 
+# 确保 GPUSTACK_EXTRA_MOUNTS 里含某挂载路径。ensure_env_present 只在整条 env 缺失时补,
+# 升级时旧容器已带 EXTRA_MOUNTS(旧值可能不含 /nfs-data)→ 必须在已有值上追加,
+# 否则老节点升级永远拿不到 /nfs-data,s2v/vace 的 config(引用 /nfs-data/...)在容器里断。
+ensure_extra_mount() { # ensure_extra_mount <host_path>
+  local want=$1 i found=0 val
+  for i in "${!WORKER_ENVS[@]}"; do
+    case "${WORKER_ENVS[$i]}" in
+      GPUSTACK_EXTRA_MOUNTS=*)
+        found=1; val="${WORKER_ENVS[$i]#GPUSTACK_EXTRA_MOUNTS=}"
+        case ",${val}," in
+          *",${want},"*) : ;;  # 已含,不动
+          *) WORKER_ENVS[i]="GPUSTACK_EXTRA_MOUNTS=${val},${want}"
+             echo "    ⚠️ EXTRA_MOUNTS 追加 ${want}" ;;
+        esac ;;
+    esac
+  done
+  [ "$found" -eq 1 ] || WORKER_ENVS+=("GPUSTACK_EXTRA_MOUNTS=/nfs-models,/nfs-output,${want}")
+}
+
 run_worker() { # run_worker <worker_ip> <volume> <server_url>(env 取全局 WORKER_ENVS)
   local ip=$1 volume=$2 server_url=$3
   local env_flags=() e
@@ -359,6 +378,7 @@ run_worker() { # run_worker <worker_ip> <volume> <server_url>(env 取全局 WORK
     --volume /var/run/docker.sock:/var/run/docker.sock \
     --volume "${volume}:/var/lib/gpustack" \
     --volume /nfs-models:/nfs-models --volume /nfs-output:/nfs-output \
+    --volume /nfs-data:/nfs-data \
     --runtime nvidia \
     "$GPUSTACK_IMAGE" \
     --server-url "$server_url" --worker-ip "$ip"
@@ -505,7 +525,9 @@ cmd_upgrade_gpustack() {
   local volume old_server_url
   collect_existing_envs
   ensure_env_present GPUSTACK_RUNTIME_DEPLOY_MIRRORED_NAME "$WORKER_NAME"
-  ensure_env_present GPUSTACK_EXTRA_MOUNTS "/nfs-models,/nfs-output"
+  ensure_env_present GPUSTACK_EXTRA_MOUNTS "/nfs-models,/nfs-output,/nfs-data"
+  ensure_extra_mount /nfs-data   # 旧容器已带 EXTRA_MOUNTS 时补挂 /nfs-data(s2v/vace 依赖)
+  ensure_symlink /nfs-data       # 宿主软链兜底(个别节点当年 install 未建上)
   volume="$(current_worker_volume)"
   [ -n "$volume" ] || die "读不到数据卷名" \
     "匿名卷也会有 64 位卷名;完全为空说明容器没挂 /var/lib/gpustack,重建会丢状态,停止" \
@@ -588,7 +610,7 @@ cmd_prepare_transfer() {
   parse_flags "$@"
   STEP_TOTAL=4
   # tar 必须落在共享 NFS 上;未挂载时 mkdir -p 会静默建本地目录,
-  # 29G tar 写进根盘且其他节点拿不到
+  # 大 tar(引擎/indextts 各 ~10G)写进根盘且其他节点拿不到
   mountpoint -q /nfs-models || die "/nfs-models 未挂载,拒绝把 tar 写到本地盘" \
     "先挂 NFS(fstab 两行 + mount -a,见 install 的 ② 或全记录 §4.2)再重试"
   mkdir -p "$TRANSFER_DIR"
@@ -610,7 +632,7 @@ cmd_prepare_transfer() {
     docker pull --platform linux/amd64 "$GPUSTACK_IMAGE"
   fi
 
-  step "save 引擎 tar(~29G,耐心)"
+  step "save 引擎 tar(~10G,耐心)"
   docker save "$ENGINE_IMAGE" > "${ENGINE_TAR}.tmp" &
   pid=$!; watch_size $pid "${ENGINE_TAR}.tmp"; wait $pid
   mv "${ENGINE_TAR}.tmp" "$ENGINE_TAR"

@@ -674,6 +674,27 @@ async def prioritize_workers_with_model_files(
     return sorted_workers
 
 
+def _evaluate_builtin_backend_config(model: Model) -> Optional[bool]:
+    """
+    First-class built-in engines (LightX2V, IndexTTS) have fixed profiles and
+    non-standard architectures. Loading a HF pretrained config would error and
+    mis-tag them as LLM, so skip detection entirely and declare their category
+    explicitly (LightX2V=video, IndexTTS=text_to_speech).
+    Returns the "categories/gpus_per_replica updated" flag, or None when the
+    model is not a built-in engine (caller should fall through to detection).
+    """
+    builtin_categories = {
+        BackendEnum.LIGHTX2V: CategoryEnum.VIDEO,
+        BackendEnum.INDEXTTS: CategoryEnum.TEXT_TO_SPEECH,
+    }
+    category = builtin_categories.get(model.backend)
+    if category is None:
+        return None
+    categories_modified = set_model_categories(model, category)
+    gpus_per_replica_modified = set_model_gpus_per_replica(model)
+    return categories_modified or gpus_per_replica_modified
+
+
 async def evaluate_pretrained_config(
     model: Model,
     workers: Optional[List[Worker]] = None,
@@ -688,24 +709,13 @@ async def evaluate_pretrained_config(
     Returns:
         True if the model's categories are updated, False otherwise.
     """
-    # 0) LightX2V is a first-class built-in engine with a fixed profile and no
-    # standard HF architecture (z_image / wan). Skip pretrained-config detection
-    # entirely — loading a HF config would error and mis-tag the model as LLM.
-    # Categories are declared explicitly at deploy time (image for z_image,
-    # video for wan); default to video if unset so it never falls through to LLM.
-    if model.backend == BackendEnum.LIGHTX2V:
-        categories_modified = set_model_categories(model, CategoryEnum.VIDEO)
-        gpus_per_replica_modified = set_model_gpus_per_replica(model)
-        return categories_modified or gpus_per_replica_modified
-
-    # 0b) IndexTTS-2 is a first-class built-in TTS engine with a custom
-    # architecture (config.yaml, not a standard HF transformer config). Loading
-    # a HF pretrained config would error and mis-tag it as LLM, so skip
-    # detection entirely and declare text_to_speech.
-    if model.backend == BackendEnum.INDEXTTS:
-        categories_modified = set_model_categories(model, CategoryEnum.TEXT_TO_SPEECH)
-        gpus_per_replica_modified = set_model_gpus_per_replica(model)
-        return categories_modified or gpus_per_replica_modified
+    # 0) First-class built-in engines (LightX2V=video, IndexTTS=text_to_speech)
+    # have fixed profiles and non-standard architectures — skip HF pretrained-
+    # config detection (would error and mis-tag as LLM) and declare category
+    # explicitly. See _evaluate_builtin_backend_config.
+    builtin_modified = _evaluate_builtin_backend_config(model)
+    if builtin_modified is not None:
+        return builtin_modified
 
     # 1) try to evaluate as diffusion model
     try:

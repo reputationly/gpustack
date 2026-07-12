@@ -11,29 +11,13 @@ defaults:
   run:
     shell: bash
 
+# Fork note: this is the UPSTREAM full-pack workflow. It needs registry
+# secrets this fork doesn't set (fails "Password required") and is NOT the
+# fork's release path — we ship via pack-acr-overlay.yml. Auto-triggers
+# (push / pull_request) are disabled so it stops failing on every push;
+# left as workflow_dispatch-only in case someone wants the full upstream pack.
 on:
   workflow_dispatch: {}
-  push:
-    branches:
-      - "main"
-      - "v*-dev"
-    tags:
-      - "v*.*.*"
-    paths-ignore:
-      - "mkdocs.yml"
-      - "docs/**"
-      - "**.md"
-      - "**.mdx"
-      - "**.png"
-      - "**.jpg"
-      - "**.gif"
-  pull_request:
-    branches:
-      - "main"
-      - "v*-dev"
-    paths:
-      - ".github/workflows/pack.yaml"
-      - "pack/**"
 
 env:
   INPUT_PYTHON_VERSION: 3.11
