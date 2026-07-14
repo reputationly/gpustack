@@ -195,7 +195,10 @@ def test_make_ssl_context_verifies_against_custom_bundle(monkeypatch, tls_server
     ctx = make_ssl_context()
     try:
         # Use httpx to drive a real request through the new context.
-        with httpx.Client(verify=ctx, timeout=5) as client:
+        # trust_env=False: this loopback request must not route through
+        # ambient proxies (httpx honors macOS system proxy settings via
+        # urllib.getproxies() but ignores their localhost exception list).
+        with httpx.Client(verify=ctx, timeout=5, trust_env=False) as client:
             # Server cert SAN=localhost; resolve via localhost directly and
             # pin sni_hostname so SNI/SAN verification lines up regardless of
             # the runner's IPv4/IPv6 ordering for "localhost".
@@ -218,7 +221,8 @@ def test_make_ssl_context_rejects_untrusted_cert(monkeypatch, tls_server, tmp_pa
 
     ctx = make_ssl_context()
     try:
-        with httpx.Client(verify=ctx, timeout=5) as client:
+        # trust_env=False: same loopback/proxy hygiene as the verify test above.
+        with httpx.Client(verify=ctx, timeout=5, trust_env=False) as client:
             with pytest.raises(httpx.ConnectError) as exc_info:
                 client.get(f"https://localhost:{port}/")
         # The error chain should contain a TLS cert verification failure.

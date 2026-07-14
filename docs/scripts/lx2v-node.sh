@@ -113,6 +113,32 @@ watch_size() { # watch_size <pid> <file>
   done
 }
 
+# 镜像的 registry digest(RepoDigests,manifest-list 级,与本地拉的哪个平台无关;
+# 排序拼接防多条目顺序抖动)。本地 build 的镜像无 RepoDigests → 返回空 → 永远重 save
+image_digest() { # image_digest <image>
+  docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$1" 2>/dev/null \
+    | sort | tr '\n' ' ' || true
+}
+
+# save 去重:tar 旁存 <tar>.digest 标记。digest 未变且 tar 在 → 跳过(~10G/次的大头)。
+# 完整性:tar 走 .tmp + mv 原子改名,tar 文件存在即写完;.digest 在 mv 之后才写,
+# 标记在 = tar 完整。半截只会是 .tmp,进场先清(上次 Ctrl-C 的残留)。
+save_tar_if_changed() { # save_tar_if_changed <image> <tar> [docker save 额外参数...]
+  local image=$1 tar=$2; shift 2
+  local digest; digest="$(image_digest "$image")"
+  rm -f "${tar}.tmp"
+  if [ -n "$digest" ] && [ -f "$tar" ] \
+     && [ "$(cat "${tar}.digest" 2>/dev/null || true)" = "$digest" ]; then
+    echo "    digest 未变($(du -h "$tar" | cut -f1) 已在 NFS),跳过 save: $tar"
+    return 0
+  fi
+  docker save "$@" "$image" > "${tar}.tmp" &
+  local pid=$!; watch_size $pid "${tar}.tmp"; wait $pid
+  mv "${tar}.tmp" "$tar"
+  if [ -n "$digest" ]; then echo "$digest" > "${tar}.digest"; fi
+  echo "    $(du -h "$tar" | cut -f1)  ${tar}"
+}
+
 detect_worker_ip() {
   # 取 10.x 网段第一个地址;无匹配返回空(由调用方决定是否致命)
   hostname -I | tr ' ' '\n' | grep -E '^10\.' | head -1 || true
@@ -620,11 +646,11 @@ cmd_prepare_transfer() {
   docker pull --platform linux/arm64 "$ENGINE_IMAGE"
   docker pull --platform linux/arm64 "$INDEXTTS_IMAGE"
 
-  step "save gpustack tar(必须 > 重定向,不能 -o,坑#5)"
-  docker save "$GPUSTACK_IMAGE" > "${GPUSTACK_TAR}.tmp" &
-  local pid=$!; watch_size $pid "${GPUSTACK_TAR}.tmp"; wait $pid
-  mv "${GPUSTACK_TAR}.tmp" "$GPUSTACK_TAR"
-  echo "    $(du -h "$GPUSTACK_TAR" | cut -f1)  ${GPUSTACK_TAR}"
+  step "save gpustack tar(digest 未变则跳过;必须 > 重定向,不能 -o,坑#5)"
+  # --platform:gpustack 镜像是多架构 manifest;containerd 镜像存储下,不带 --platform
+  # 的 docker save 会尝试导出整个 manifest list(含未拉的 amd64)→ "content digest
+  # not found"。指定 arm64 只导该平台,免去"先拉 amd64 占本地"的前置步骤。
+  save_tar_if_changed "$GPUSTACK_IMAGE" "$GPUSTACK_TAR" --platform linux/arm64
   if [ "$(uname -m)" = "x86_64" ]; then
     # 238 的 server 容器与本 tag 同名:上面 --platform arm64 的 pull 已把本地 tag
     # 指向 arm64 镜像,不恢复的话之后跳过 pull 直接 docker run 会 exec format error
@@ -632,17 +658,11 @@ cmd_prepare_transfer() {
     docker pull --platform linux/amd64 "$GPUSTACK_IMAGE"
   fi
 
-  step "save 引擎 tar(~10G,耐心)"
-  docker save "$ENGINE_IMAGE" > "${ENGINE_TAR}.tmp" &
-  pid=$!; watch_size $pid "${ENGINE_TAR}.tmp"; wait $pid
-  mv "${ENGINE_TAR}.tmp" "$ENGINE_TAR"
-  echo "    $(du -h "$ENGINE_TAR" | cut -f1)  ${ENGINE_TAR}"
+  step "save 引擎 tar(~10G,digest 未变则跳过)"
+  save_tar_if_changed "$ENGINE_IMAGE" "$ENGINE_TAR"
 
-  step "save indextts2 tar(~10G)"
-  docker save "$INDEXTTS_IMAGE" > "${INDEXTTS_TAR}.tmp" &
-  pid=$!; watch_size $pid "${INDEXTTS_TAR}.tmp"; wait $pid
-  mv "${INDEXTTS_TAR}.tmp" "$INDEXTTS_TAR"
-  echo "    $(du -h "$INDEXTTS_TAR" | cut -f1)  ${INDEXTTS_TAR}"
+  step "save indextts2 tar(~10G,digest 未变则跳过)"
+  save_tar_if_changed "$INDEXTTS_IMAGE" "$INDEXTTS_TAR"
   cp -f "$0" "${TRANSFER_DIR}/lx2v-node.sh" && chmod +x "${TRANSFER_DIR}/lx2v-node.sh"
   echo "    脚本自身已同步到 ${TRANSFER_DIR}/lx2v-node.sh(已挂 NFS 的节点可直接执行)"
   echo "    提示:nvidia-repo/ 两件套如缺,在既有 GPU 节点执行:"
