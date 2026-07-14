@@ -524,6 +524,7 @@ cd gpustack && uv run --no-sync pytest        # 2026-07-14 全绿：1238 passed,
 ```
 
 - **必须带 `--no-sync`**：venv 依赖已装齐，裸 `uv run pytest` 每次触发全量 depsync（拉 torch 等巨型依赖）导致超时——这就是之前"pytest 跑不通"的原因。
+- **CI 门禁**：`pack-acr-overlay.yml` 已加 test job（build needs test），保证出的每个 overlay 镜像都过单测；pre-commit 保持秒级静态检查不挂 pytest（避免 --no-verify 绕过文化）。
 - **macOS 开代理的机器**：httpx 经 `urllib.getproxies()` 会读 macOS 系统代理但忽略其 localhost 例外清单，回环 TLS 测试会被路由进本地代理而 ReadTimeout。`tests/utils/test_ssl_context.py` 已改为 `trust_env=False` 隔离；后续新增涉及本地回环 HTTP 的测试同样要加。
 
 ### 9.4 已知未专项验证项（接手人注意）

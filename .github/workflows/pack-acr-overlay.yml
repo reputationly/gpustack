@@ -37,8 +37,30 @@ env:
   ACR_REPO: crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack
 
 jobs:
+  # Gate: every image we ship must pass the unit suite. This is the only place
+  # tests run automatically (pre-commit stays static-checks-only by design).
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync --frozen
+
+      - name: Run pytest
+        run: uv run --no-sync pytest
+
   build:
     runs-on: ubuntu-latest
+    needs: test
     steps:
       - name: Checkout
         uses: actions/checkout@v4
