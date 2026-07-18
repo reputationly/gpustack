@@ -27,6 +27,7 @@ from gpustack.schemas.models import (
     is_audio_model,
     is_embedding_model,
     is_image_model,
+    is_music_model,
     is_reranker_model,
     is_video_model,
 )
@@ -291,6 +292,7 @@ async def validate_and_mutate_benchmark_in(
         is_image_model(model)
         or is_video_model(model)
         or is_audio_model(model)
+        or is_music_model(model)
         or is_embedding_model(model)
         or is_reranker_model(model)
     ):

@@ -86,10 +86,17 @@ _VIDEO_TASK_TYPES = {"t2v", "i2v", "flf2v", "s2v", "sr", "vace"}
 # facade task_type; it maps to the engine's POST /v1/tasks/audio/ (engine kind
 # "audio"). Zero-shot voice clone + emotion control, async like video.
 _AUDIO_TASK_TYPES = {"tts"}
+# Music task types served by the ACE-Step-1.5 built-in engine. They map to the
+# engine's POST /v1/tasks/music/ (engine kind "music"): t2m (text-to-music, no
+# input), cover (style transfer from a reference audio) and repaint (region
+# regeneration). Async like video/audio.
+_MUSIC_TASK_TYPES = {"t2m", "cover", "repaint"}
 # Finite set of accepted actions. task_type is the first path component of the
 # §7.2 NFS layout, so it MUST be constrained — an unsanitized value like
 # "../../tmp/x" would let save_result_path / input writes escape the output root.
-_VALID_TASK_TYPES = _IMAGE_TASK_TYPES | _VIDEO_TASK_TYPES | _AUDIO_TASK_TYPES
+_VALID_TASK_TYPES = (
+    _IMAGE_TASK_TYPES | _VIDEO_TASK_TYPES | _AUDIO_TASK_TYPES | _MUSIC_TASK_TYPES
+)
 
 # Facade input field -> (engine request field, default extension). Inputs are
 # NOT sent as base64/URL anymore: new-api (the trusted caller) pre-materializes
@@ -118,6 +125,10 @@ _INPUT_FIELDS = {
     "src_video": ("src_video", ".mp4"),
     "src_mask": ("src_mask", ".mp4"),
     "src_ref_images": ("src_ref_images", ".png"),
+    # Music (ACE-Step, task_type "cover"/"repaint"): the reference/source audio
+    # whose style or region drives generation. t2m needs no input.
+    "reference_audio": ("reference_audio_path", ".mp3"),
+    "src_audio": ("src_audio_path", ".mp3"),
 }
 
 # Facade fields that may carry a LIST of refs; each item is persisted and the
@@ -171,6 +182,10 @@ _ENGINE_OWNED_FIELDS = {
     "src_video",
     "src_mask",
     "src_ref_images",
+    # Music (ACE-Step) engine-owned path fields: reject if sent raw in the body
+    # (they must arrive as validated NFS input_refs, not caller-supplied paths).
+    "reference_audio_path",
+    "src_audio_path",
     "save_result_path",
 }
 
@@ -191,6 +206,9 @@ _DEFAULT_VIDEO_LATENCY = 90
 # IndexTTS-2 at RTF~3 does a short line (5-8s audio) in a handful of seconds;
 # 20s is a conservative per-instance fallback that also absorbs longer lines.
 _DEFAULT_AUDIO_LATENCY = 20
+# ACE-Step turbo/xl-turbo generate a 30s clip in ~10s warm; longer clips scale
+# but stay well under a minute. 30s is a conservative per-instance fallback.
+_DEFAULT_MUSIC_LATENCY = 30
 
 
 def _engine_kind(task_type: str) -> str:
@@ -198,6 +216,8 @@ def _engine_kind(task_type: str) -> str:
         return "image"
     if task_type in _AUDIO_TASK_TYPES:
         return "audio"
+    if task_type in _MUSIC_TASK_TYPES:
+        return "music"
     return "video"
 
 
@@ -207,6 +227,8 @@ def _output_ext(task_type: str) -> str:
         return ".png"
     if kind == "audio":
         return ".wav"
+    if kind == "music":
+        return ".mp3"
     return ".mp4"
 
 
@@ -437,6 +459,8 @@ def _model_latency(cfg, model_name: str, task_type: str) -> int:
         return _DEFAULT_IMAGE_LATENCY
     if kind == "audio":
         return _DEFAULT_AUDIO_LATENCY
+    if kind == "music":
+        return _DEFAULT_MUSIC_LATENCY
     return _DEFAULT_VIDEO_LATENCY
 
 
@@ -474,6 +498,8 @@ async def _check_admission(
         max_wait = getattr(cfg, "lightx2v_image_max_queue_wait_seconds", 25)
     elif kind == "audio":
         max_wait = getattr(cfg, "lightx2v_audio_max_queue_wait_seconds", 60)
+    elif kind == "music":
+        max_wait = getattr(cfg, "lightx2v_music_max_queue_wait_seconds", 90)
     else:
         max_wait = getattr(cfg, "lightx2v_video_max_queue_wait_seconds", 150)
     if est_wait > int(max_wait):
@@ -579,6 +605,18 @@ async def create_video_task(request: Request, user: CurrentUserDep):
     # by new-api (production) or by this server's /v1/videos/inputs upload
     # endpoint (gpustack-ui admin); the submit body itself never carries bytes.
     input_overrides = _resolve_input_refs(body.get("input_refs"), user_id)
+    # Music cover/repaint need a driving audio; t2m is pure text. Fail fast before
+    # queue/GPU (image i2v-style required-input checks live in the same spirit).
+    if task_type == "cover" and "reference_audio_path" not in input_overrides:
+        raise BadRequestException(
+            message="reference_audio is required for cover",
+            is_openai_exception=True,
+        )
+    if task_type == "repaint" and "src_audio_path" not in input_overrides:
+        raise BadRequestException(
+            message="src_audio is required for repaint",
+            is_openai_exception=True,
+        )
     engine_body: Dict[str, Any] = {
         k: v
         for k, v in body.items()

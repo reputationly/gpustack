@@ -452,6 +452,32 @@ def get_built_in_backend() -> List[InferenceBackend]:
             description="IndexTTS-2 zero-shot voice-clone TTS engine (first-class built-in backend).",
         ),
         InferenceBackend(
+            backend_name=BackendEnum.ACESTEP.value,
+            is_built_in=True,
+            default_version="1.0.0",
+            version_configs=VersionConfigDict(
+                root={
+                    # ACE-Step-1.5 arm64/A100 text-to-music engine image
+                    # (reputationly/acestep, built by the independent CI -> ACR).
+                    # Same pattern as IndexTTS: custom_framework="cuda" so
+                    # BackendFrameworkFilter accepts cuda workers without a
+                    # gpustack-runner service and get_image_name returns this
+                    # explicit image for a BUILT_IN row. Async music generation,
+                    # whole-GPU single instance.
+                    "1.0.0": VersionConfig(
+                        image_name=(
+                            "crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com"
+                            "/reputationly/acestep:arm64-a100-latest"
+                        ),
+                        custom_framework="cuda",
+                    ),
+                }
+            ),
+            health_check_path="/ready",
+            parameter_format=ParameterFormatEnum.SPACE,
+            description="ACE-Step-1.5 text-to-music generation engine (first-class built-in backend).",
+        ),
+        InferenceBackend(
             backend_name=BackendEnum.ASCEND_MINDIE.value, is_built_in=True
         ),
         InferenceBackend(backend_name=BackendEnum.VOX_BOX.value, is_built_in=True),

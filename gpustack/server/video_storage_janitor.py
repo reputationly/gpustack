@@ -47,6 +47,9 @@ _INPUT_PATH_PARAM_KEYS = (
     "src_video",
     "src_mask",
     "src_ref_images",
+    # Music (ACE-Step): cover reference audio / repaint source audio.
+    "reference_audio_path",
+    "src_audio_path",
 )
 
 # DONE tasks stay protected for this long after their last update so watermark

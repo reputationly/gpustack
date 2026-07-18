@@ -64,7 +64,8 @@
 ### 3.1 端点(与门面 `_ENGINE_STATE_MAP` 逐字对齐)
 
 ```
-POST   /v1/tasks/audio/           → 200 {task_id, task_status, save_result_path} | 503 队列满 | 400 缺参
+POST   /v1/tasks/music/           → 200 {task_id, task_status, save_result_path} | 503 队列满 | 400 缺参
+       (别名 /v1/tasks/audio/;门面按 engine_kind "music" 发 /v1/tasks/music/)
 GET    /v1/tasks/{task_id}/status → 200 {task_id, status, save_result_path, error, error_type,
                                           created_at, completed_at} | 404(触发门面死亡重派)
 GET    /v1/tasks/queue/status     → {is_processing, current_task, pending_count, active_count,
@@ -125,7 +126,7 @@ GET    /health                    → 复用现有(launcher/探活)
 ### 4.3 门面 4 处(`routes/videos.py`)
 
 1. `_MUSIC_TASK_TYPES = {"t2m", "cover", "repaint"}` 并入 `_VALID_TASK_TYPES`。
-2. `_engine_kind()` 加 music 分支 → 提交到 `/v1/tasks/audio/`。
+2. `_engine_kind()` 加 music 分支 → 提交到 `/v1/tasks/music/`。
 3. `_output_ext()` → `.mp3`(music 默认;适配层据此设 audio_format)。
 4. `_model_latency()` 加 ACE-Step 默认时延(P0 实测填,t2m 约数十秒~分钟级)。
 5. janitor 输入保护键覆盖 `reference_audio_path` / `src_audio_path`。
@@ -198,7 +199,7 @@ CI:原生 `ubuntu-24.04-arm` runner、ACR 一次性种 base、双 tag(`acestep:a
 | M | 仓 | 验收 |
 |---|---|---|
 | **P0** | ACE-Step | smoke harness 全绿:t2m/cover/repaint 出可听音频,显存/卡数/lm_backend 结论,实验报告 |
-| **M1** | ACE-Step | curl 全链路:`POST /v1/tasks/audio/` → 轮询 status → 产物落 NFS;`/ready` 加载前 503;unittest 覆盖状态映射 + 原子写 |
+| **M1** | ACE-Step | curl 全链路:`POST /v1/tasks/music/` → 轮询 status → 产物落 NFS;`/ready` 加载前 503;unittest 覆盖状态映射 + 原子写 |
 | **M2/M3** | gpustack | 容器拉起、`/ready` 200、门面接收 `t2m/cover/repaint` 分发正确;category 扫点无遗漏;`uv run --no-sync pytest` 全绿 |
 | **M4** | new-api | 端到端:new-api submit → 物化(cover/repaint)→ 推理 → OBS 取件 |
 | **M5** | gpustack-ui | music 类目 + 提交/试听/下载(可后置) |

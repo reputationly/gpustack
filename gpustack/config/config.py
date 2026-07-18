@@ -194,6 +194,9 @@ class Config(WorkerConfig, BaseSettings):
     lightx2v_image_max_queue_wait_seconds: int = 25
     lightx2v_video_max_queue_wait_seconds: int = 150
     lightx2v_audio_max_queue_wait_seconds: int = 60
+    # ACE-Step music: ~10-30s warm per clip behind a per-instance FIFO; 90s is a
+    # sane admission ceiling.
+    lightx2v_music_max_queue_wait_seconds: int = 90
     # Per-model single-instance hot-state latency (seconds), keyed by public model
     # name (substring match, case-insensitive). Defaults from the LightX2V test
     # reports. Unknown models fall back to a per-kind default (image/video/audio).

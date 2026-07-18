@@ -49,6 +49,7 @@ class CategoryEnum(str, Enum):
     RERANKER = "reranker"
     SPEECH_TO_TEXT = "speech_to_text"
     TEXT_TO_SPEECH = "text_to_speech"
+    MUSIC = "music"
     UNKNOWN = "unknown"
 
 
@@ -64,6 +65,7 @@ class BackendEnum(str, Enum):
     SGLANG = "SGLang"
     LIGHTX2V = "LightX2V"
     INDEXTTS = "IndexTTS"
+    ACESTEP = "ACEStep"
     CUSTOM = "Custom"
 
 
@@ -862,6 +864,15 @@ def is_video_model(model: Model):
         model: Model to check.
     """
     return "video" in model.categories
+
+
+def is_music_model(model: Model):
+    """
+    Check if the model is a music-generation model (ACE-Step).
+    Args:
+        model: Model to check.
+    """
+    return "music" in model.categories
 
 
 def is_embedding_model(model: Model):
