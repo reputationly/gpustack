@@ -53,6 +53,10 @@ _INPUT_PATH_PARAM_KEYS = (
     # TTS voice-clone / dialogue (vLLM-Omni): reference voice + 2nd speaker ref.
     "ref_audio_path",
     "ref_audio_2_path",
+    # Diffusion audio (vLLM-Omni "audiogen"): AudioX video (video_path, already
+    # listed above) + SoulX-Singer prompt/target vocals (engine field names match).
+    "prompt_audio",
+    "target_audio",
 )
 
 # DONE tasks stay protected for this long after their last update so watermark

@@ -91,11 +91,24 @@ _AUDIO_TASK_TYPES = {"tts"}
 # input), cover (style transfer from a reference audio) and repaint (region
 # regeneration). Async like video/audio.
 _MUSIC_TASK_TYPES = {"t2m", "cover", "repaint"}
+# Diffusion audio-generation task types served by the vLLM-Omni built-in engine's
+# diffusion models. They map to the engine's POST /v1/tasks/audiogen/ (engine kind
+# "audiogen"): AudioX (t2a sound-effects, v2a/v2m/tv2a/tv2m video->audio/music) and
+# SoulX-Singer (svs singing voice synthesis). Distinct from TTS ("audio" kind) and
+# ACE-Step music ("music" kind); NOTE "t2m" is NOT here — it belongs to ACE-Step
+# (text-to-music), so AudioX text->music is not exposed via the facade (use v2m for
+# video->music or ACE-Step for text->music). SVC is a later batch. Async like the
+# rest; status/cancel reuse the global /v1/tasks/{id} endpoints.
+_AUDIOGEN_TASK_TYPES = {"t2a", "v2a", "v2m", "tv2a", "tv2m", "svs"}
 # Finite set of accepted actions. task_type is the first path component of the
 # §7.2 NFS layout, so it MUST be constrained — an unsanitized value like
 # "../../tmp/x" would let save_result_path / input writes escape the output root.
 _VALID_TASK_TYPES = (
-    _IMAGE_TASK_TYPES | _VIDEO_TASK_TYPES | _AUDIO_TASK_TYPES | _MUSIC_TASK_TYPES
+    _IMAGE_TASK_TYPES
+    | _VIDEO_TASK_TYPES
+    | _AUDIO_TASK_TYPES
+    | _MUSIC_TASK_TYPES
+    | _AUDIOGEN_TASK_TYPES
 )
 
 # Facade input field -> (engine request field, default extension). Inputs are
@@ -143,6 +156,15 @@ _INPUT_FIELDS = {
     # dependency. ambient_sound / instructions / language are text scalars too.
     "ref_audio": ("ref_audio_path", ".wav"),
     "ref_audio_2": ("ref_audio_2_path", ".wav"),
+    # Diffusion audio (vLLM-Omni, "audiogen" kind). AudioX video->audio/music
+    # reuses the existing "video" field above (-> video_path; AudioX loads it via
+    # av.open, a bare path, no file:// needed). SoulX-Singer SVS integrated
+    # preprocess takes a prompt vocal (target timbre) + target accompaniment; the
+    # engine field names match the SoulX extra_args keys (prompt_audio /
+    # target_audio), which AudioGenTaskRequest.to_chat_request nests under
+    # extra_args. Bare server paths (no file://).
+    "prompt_audio": ("prompt_audio", ".wav"),
+    "target_audio": ("target_audio", ".wav"),
 }
 
 # Facade fields that may carry a LIST of refs; each item is persisted and the
@@ -203,6 +225,10 @@ _ENGINE_OWNED_FIELDS = {
     # TTS voice-clone / dialogue (vLLM-Omni) engine-owned path fields.
     "ref_audio_path",
     "ref_audio_2_path",
+    # Diffusion audio (vLLM-Omni "audiogen") engine-owned path fields. video_path
+    # is already listed above (shared with SeedVR2 sr).
+    "prompt_audio",
+    "target_audio",
     "save_result_path",
 }
 
@@ -226,6 +252,9 @@ _DEFAULT_AUDIO_LATENCY = 20
 # ACE-Step turbo/xl-turbo generate a 30s clip in ~10s warm; longer clips scale
 # but stay well under a minute. 30s is a conservative per-instance fallback.
 _DEFAULT_MUSIC_LATENCY = 30
+# Diffusion audio (AudioX ~10-30s for 250 steps / 10s clip; SoulX ~10-50s per
+# song). 30s is a conservative per-instance fallback that absorbs both.
+_DEFAULT_AUDIOGEN_LATENCY = 30
 
 
 def _engine_kind(task_type: str) -> str:
@@ -235,6 +264,8 @@ def _engine_kind(task_type: str) -> str:
         return "audio"
     if task_type in _MUSIC_TASK_TYPES:
         return "music"
+    if task_type in _AUDIOGEN_TASK_TYPES:
+        return "audiogen"
     return "video"
 
 
@@ -246,6 +277,8 @@ def _output_ext(task_type: str) -> str:
         return ".wav"
     if kind == "music":
         return ".mp3"
+    if kind == "audiogen":
+        return ".wav"
     return ".mp4"
 
 
@@ -478,6 +511,8 @@ def _model_latency(cfg, model_name: str, task_type: str) -> int:
         return _DEFAULT_AUDIO_LATENCY
     if kind == "music":
         return _DEFAULT_MUSIC_LATENCY
+    if kind == "audiogen":
+        return _DEFAULT_AUDIOGEN_LATENCY
     return _DEFAULT_VIDEO_LATENCY
 
 
@@ -517,6 +552,8 @@ async def _check_admission(
         max_wait = getattr(cfg, "lightx2v_audio_max_queue_wait_seconds", 60)
     elif kind == "music":
         max_wait = getattr(cfg, "lightx2v_music_max_queue_wait_seconds", 90)
+    elif kind == "audiogen":
+        max_wait = getattr(cfg, "lightx2v_audiogen_max_queue_wait_seconds", 90)
     else:
         max_wait = getattr(cfg, "lightx2v_video_max_queue_wait_seconds", 150)
     if est_wait > int(max_wait):
@@ -641,6 +678,16 @@ async def create_video_task(request: Request, user: CurrentUserDep):
     }
     engine_body.update(input_overrides)
     engine_body["save_result_path"] = out_abs
+    # Forward the audiogen subtype to the engine. task_type is a _CONTROL_KEY
+    # (stripped above), but the diffusion engine needs to know WHICH AudioX mode
+    # was requested — v2a vs v2m (or t2a) take the same inputs yet produce
+    # different output (sound-effect vs music). Backfill audiox_task from task_type
+    # for the AudioX modes so a direct caller that sent only task_type (not
+    # audiox_task) still routes correctly; a caller-supplied audiox_task wins.
+    # SoulX svs is single-mode (the loaded pipeline determines it), so it needs no
+    # subtype field.
+    if task_type in _AUDIOGEN_TASK_TYPES and task_type != "svs":
+        engine_body.setdefault("audiox_task", task_type)
     await asyncio.to_thread(_ensure_parent_dir, out_abs)
 
     # Persist BEFORE the engine accepts work: if the row were written after a
