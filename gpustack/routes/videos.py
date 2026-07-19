@@ -129,6 +129,20 @@ _INPUT_FIELDS = {
     # whose style or region drives generation. t2m needs no input.
     "reference_audio": ("reference_audio_path", ".mp3"),
     "src_audio": ("src_audio_path", ".mp3"),
+    # TTS voice-clone / dialogue (vLLM-Omni, task_type "tts"): the zero-shot
+    # reference voice (VoxCPM2/CosyVoice3/GLM-TTS/MOSS-*) and, for MOSS-TTSD
+    # multi-speaker dialogue, the second speaker's reference. Distinct from
+    # IndexTTS "voice"->spk_audio_path because vLLM-Omni's request field for the
+    # clone reference is ref_audio (a file). vLLM-Omni's PRESET voice (Qwen3-TTS
+    # "vivian"/"ryan"/…) is a string, not a file: it does NOT use "voice" here
+    # (that key is IndexTTS's file voice), but rides the engine's "voice" alias
+    # "speaker" (AliasChoices("voice","speaker") in protocol/audio.py) — a caller
+    # sends the preset name as the scalar "speaker", which is not an _INPUT_FIELDS
+    # key and passes through the facade untouched to the engine. So both preset
+    # voices (speaker) and cloning (ref_audio) work today; no IndexTTS-retire
+    # dependency. ambient_sound / instructions / language are text scalars too.
+    "ref_audio": ("ref_audio_path", ".wav"),
+    "ref_audio_2": ("ref_audio_2_path", ".wav"),
 }
 
 # Facade fields that may carry a LIST of refs; each item is persisted and the
@@ -186,6 +200,9 @@ _ENGINE_OWNED_FIELDS = {
     # (they must arrive as validated NFS input_refs, not caller-supplied paths).
     "reference_audio_path",
     "src_audio_path",
+    # TTS voice-clone / dialogue (vLLM-Omni) engine-owned path fields.
+    "ref_audio_path",
+    "ref_audio_2_path",
     "save_result_path",
 }
 

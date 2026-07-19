@@ -45,6 +45,7 @@ from gpustack.worker.backends.vox_box import VoxBoxServer
 from gpustack.worker.backends.lightx2v import LightX2VServer
 from gpustack.worker.backends.indextts import IndexTTSServer
 from gpustack.worker.backends.acestep import ACEStepServer
+from gpustack.worker.backends.vllm_omni import VLLMOmniServer
 from gpustack.worker.backends.custom import CustomServer
 from gpustack.routes.worker.logs import (
     extract_container_restart_count,
@@ -84,6 +85,7 @@ _SERVER_CLASS_MAPPING = {
     BackendEnum.LIGHTX2V: LightX2VServer,
     BackendEnum.INDEXTTS: IndexTTSServer,
     BackendEnum.ACESTEP: ACEStepServer,
+    BackendEnum.VLLM_OMNI: VLLMOmniServer,
 }
 
 

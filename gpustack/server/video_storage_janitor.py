@@ -50,6 +50,9 @@ _INPUT_PATH_PARAM_KEYS = (
     # Music (ACE-Step): cover reference audio / repaint source audio.
     "reference_audio_path",
     "src_audio_path",
+    # TTS voice-clone / dialogue (vLLM-Omni): reference voice + 2nd speaker ref.
+    "ref_audio_path",
+    "ref_audio_2_path",
 )
 
 # DONE tasks stay protected for this long after their last update so watermark

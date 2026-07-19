@@ -478,6 +478,33 @@ def get_built_in_backend() -> List[InferenceBackend]:
             description="ACE-Step-1.5 text-to-music generation engine (first-class built-in backend).",
         ),
         InferenceBackend(
+            backend_name=BackendEnum.VLLM_OMNI.value,
+            is_built_in=True,
+            default_version="1.0.0",
+            version_configs=VersionConfigDict(
+                root={
+                    # vLLM-Omni arm64/A100 multi-model speech engine image
+                    # (reputationly/vllm-omni, built by the independent CI -> ACR).
+                    # Same pattern as IndexTTS/ACE-Step: custom_framework="cuda" so
+                    # BackendFrameworkFilter accepts cuda workers without a
+                    # gpustack-runner service and get_image_name returns this
+                    # explicit image for a BUILT_IN row. Async speech synthesis
+                    # (/v1/tasks/audio/), reuses the IndexTTS "tts" facade path;
+                    # serves TTS + MOSS family (1-card small models, 2-card 8B).
+                    "1.0.0": VersionConfig(
+                        image_name=(
+                            "crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com"
+                            "/reputationly/vllm-omni:arm64-a100-latest"
+                        ),
+                        custom_framework="cuda",
+                    ),
+                }
+            ),
+            health_check_path="/ready",
+            parameter_format=ParameterFormatEnum.SPACE,
+            description="vLLM-Omni multi-model speech/TTS engine (first-class built-in backend; supersedes IndexTTS for TTS).",
+        ),
+        InferenceBackend(
             backend_name=BackendEnum.ASCEND_MINDIE.value, is_built_in=True
         ),
         InferenceBackend(backend_name=BackendEnum.VOX_BOX.value, is_built_in=True),

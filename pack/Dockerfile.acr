@@ -42,6 +42,9 @@ COPY gpustack/policies/candidate_selectors/indextts_resource_fit_selector.py /tm
 # --- ACE-Step built-in backend (text-to-music) ---
 COPY gpustack/worker/backends/acestep.py                                     /tmp/lx2v-overlay/worker/backends/acestep.py
 COPY gpustack/policies/candidate_selectors/acestep_resource_fit_selector.py  /tmp/lx2v-overlay/policies/candidate_selectors/acestep_resource_fit_selector.py
+# --- vLLM-Omni built-in backend (multi-model speech/TTS; supersedes IndexTTS) ---
+COPY gpustack/worker/backends/vllm_omni.py                                    /tmp/lx2v-overlay/worker/backends/vllm_omni.py
+COPY gpustack/policies/candidate_selectors/vllm_omni_resource_fit_selector.py /tmp/lx2v-overlay/policies/candidate_selectors/vllm_omni_resource_fit_selector.py
 COPY gpustack/assets/model-catalog.yaml                                      /tmp/lx2v-overlay/assets/model-catalog.yaml
 # Catalog icon lands under the installed UI static dir (copy_extra_static
 # equivalent); staged separately because it's outside the gpustack/ pkg tree.
@@ -94,8 +97,12 @@ RUN set -eux; \
         "${GP_DIR}/policies/candidate_selectors/lightx2v_resource_fit_selector.py" \
         "${GP_DIR}/policies/candidate_selectors/indextts_resource_fit_selector.py" \
         "${GP_DIR}/policies/candidate_selectors/acestep_resource_fit_selector.py" \
+        "${GP_DIR}/worker/backends/vllm_omni.py" \
+        "${GP_DIR}/policies/candidate_selectors/vllm_omni_resource_fit_selector.py" \
         "${GP_DIR}/schemas/inference_backend.py" \
         "${GP_DIR}/scheduler/scheduler.py" \
+        "${GP_DIR}/scheduler/evaluator.py" \
+        "${GP_DIR}/worker/model_meta.py" \
         "${GP_DIR}/routes/videos.py" \
         "${GP_DIR}/routes/video_tasks.py" \
         "${GP_DIR}/schemas/video_generation_task.py" \
@@ -105,6 +112,7 @@ RUN set -eux; \
     python3 -c "from gpustack.schemas.models import BackendEnum, CategoryEnum; assert BackendEnum.LIGHTX2V and CategoryEnum.VIDEO; print('lx2v backend overlay OK')"; \
     python3 -c "from gpustack.schemas.models import BackendEnum; assert BackendEnum.INDEXTTS; print('indextts backend overlay OK')"; \
     python3 -c "from gpustack.schemas.models import BackendEnum, CategoryEnum; assert BackendEnum.ACESTEP and CategoryEnum.MUSIC; print('acestep backend + music category overlay OK')"; \
+    python3 -c "from gpustack.schemas.models import BackendEnum; assert BackendEnum.VLLM_OMNI; from gpustack.worker.backends.vllm_omni import VLLMOmniServer; from gpustack.policies.candidate_selectors.vllm_omni_resource_fit_selector import VLLMOmniResourceFitSelector; print('vllm-omni backend overlay OK')"; \
     grep -q "IndexTTS-2" "${GP_DIR}/assets/model-catalog.yaml" && echo "catalog overlay OK"; \
     mkdir -p "${GP_DIR}/ui/static/catalog_icons"; \
     cp -v /tmp/lx2v-static/catalog_icons/index-tts.png "${GP_DIR}/ui/static/catalog_icons/"; \

@@ -66,6 +66,7 @@ class BackendEnum(str, Enum):
     LIGHTX2V = "LightX2V"
     INDEXTTS = "IndexTTS"
     ACESTEP = "ACEStep"
+    VLLM_OMNI = "vLLMOmni"
     CUSTOM = "Custom"
 
 

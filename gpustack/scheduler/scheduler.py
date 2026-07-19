@@ -38,6 +38,9 @@ from gpustack.policies.candidate_selectors.indextts_resource_fit_selector import
 from gpustack.policies.candidate_selectors.acestep_resource_fit_selector import (
     ACEStepResourceFitSelector,
 )
+from gpustack.policies.candidate_selectors.vllm_omni_resource_fit_selector import (
+    VLLMOmniResourceFitSelector,
+)
 from gpustack.policies.utils import ListMessageBuilder, should_skip_gpu_count_check
 from gpustack.policies.worker_filters.backend_framework_filter import (
     BackendFrameworkFilter,
@@ -414,7 +417,7 @@ class Scheduler:
                 )
 
 
-async def find_candidate(
+async def find_candidate(  # noqa: C901
     config: Config,
     model: Model,
     workers: List[Worker],
@@ -479,6 +482,12 @@ async def find_candidate(
         elif model.backend == BackendEnum.ACESTEP:
             # ACE-Step: whole-GPU exclusive, 1 instance/card (same as IndexTTS).
             candidates_selector = ACEStepResourceFitSelector(
+                config, model, model_instances
+            )
+        elif model.backend == BackendEnum.VLLM_OMNI:
+            # vLLM-Omni: whole-GPU exclusive; variable card count (1 for small
+            # TTS, 2 for the 8B MOSS models via gpus_per_replica — see selector).
+            candidates_selector = VLLMOmniResourceFitSelector(
                 config, model, model_instances
             )
         else:
@@ -684,17 +693,19 @@ async def prioritize_workers_with_model_files(
 
 def _evaluate_builtin_backend_config(model: Model) -> Optional[bool]:
     """
-    First-class built-in engines (LightX2V, IndexTTS, ACE-Step) have fixed
-    profiles and non-standard architectures. Loading a HF pretrained config would
-    error and mis-tag them as LLM, so skip detection entirely and declare their
-    category explicitly (LightX2V=video, IndexTTS=text_to_speech, ACE-Step=music).
-    Returns the "categories/gpus_per_replica updated" flag, or None when the
-    model is not a built-in engine (caller should fall through to detection).
+    First-class built-in engines (LightX2V, IndexTTS, ACE-Step, vLLM-Omni) have
+    fixed profiles and non-standard architectures. Loading a HF pretrained config
+    would error and mis-tag them as LLM, so skip detection entirely and declare
+    their category explicitly (LightX2V=video, IndexTTS/vLLM-Omni=text_to_speech,
+    ACE-Step=music). Returns the "categories/gpus_per_replica updated" flag, or
+    None when the model is not a built-in engine (caller falls through to
+    detection).
     """
     builtin_categories = {
         BackendEnum.LIGHTX2V: CategoryEnum.VIDEO,
         BackendEnum.INDEXTTS: CategoryEnum.TEXT_TO_SPEECH,
         BackendEnum.ACESTEP: CategoryEnum.MUSIC,
+        BackendEnum.VLLM_OMNI: CategoryEnum.TEXT_TO_SPEECH,
     }
     category = builtin_categories.get(model.backend)
     if category is None:
