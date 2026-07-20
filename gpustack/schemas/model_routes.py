@@ -304,17 +304,14 @@ class ModelRouteUpdateBase(SQLModel):
     def validate_categories(cls, v):
         if v is None:
             return v
+        # Lazy import: models.py imports this module at top level, so importing
+        # CategoryEnum here at module scope would be circular. Reference the enum
+        # so the valid set stays in sync with the single source of truth.
+        from gpustack.schemas.models import CategoryEnum
+
+        valid_categories = {c.value for c in CategoryEnum}
         for category in v:
-            if category not in [
-                "llm",
-                "embedding",
-                "image",
-                "video",
-                "reranker",
-                "speech_to_text",
-                "text_to_speech",
-                "unknown",
-            ]:
+            if category not in valid_categories:
                 raise ValueError(f"Invalid category: {category}")
         return v
 
