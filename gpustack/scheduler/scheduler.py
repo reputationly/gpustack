@@ -41,6 +41,9 @@ from gpustack.policies.candidate_selectors.acestep_resource_fit_selector import 
 from gpustack.policies.candidate_selectors.vllm_omni_resource_fit_selector import (
     VLLMOmniResourceFitSelector,
 )
+from gpustack.policies.candidate_selectors.bernini_resource_fit_selector import (
+    BerniniResourceFitSelector,
+)
 from gpustack.policies.utils import ListMessageBuilder, should_skip_gpu_count_check
 from gpustack.policies.worker_filters.backend_framework_filter import (
     BackendFrameworkFilter,
@@ -474,6 +477,12 @@ async def find_candidate(  # noqa: C901
             candidates_selector = LightX2VResourceFitSelector(
                 config, model, model_instances
             )
+        elif model.backend == BackendEnum.BERNINI:
+            # Bernini: native Bernini-R video engine; multi-GPU Ulysses like
+            # LightX2V (GPUs/replica from deploy input, see selector).
+            candidates_selector = BerniniResourceFitSelector(
+                config, model, model_instances
+            )
         elif model.backend == BackendEnum.INDEXTTS:
             # IndexTTS-2: whole-GPU exclusive, 1 instance/card (see selector).
             candidates_selector = IndexTTSResourceFitSelector(
@@ -706,6 +715,7 @@ def _evaluate_builtin_backend_config(model: Model) -> Optional[bool]:
         BackendEnum.INDEXTTS: CategoryEnum.TEXT_TO_SPEECH,
         BackendEnum.ACESTEP: CategoryEnum.MUSIC,
         BackendEnum.VLLM_OMNI: CategoryEnum.TEXT_TO_SPEECH,
+        BackendEnum.BERNINI: CategoryEnum.VIDEO,
     }
     category = builtin_categories.get(model.backend)
     if category is None:

@@ -452,6 +452,32 @@ def get_built_in_backend() -> List[InferenceBackend]:
             description="IndexTTS-2 zero-shot voice-clone TTS engine (first-class built-in backend).",
         ),
         InferenceBackend(
+            backend_name=BackendEnum.BERNINI.value,
+            is_built_in=True,
+            default_version="1.0.0",
+            version_configs=VersionConfigDict(
+                root={
+                    # Bernini native (Bernini-R renderer) arm64/A100 engine image
+                    # (reputationly/bernini, built by the independent CI -> ACR).
+                    # Same wiring as IndexTTS: floating tag, custom_framework="cuda"
+                    # so BackendFrameworkFilter accepts cuda A100 workers without a
+                    # gpustack-runner and get_image_name returns this explicit image
+                    # for the BUILT_IN row. server.py self-answers /ready (503 while
+                    # a task's torchrun child loads weights, 200 when accepting).
+                    "1.0.0": VersionConfig(
+                        image_name=(
+                            "crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com"
+                            "/reputationly/bernini:arm64-a100-latest"
+                        ),
+                        custom_framework="cuda",
+                    ),
+                }
+            ),
+            health_check_path="/ready",
+            parameter_format=ParameterFormatEnum.SPACE,
+            description="Bernini native video generation/editing engine (Bernini-R renderer; t2v/v2v/rv2v/r2v/t2i/i2i).",
+        ),
+        InferenceBackend(
             backend_name=BackendEnum.ACESTEP.value,
             is_built_in=True,
             default_version="1.0.0",

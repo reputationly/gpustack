@@ -100,6 +100,16 @@ _MUSIC_TASK_TYPES = {"t2m", "cover", "repaint"}
 # video->music or ACE-Step for text->music). SVC is a later batch. Async like the
 # rest; status/cancel reuse the global /v1/tasks/{id} endpoints.
 _AUDIOGEN_TASK_TYPES = {"t2a", "v2a", "v2m", "tv2a", "tv2m", "svs"}
+# Video-EDITING task types served by the Bernini built-in engine (native
+# Bernini-R renderer). These are Bernini-EXCLUSIVE (no LightX2V collision) and
+# map to engine kind "video" via the _engine_kind default (-> POST
+# /v1/tasks/video/, .mp4, video latency): v2v (edit a source video by prompt),
+# rv2v (source video + reference images), r2v (reference images -> video). Unlike
+# LightX2V (which infers mode from input fields), Bernini's server picks its
+# guidance_mode from task_type, so task_type is backfilled into the engine body
+# below. Bernini's generation modes t2v/t2i/i2i collide with LightX2V/existing
+# sets and are NOT Bernini's strength (deferred; add with a namespace if needed).
+_BERNINI_TASK_TYPES = {"v2v", "rv2v", "r2v"}
 # Finite set of accepted actions. task_type is the first path component of the
 # §7.2 NFS layout, so it MUST be constrained — an unsanitized value like
 # "../../tmp/x" would let save_result_path / input writes escape the output root.
@@ -109,6 +119,7 @@ _VALID_TASK_TYPES = (
     | _AUDIO_TASK_TYPES
     | _MUSIC_TASK_TYPES
     | _AUDIOGEN_TASK_TYPES
+    | _BERNINI_TASK_TYPES
 )
 
 # Facade input field -> (engine request field, default extension). Inputs are
@@ -688,6 +699,12 @@ async def create_video_task(request: Request, user: CurrentUserDep):
     # subtype field.
     if task_type in _AUDIOGEN_TASK_TYPES and task_type != "svs":
         engine_body.setdefault("audiox_task", task_type)
+    # task_type is stripped as a control key, but Bernini's server selects its
+    # guidance_mode from task_type (v2v/rv2v/r2v -> different guidance paths), so
+    # backfill it into the engine body. Bernini-exclusive types, so no collision
+    # with other engines; a caller-supplied task_type in the body would win.
+    if task_type in _BERNINI_TASK_TYPES:
+        engine_body.setdefault("task_type", task_type)
     await asyncio.to_thread(_ensure_parent_dir, out_abs)
 
     # Persist BEFORE the engine accepts work: if the row were written after a

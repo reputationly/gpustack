@@ -372,9 +372,10 @@ async def evaluate_runtime_version(
         BackendEnum.INDEXTTS.value,
         BackendEnum.ACESTEP.value,
         BackendEnum.VLLM_OMNI.value,
+        BackendEnum.BERNINI.value,
     ):
-        # LightX2V, IndexTTS, ACE-Step and vLLM-Omni are self-contained built-in
-        # backends (explicit image via the registry's version_configs, no
+        # LightX2V, IndexTTS, ACE-Step, vLLM-Omni and Bernini are self-contained
+        # built-in backends (explicit image via the registry's version_configs, no
         # gpustack-runner entry), so there is no runner runtime-version matrix to
         # check against — same rationale as the custom-backend skip above.
         # Without this skip the check would look up a non-existent runner service

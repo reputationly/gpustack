@@ -17,24 +17,39 @@ bash /root/lx2v-node.sh install --token <GPUSTACK_TOKEN>
 bash /root/lx2v-node.sh upgrade-gpustack
 
 # 升级本节点的引擎镜像(之后到 UI 逐个删实例重建生效):
-bash /root/lx2v-node.sh upgrade-engine                     # lightx2v(默认)
-bash /root/lx2v-node.sh upgrade-engine --engine indextts   # IndexTTS-2 语音引擎
+bash /root/lx2v-node.sh upgrade-engine                       # lightx2v(默认)
+bash /root/lx2v-node.sh upgrade-engine --engine indextts     # IndexTTS-2 语音引擎
+bash /root/lx2v-node.sh upgrade-engine --engine acestep      # ACE-Step 文生音乐引擎
+bash /root/lx2v-node.sh upgrade-engine --engine vllm-omni    # vLLM-Omni 全模型语音/音频引擎
 
 # 节点健康速览 / 清理残留:
 bash /root/lx2v-node.sh status
 bash /root/lx2v-node.sh clean [--purge-data] [--kill-gpu-procs]
 
-# (238 上)出了新包之后,更新 NFS 上的 tar(三镜像)和脚本副本:
+# (238 上)出了新包之后,更新 NFS 上的 tar(五镜像)和脚本副本:
 bash /root/lx2v-node.sh prepare-transfer
 ```
+
+> **集群批量**:238 上用 `lx2v-fleet.sh` 对所有 worker 并发跑 node 脚本子命令(自动排除 238 自身):
+> `bash /root/lx2v-fleet.sh upgrade-gpustack --offline` / `bash /root/lx2v-fleet.sh -j 3 upgrade-engine --engine vllm-omni --offline` / `bash /root/lx2v-fleet.sh status`。日志在 238 `/tmp/lx2v-fleet/<ip>.log`。
 
 - 所有命令须 **root** 执行,脚本放任意路径均可;
 - 全程日志:`/var/log/lx2v-node-<日期>.log`;每步打印 `[step i/N] 时间` 和耗时,长任务(load/pull/save)有进度输出——**长时间无输出再怀疑卡住,先看当前 step 是什么**(toolkit 在线下载 5-8 分钟、引擎 tar load 4-5 分钟都是正常的);
 - 任何失败都会打印**原因分析和操作建议**,先照建议做,再看日志。
 
-**当前版本基线**(2026-07-06):gpustack `lx2v-dev` = `lx2v-20260706-0854-cb10ba09`(镜像 ID `1454d55e522d`);引擎 `arm64-a100-latest` = `2d259627e8e1`。节点上 `docker images` 对得上这两个 ID 即为最新。
+**当前镜像清单**(五镜像,tag 均须与 gpustack 内置后端注册表 `schemas/inference_backend.py` 的 image_name 一致,勿改名):
 
-> **2026-07-09 起**:gpustack `lx2v-dev` 重新出包(含 IndexTTS-2 内置后端 + 语音反压 UI),并新增第三镜像 **`indextts2:arm64-a100-latest`**(IndexTTS-2 语音引擎,tar ~10G;tag 必须与 gpustack 内置后端注册表一致,勿改名)。集群升级后请以 `docker images` 实际 ID 刷新本行基线。
+| 镜像 | tag | 用途 |
+|---|---|---|
+| gpustack | `gpustack:lx2v-dev` | server(238,x86)+ worker |
+| lightx2v | `lightx2v:arm64-a100-latest` | 图片/视频引擎 |
+| indextts2 | `indextts2:arm64-a100-latest` | IndexTTS-2 独立语音引擎(可被 vLLM-Omni 取代,见 §4) |
+| acestep | `acestep:arm64-a100-latest` | ACE-Step 文生音乐引擎 |
+| vllm-omni | `vllm-omni:arm64-a100-latest` | vLLM-Omni 全模型语音/音频引擎(TTS/AudioX/SoulX/MOSS 等) |
+
+> **2026-07-20 出包**:gpustack 修 `/v2/model-routes` 的 category 校验(放行 `music`,否则 ACE-Step 令 new-api 拿不到模型);vLLM-Omni 修 audiogen 任务 `model` 字段(门面 strip 掉后引擎兜底填 served model,否则 AudioX/SoulX 的 t2a/v2a/v2m/svs 报 400)。**两者都要重出包 + 分别升 server / 换 vllm-omni 引擎 + 重建实例**才生效(见 §2.4)。
+>
+> 集群升级后请以各节点 `docker images` 实际 ID 为准;`status` 子命令会列出这五镜像 ID 便于比对。
 
 ---
 
@@ -42,7 +57,7 @@ bash /root/lx2v-node.sh prepare-transfer
 
 ### 1.1 接入前必做(两件事,顺序无所谓)
 
-1. **☠️ 安全组(最大坑,先做)**:华为云控制台把新节点加入 **0002/0003/0004/0005 同款安全组**。不做的症状极具迷惑性:脚本全绿、worker 注册成功、本机 healthz OK,但 **UI 永远不转 Ready**——server 到 worker 的 TCP 10150 被安全组拦(ping 是通的,更迷惑)。
+1. **☠️ 安全组(最大坑,先做)**:华为云控制台把新节点安全组改成既有 GPU 节点同款 —— **`newapi` 组,不是新机默认的 `hcso` 组**。不做的症状极具迷惑性:脚本全绿、worker 注册成功、本机 healthz OK,但 **UI 永远不转 Ready**——server 到 worker 的 TCP 10150 被安全组拦(ping 是通的,更迷惑)。改完 238 下一轮探测即转 Ready,无需重装。
 2. **GPU 驱动确认**:`nvidia-smi` 能列出 4 张 A100(华为云 A100 机镜像通常自带;重装过系统的要先补驱动,脚本第 1 步会拦住)。
 
 ### 1.2 分发脚本到新节点
@@ -73,7 +88,7 @@ token 是**集群级注册令牌,所有 worker 复用同一个**;忘了就在任
 - `--clean-residue`:残留扫描发现孤儿引擎容器时一并硬杀;
 - `--force`:检测到**同 token** 的现有 worker 时才需要(见 1.5)。
 
-### 1.4 九个步骤与耗时参照(1-8 为 0004/0005 实测;step 8 为 2026-07-09 新增)
+### 1.4 十一个步骤与耗时参照(1-8 为早期实测;9-10 为五镜像后新增)
 
 | step | 内容 | 参考耗时 | 说明 |
 |---|---|---|---|
@@ -83,9 +98,11 @@ token 是**集群级注册令牌,所有 worker 复用同一个**;忘了就在任
 | 4 | 挂 NFS + `/data`、`/nfs-data` 软链 | 秒级 | fstab 两行 + mount |
 | 5 | nvidia-container-toolkit | **5-8min** | 源配置来自 NFS `nvidia-repo/`,deb 包从 nvidia.github.io 在线下载(慢是网络,不是卡死) |
 | 6 | gpustack 镜像(NFS tar load) | ~1.5min | 4.4G |
-| 7 | lightx2v 引擎镜像(NFS tar load) | ~4min | 9.8G(docker 29 containerd 存储的压缩导出,比虚拟大小小是正常的) |
-| 8 | indextts2 引擎镜像(NFS tar load) | ~4min(预估) | ~10G;全节点预载,TTS 整卡单实例可落任意空闲卡 |
-| 9 | 起 worker + 注册/healthz 验证 | ~2min | 旧容器(如有)到这一步才移除,前面失败节点仍有原 worker |
+| 7 | lightx2v 引擎镜像 | ~4min | 9.8G |
+| 8 | indextts2 引擎镜像 | ~4min | ~10G;TTS 整卡单实例可落任意空闲卡 |
+| 9 | acestep 引擎镜像 | ~4min | ~8G;文生音乐整卡单实例,全节点预载 |
+| 10 | vllm-omni 引擎镜像(**soft**) | ~4min | ~10G;有 tar 则装、缺则告警不阻塞 install(全模型语音/音频引擎) |
+| 11 | 起 worker + 注册/healthz 验证 | ~2min | 旧容器(如有)到这一步才移除,前面失败节点仍有原 worker |
 
 **成功标志**:`Worker dev-gpustack-a100-000N registered with worker_id N` + `本机 healthz OK`,UI Resources → Workers 转 **Ready**。
 
@@ -122,15 +139,16 @@ bash /root/lx2v-node.sh upgrade-gpustack --offline  # 或从 NFS tar load(需先
 
 ### 2.2 升级引擎镜像(upgrade-engine)
 
-**何时用**:LightX2V 仓改了 profiles/configs/launcher、或 index-tts 仓 CI 出了新引擎包之后。
+**何时用**:某个引擎仓出了新包之后(LightX2V profiles/launcher、index-tts、acestep、vllm-omni)。
 
 ```bash
-bash /root/lx2v-node.sh upgrade-engine                     # lightx2v(默认),打印 旧ID -> 新ID
-bash /root/lx2v-node.sh upgrade-engine --engine indextts   # IndexTTS-2 语音引擎
+bash /root/lx2v-node.sh upgrade-engine                       # lightx2v(默认),打印 旧ID -> 新ID
+bash /root/lx2v-node.sh upgrade-engine --engine indextts     # IndexTTS-2 语音引擎
+bash /root/lx2v-node.sh upgrade-engine --engine acestep      # ACE-Step 文生音乐引擎
+bash /root/lx2v-node.sh upgrade-engine --engine vllm-omni    # vLLM-Omni 全模型语音/音频引擎
 ```
 
-IndexTTS-2 引擎镜像 tag(`indextts2:arm64-a100-latest`)必须与 gpustack 内置后端注册表
-(`schemas/inference_backend.py` 的 image_name)完全一致——worker 按名匹配本地镜像。
+各引擎镜像 tag 必须与 gpustack 内置后端注册表(`schemas/inference_backend.py` 的 image_name)完全一致——worker 按名匹配本地镜像。全 worker 批量:`bash /root/lx2v-fleet.sh -j 3 upgrade-engine --engine <名> --offline`(大 tar 降并发)。
 
 **⚠️ 关键**:换镜像**不影响正在运行的实例**(它们锁旧镜像 ID)。生效方式:UI → Instance List → **逐个删除实例**让其自动重建(先删一个、等新的 Running 再删下一个,服务不断)。
 
@@ -141,7 +159,33 @@ IndexTTS-2 引擎镜像 tag(`indextts2:arm64-a100-latest`)必须与 gpustack 内
 bash /root/lx2v-node.sh prepare-transfer
 ```
 
-做四件事:拉**三镜像**(gpustack / lightx2v / indextts2)arm64 变体 → save **三个 tar** 到 NFS(带写入进度,`.tmp`+`mv` 防半截)→ **x86 机器上自动把本地 gpustack tag 拉回 amd64**(否则 238 之后重建 server 容器会 exec format error——坑 §5.5)→ 把脚本自身同步到 `_transfer/`。
+做四件事:拉**五镜像**(gpustack / lightx2v / indextts2 / acestep / vllm-omni)arm64 变体 → 按 digest 变化 save 到 NFS 五个 tar(未变的跳过;带写入进度,`.tmp`+`mv` 防半截)→ **x86 机器上自动把本地 gpustack tag 拉回 amd64**(否则 238 之后重建 server 容器会 exec format error——坑 §5.5)→ 把脚本自身同步到 `_transfer/`。vllm-omni 是 soft:拉不到只告警、不阻塞其余 tar。
+
+### 2.4 一次完整现网升级(以 2026-07-20 gpustack + vllm-omni 为例)
+
+只动变了的镜像,顺序 **server 先 → worker → 重建实例**:
+
+```bash
+# ① 238:刷 NFS tar(只有变了的 gpustack/vllm-omni 会重存,其余 digest 跳过)
+bash /root/lx2v-node.sh prepare-transfer
+
+# ② 238 server 手动升级(脚本不管 x86 server;详见下方"server 不用脚本")
+docker pull crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:lx2v-dev
+docker stop gpustack-server && docker rm gpustack-server
+docker run -d --name gpustack-server --restart unless-stopped -p 80:80 \
+  --volume gpustack-data:/var/lib/gpustack --volume /nfs-output:/nfs-output \
+  crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:lx2v-dev \
+  --system-default-container-registry quay.io
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost/   # 200
+
+# ③ 全 worker 升 gpustack(fleet)
+bash /root/lx2v-fleet.sh upgrade-gpustack --offline
+
+# ④ 全 worker 换 vllm-omni 引擎(fleet;lightx2v/indextts/acestep 没变不用动)
+bash /root/lx2v-fleet.sh -j 3 upgrade-engine --engine vllm-omni --offline
+```
+
+**⑤ UI 重建实例**:vLLMOmni 系(audiox/soulx/indextts-2/qwen3-tts/moss-*)逐个删实例重建到新引擎镜像;ACE-Step(ACEStep 后端,镜像没变)不用动。**server 必须先于 worker**(版本校验软 + DB/API 方向 server ≥ worker)。
 
 ---
 
@@ -150,7 +194,7 @@ bash /root/lx2v-node.sh prepare-transfer
 ```bash
 bash /root/lx2v-node.sh status
 ```
-一屏看:worker 容器状态/healthz、三镜像 ID(gpustack/lightx2v/indextts2,与 §0 基线比对)、NFS 挂载、每卡显存、引擎实例容器(按 runtime label 精确识别,含 -init/-unhealthy-restart)。
+一屏看:worker 容器状态/healthz、五镜像 ID(gpustack/lightx2v/indextts2/acestep/vllm-omni,与 §0 清单比对)、NFS 挂载、每卡显存、引擎实例容器(按 runtime label 精确识别,含 -init/-unhealthy-restart)。
 
 ```bash
 bash /root/lx2v-node.sh clean                     # 删 worker + 硬杀全部引擎实例容器(kill+sleep+rm -f)
@@ -166,7 +210,7 @@ bash /root/lx2v-node.sh clean --kill-gpu-procs    # 追加 kill -9 GPU 上全部
 
 ### 4.1 模型部署参数速查
 
-统一部分:Source=Local Path,Version=Auto,Scheduling=Manual 勾卡;Backend 视模型:图片/视频=**LightX2V**,语音=**IndexTTS**。
+统一部分:Source=Local Path,Version=Auto,Scheduling=Manual 勾卡;Backend 视模型:图片/视频=**LightX2V**,语音(旧路径)=**IndexTTS**。**语音/音频/音乐的 vLLM-Omni 系 + ACE-Step 见 §4.1a**(IndexTTS-2 已可改走 vLLMOmni 取代独立 IndexTTS)。
 
 | 模型 | Model Path(`/nfs-models/wuhanjisuan894/` 下) | Backend | GPUs/Replica | Category | Backend Parameters | 显存/加载参考 |
 |---|---|---|---|---|---|---|
@@ -183,6 +227,32 @@ bash /root/lx2v-node.sh clean --kill-gpu-procs    # 追加 kill -9 GPU 上全部
 - Backend Parameters 每框写 `--key value`(空格分隔即可,后端会正确拆分);
 - qwen 系有**主机内存红线**:每实例 ~60G Shmem(调度器只看显存,看不见这个),**单节点 ≤2 副本**(3 绝对上限,第 4 个 OOM 整机);多副本**错峰启动**(先 1 副本,Running 后再加);
 - 兼容性提示 "N×40 GiB VRAM" = 整卡预订,是正确表现。
+
+### 4.1a vLLM-Omni 语音/音频 + ACE-Step 音乐模型部署(2026-07-20 实测)
+
+模型权重根:**`/nfs-models/wuhanjisuan894/vllm-omni-speech/`**(IndexTTS-2 例外,在 `.../models/IndexTTS-2`)。Source=Local Path,Scheduling=Manual,Category 见下(vLLMOmni 系=Text-to-Speech,ACE-Step=Music)。
+
+| 模型(能力) | Model Path(相对 `/nfs-models/wuhanjisuan894/`) | Backend | 卡/副本 | Backend Parameters | Env |
+|---|---|---|---|---|---|
+| IndexTTS-2(情感合成) | `models/IndexTTS-2` | vLLMOmni | 1(2-stage 同卡) | `--deploy-config <见下坑A> --allowed-local-media-path /nfs-output` | `HF_HOME=.../models/IndexTTS-2/hf_cache` |
+| Qwen3-TTS(语音合成/克隆) | `vllm-omni-speech/Qwen3-TTS-1.7B-CustomVoice` | vLLMOmni | 1 | `--allowed-local-media-path /nfs-output` | `HF_HOME=.../vllm-omni-speech/hf_cache` |
+| MOSS-TTSD(双人对话) | `vllm-omni-speech/MOSS-TTSD-v1.0` | vLLMOmni | **2** | `--deploy-config .../vllm-omni-speech/moss_ttsd_a100_40g.yaml --allowed-local-media-path /nfs-output` | `HF_HOME=.../vllm-omni-speech/hf_cache` |
+| MOSS-VoiceGenerator(声音设计) | `vllm-omni-speech/MOSS-VoiceGenerator` | vLLMOmni | **2** | `--deploy-config .../vllm-omni-speech/moss_voicegen_a100_40g.yaml` | `HF_HOME=.../vllm-omni-speech/hf_cache` |
+| AudioX(文生音效/视频配音效/配乐) | `vllm-omni-speech/AudioX` | vLLMOmni | 1 | `--model-class-name AudioXPipeline --allowed-local-media-path /nfs-output`(**不带** trust-remote-code) | `HF_HOME=.../vllm-omni-speech/hf_cache` |
+| SoulX-Singer(歌声合成) | `vllm-omni-speech/SoulX-Singer` | vLLMOmni | 1 | `--enforce-eager --deploy-config /deploy-configs/soulxsinger_svs.yaml --allowed-local-media-path /nfs-output` | `HF_HOME=.../vllm-omni-speech/hf_cache` |
+| ACE-Step(文生音乐/改编/重绘) | `vllm-omni-speech/ACE-Step-1.5` | **ACEStep** | 1 | **无**(env 全自动注入) | **无** |
+
+后端自动注入、不用手填:`--omni`、host/port、`--trust-remote-code`(有 `--model-class-name` 时自动跳过)、`DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN`、`HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE=1`。ACEStep 后端更自洽(`ACESTEP_CHECKPOINTS_DIR`=Model Path 等全自动)。
+
+**vLLMOmni 部署五个坑(按杀伤力)**:
+
+- **坑 A · IndexTTS-2 deploy-config 路径要改**:模型自带 `indextts2-a100.yaml` 用的是 POC 挂载前缀 `/models/IndexTTS-2/...`,GPUStack 里模型在 `/nfs-models/...`,直接用会去 HF 下 tokenizer → 离线 `LocalEntryNotFoundError`。修:`sed 's#/models/IndexTTS-2/#/nfs-models/wuhanjisuan894/models/IndexTTS-2/#g' indextts2-a100.yaml > indextts2-a100-gpustack.yaml`,`--deploy-config` 指修正版。**凡自带 deploy-config 的模型都先 grep 里面的绝对路径**。
+- **坑 B · HF_HOME 各指各的 cache**:MOSS 系用共享 `vllm-omni-speech/hf_cache`(含 MOSS-Audio-Tokenizer codec);IndexTTS-2 用它自己的 `models/IndexTTS-2/hf_cache`(含 w2v-bert/bigvgan)。指错 → codec/tokenizer 离线加载失败崩。
+- **坑 C · 读输入的必须 `--allowed-local-media-path /nfs-output`**:AudioX v2a/v2m(视频)、SoulX(参考音)、MOSS-TTSD(参考音)、Qwen3/IndexTTS 克隆——不加则门面注入的 `file://` 被 vLLM MediaConnector 拒(HTTP 400)。`GPUSTACK_MEDIA_ROOT` 未设时后端 fail-closed 不注入,故直接在 Backend Parameters 手填(用户显式值优先)。
+- **坑 D · custom backend 的 Manual 只能单机**:vLLMOmni 是 custom backend,Manual GPU 选卡**只支持单个 worker**;多副本要铺到多台 → 报 `Manual GPU selection across multiple workers is not supported`。单副本单机用 Manual,**多副本跨机用 Auto**(整卡独占,调度器自动填空卡)。
+- **坑 E · ACE-Step 首启从 ModelScope 下载**:`HF_HUB_OFFLINE` 不 gate ModelScope,ACEStep 起来会拉一个 ~8G 组件。能下完就 Running,但依赖 MS 网络 + 可能缓存到临时目录每次重下。后续优化:预填 NFS cache 或设 `MODELSCOPE_OFFLINE`。
+
+**部署前置(否则上面玩法静默 400/崩)**:worker env 已带 `GPUSTACK_EXTRA_MOUNTS=/nfs-models,/nfs-output,/nfs-data`;离线 HF cache(t5/clip/whisper/MOSS-codec)在各自 hf_cache;deploy-config yaml 在 NFS 或镜像 `/deploy-configs/`(SoulX/MOSS 在镜像里,IndexTTS 在模型目录)。
 
 ### 4.2 部署验证三板斧
 
@@ -234,6 +304,10 @@ curl -s -X POST http://10.0.0.238/v1/videos -H "Authorization: Bearer $KEY" \
 | 12 | `docker save -o` | 失败留下隐藏半截文件,load 报 unexpected EOF | 用 `>` 重定向;脚本已用 `.tmp`+`mv` |
 | 13 | toolkit 不在 Ubuntu 源 | `Unable to locate package nvidia-container-toolkit` | 源两件套在 NFS `_transfer/nvidia-repo/`,脚本自动使用 |
 | 14 | 引擎升级后实例没变化 | 换了镜像但行为还是旧的 | 实例锁旧镜像 ID,UI 逐个删实例重建才生效 |
+| 15 | **新节点默认 `hcso` 安全组** | 同坑1(脚本全绿但 UI 不 Ready,238 curl 10150 超时) | 华为云控制台把新节点安全组从 `hcso` 改成 **`newapi`**(既有 GPU 节点同组);改完 238 下一轮探测即转 Ready,无需重装 |
+| 16 | **new-api 拿不到全部模型** | 渠道"智能获取"少模型;server 日志 `Invalid category: music` @ `/v2/model-routes` | ACE-Step 的 `music` category 撞旧校验白名单。**升级到 2026-07-20 gpustack 包**(`model_routes.py` 改对 `CategoryEnum` 校验);临时可在渠道**手填 `ace-step`**(推理走门面不经此接口) |
+| 17 | **AudioX/SoulX 报 `Field required: model`(400)** | new-api 文生音效等 audiogen 玩法提交即 400 | 门面 strip 掉 `model`,旧引擎 `AudioGenTaskRequest.model` 必填。**升级到 2026-07-20 vllm-omni 包**(引擎兜底填 served model)+ 重建 audiox/soulx 实例 |
+| 18 | **vLLMOmni 多副本 Manual 跨机报错** | `Manual GPU selection across multiple workers is not supported for custom backends` | custom backend 的 Manual 只支持单机;多副本跨机改 **Auto**(见 §4.1a 坑 D) |
 
 ## 6. 脚本自身的升级
 

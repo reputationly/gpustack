@@ -27,6 +27,7 @@ def get_meta_from_running_instance(
         BackendEnum.INDEXTTS,
         BackendEnum.ACESTEP,
         BackendEnum.VLLM_OMNI,
+        BackendEnum.BERNINI,
     ):
         # LightX2V exposes an async task API behind the launcher, IndexTTS an
         # async task API + /v1/audio/speech, ACE-Step an async task API

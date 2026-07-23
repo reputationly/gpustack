@@ -9,6 +9,7 @@
 #   bash lx2v-fleet.sh upgrade-gpustack                          # 全体升 worker 镜像
 #   bash lx2v-fleet.sh -j 3 upgrade-engine --engine lightx2v --offline   # 大 tar 降并发防 NFS 抢
 #   bash lx2v-fleet.sh upgrade-engine --engine indextts --offline
+#   bash lx2v-fleet.sh -j 3 upgrade-engine --engine bernini --offline    # 批量分发 bernini 引擎镜像
 #   bash lx2v-fleet.sh status                                    # 全体巡检
 #   bash lx2v-fleet.sh -f /path/other-nodes.txt <子命令...>       # 换清单
 #   bash lx2v-fleet.sh --seq <子命令...>                          # 串行(= -j 1)

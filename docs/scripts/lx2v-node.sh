@@ -5,11 +5,11 @@
 #   ./lx2v-node.sh setup-base                        # 全新节点只配基础环境(docker/NFS/toolkit),不入集群
 #   ./lx2v-node.sh install --token <GPUSTACK_TOKEN> [--worker-ip <IP>] [--offline] [--clean-residue] [--force]
 #   ./lx2v-node.sh upgrade-gpustack [--offline]     # 换 gpustack:lx2v-dev 并原参数重启 worker
-#   ./lx2v-node.sh upgrade-engine   [--engine lightx2v|indextts|acestep|vllm-omni] [--offline]
+#   ./lx2v-node.sh upgrade-engine   [--engine lightx2v|indextts|acestep|vllm-omni|bernini] [--offline]
 #                                                    # 换引擎镜像(默认 lightx2v;实例需重建才生效)
 #   ./lx2v-node.sh clean [--purge-data] [--kill-gpu-procs]   # 清理卸载残留(见下)
 #   ./lx2v-node.sh status                            # 节点健康速览
-#   ./lx2v-node.sh prepare-transfer                  # (238/有 ACR 外网的机器)拉五镜像(gpustack/lightx2v/indextts2/acestep/vllm-omni)存 NFS tar
+#   ./lx2v-node.sh prepare-transfer                  # (238/有 ACR 外网的机器)拉六镜像(gpustack/lightx2v/indextts2/acestep/vllm-omni/bernini)存 NFS tar
 #
 # 残留环境(装过 GPUStack 又卸载/被清理过的节点):
 #   install 自带残留检测——异 token 的旧 worker 自动移除重建,同 token(同集群)需加 --force;
@@ -45,6 +45,10 @@ ACESTEP_IMAGE="${REGISTRY}/acestep:arm64-a100-latest"
 # gpustack 内置后端注册表(schemas/inference_backend.py 的 image_name)一致——
 # 后端注册在 P3;注册前本镜像仅供分发/手测,GPUStack 尚不会调度它。
 VLLM_OMNI_IMAGE="${REGISTRY}/vllm-omni:arm64-a100-latest"
+# Bernini 原生视频生成/编辑引擎(Bernini-R 渲染器;独立 CI 出包,同 indextts 范式)。
+# 已注册为 gpustack 内置后端——tag 须与 schemas/inference_backend.py 的 image_name
+# 完全一致,worker 本地 load 后按名匹配。
+BERNINI_IMAGE="${REGISTRY}/bernini:arm64-a100-latest"
 SERVER_URL="${SERVER_URL:-http://10.0.0.238}"
 NFS_SERVER="100.125.40.2"
 NFS_MODELS_EXPORT="/share-LLM"
@@ -55,6 +59,7 @@ ENGINE_TAR="${TRANSFER_DIR}/lightx2v-arm64-profiles.tar"
 INDEXTTS_TAR="${TRANSFER_DIR}/indextts2-arm64-a100.tar"
 ACESTEP_TAR="${TRANSFER_DIR}/acestep-arm64-a100.tar"
 VLLM_OMNI_TAR="${TRANSFER_DIR}/vllm-omni-arm64-a100.tar"
+BERNINI_TAR="${TRANSFER_DIR}/bernini-arm64-a100.tar"
 NVIDIA_REPO_DIR="${TRANSFER_DIR}/nvidia-repo"
 WORKER_NAME="gpustack-worker"
 WORKER_PORT=10150
@@ -525,7 +530,7 @@ cmd_install() {
   [ -n "$TOKEN" ] || die "install 需要 --token" \
     "在既有 worker 节点上取: docker inspect ${WORKER_NAME} --format '{{range .Config.Env}}{{println .}}{{end}}' | grep GPUSTACK_TOKEN" \
     "同一集群的注册令牌可复用于多台 worker"
-  STEP_TOTAL=11
+  STEP_TOTAL=12
 
   step "预检:GPU 驱动 / 架构"
   nvidia-smi -L || die "nvidia-smi 不可用" "先安装 GPU 驱动(A100 节点镜像通常自带,重装过系统的机器需补装)"
@@ -555,6 +560,11 @@ cmd_install() {
   step "镜像:acestep 引擎(NFS tar 优先,无则在线拉)"
   # 同 indextts:文生音乐整卡单实例,全节点预载即可被调度落任意空闲卡
   fetch_image_prefer_tar "$ACESTEP_IMAGE" "$ACESTEP_TAR"
+
+  step "镜像:bernini 引擎(NFS tar 优先,无则在线拉)"
+  # 同 indextts/acestep:Bernini 已注册为内置后端(视频生成/编辑,整卡多卡),
+  # 全节点预载即可被调度落任意空闲卡
+  fetch_image_prefer_tar "$BERNINI_IMAGE" "$BERNINI_TAR"
 
   step "镜像:vllm-omni 引擎(soft 预载:有则装上供手测,缺则告警不阻塞)"
   # vllm-omni 尚未在 GPUStack 注册后端(P3 前不会被调度),用 soft 预载:有镜像的
@@ -658,7 +668,8 @@ cmd_upgrade_engine() {
     indextts) img="$INDEXTTS_IMAGE"; tar="$INDEXTTS_TAR" ;;
     acestep)   img="$ACESTEP_IMAGE";   tar="$ACESTEP_TAR" ;;
     vllm-omni) img="$VLLM_OMNI_IMAGE"; tar="$VLLM_OMNI_TAR" ;;
-    *) die "未知引擎: $ENGINE_SEL" "--engine 只支持 lightx2v | indextts | acestep | vllm-omni" ;;
+    bernini)   img="$BERNINI_IMAGE";   tar="$BERNINI_TAR" ;;
+    *) die "未知引擎: $ENGINE_SEL" "--engine 只支持 lightx2v | indextts | acestep | vllm-omni | bernini" ;;
   esac
   STEP_TOTAL=2
   step "当前引擎镜像(${ENGINE_SEL})"
@@ -688,7 +699,7 @@ cmd_status() {
   echo "--- 本机 healthz:"
   curl -sf --max-time 3 "http://127.0.0.1:${WORKER_PORT}/healthz" && echo "  OK" || echo "  不通"
   echo "--- 镜像:"
-  docker images --format '  {{.ID}}  {{.Repository}}:{{.Tag}}' | grep -E "gpustack|lightx2v|indextts|acestep|vllm-omni" || true
+  docker images --format '  {{.ID}}  {{.Repository}}:{{.Tag}}' | grep -E "gpustack|lightx2v|indextts|acestep|vllm-omni|bernini" || true
   echo "--- NFS:"
   mountpoint -q /nfs-models && echo "  /nfs-models OK" || echo "  /nfs-models 未挂载"
   mountpoint -q /nfs-output && echo "  /nfs-output OK" || echo "  /nfs-output 未挂载"
@@ -709,18 +720,19 @@ cmd_status() {
 
 cmd_prepare_transfer() {
   parse_flags "$@"
-  STEP_TOTAL=6
+  STEP_TOTAL=7
   # tar 必须落在共享 NFS 上;未挂载时 mkdir -p 会静默建本地目录,
   # 大 tar(引擎/indextts 各 ~10G)写进根盘且其他节点拿不到
   mountpoint -q /nfs-models || die "/nfs-models 未挂载,拒绝把 tar 写到本地盘" \
     "先挂 NFS(fstab 两行 + mount -a,见 install 的 ② 或全记录 §4.2)再重试"
   mkdir -p "$TRANSFER_DIR"
 
-  step "拉取 arm64 五镜像(x86 机器亦可)"
+  step "拉取 arm64 六镜像(x86 机器亦可)"
   docker pull --platform linux/arm64 "$GPUSTACK_IMAGE"
   docker pull --platform linux/arm64 "$ENGINE_IMAGE"
   docker pull --platform linux/arm64 "$INDEXTTS_IMAGE"
   docker pull --platform linux/arm64 "$ACESTEP_IMAGE"
+  docker pull --platform linux/arm64 "$BERNINI_IMAGE"
   # vllm-omni 未注册后端(不被调度),soft:拉不到只告警,不阻塞其余必需 tar 的产出
   docker pull --platform linux/arm64 "$VLLM_OMNI_IMAGE" \
     || echo "    ⚠️ (soft) vllm-omni pull 失败,跳过其 tar(不影响其余镜像)"
@@ -746,9 +758,12 @@ cmd_prepare_transfer() {
   step "save acestep tar(~8G,digest 未变则跳过)"
   save_tar_if_changed "$ACESTEP_IMAGE" "$ACESTEP_TAR"
 
+  step "save bernini tar(~10G,digest 未变则跳过)"
+  save_tar_if_changed "$BERNINI_IMAGE" "$BERNINI_TAR"
+
   step "save vllm-omni tar(~10G,digest 未变则跳过;soft:镜像不在本地则跳过)"
   # 与上面 soft pull 配套:vllm-omni 拉不到时本地无此镜像,跳过 save 而非 die,
-  # 保证必需的 gpustack/lightx2v/indextts/acestep tar 已经产出。
+  # 保证必需的 gpustack/lightx2v/indextts/acestep/bernini tar 已经产出。
   if docker image inspect "$VLLM_OMNI_IMAGE" >/dev/null 2>&1; then
     save_tar_if_changed "$VLLM_OMNI_IMAGE" "$VLLM_OMNI_TAR"
   else
