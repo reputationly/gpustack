@@ -3,7 +3,7 @@ import os
 from typing import Optional, List, Dict, Tuple
 
 from gpustack.schemas.models import ModelInstanceDeploymentMetadata
-from gpustack.utils.command import extend_args_no_exist, format_backend_parameters
+from gpustack.utils.command import format_backend_parameters
 from gpustack.utils.envs import sanitize_env
 from gpustack.worker.backends.base import InferenceServer
 
@@ -30,13 +30,13 @@ logger = logging.getLogger(__name__)
 # privileged container — identical rationale to worker/backends/lightx2v.py.
 _EXTRA_MOUNTS_ENV_KEY = "GPUSTACK_EXTRA_MOUNTS"
 
-# The engine image bakes in the HTTP server (server.py) at WORKDIR /opt/bernini
-# with PYTHONPATH=/opt/bernini, so ``uvicorn server:app`` resolves the module.
-# GPUStack injects only the bound host/port; the checkpoints dir is passed via
-# BERNINI_CONFIG (the model_path, bind-mounted host==container). GPUs-per-task is
-# auto-detected by server.py from CUDA_VISIBLE_DEVICES (runtime-injected), so no
-# --nproc / world-size flag is needed.
-_SERVER_APP = "server:app"
+# The engine image bakes in the resident server (server.py) at WORKDIR /opt/bernini
+# with PYTHONPATH=/opt/bernini, launched as ``python3 server.py``. server.py detects
+# it is not under torchrun and re-execs itself via ``torchrun --nproc-per-node=N``
+# (N = allocated GPUs from CUDA_VISIBLE_DEVICES), loading the model ONCE and serving
+# all tasks from the resident process. Checkpoints dir + bound port go via env
+# (BERNINI_CONFIG / BERNINI_PORT); no torchrun / host / port CLI flag is passed.
+_SERVER_SCRIPT = "server.py"
 
 
 class BerniniServer(InferenceServer):
@@ -60,6 +60,19 @@ class BerniniServer(InferenceServer):
         env.setdefault("HF_HUB_OFFLINE", "1")
         env.setdefault("TRANSFORMERS_OFFLINE", "1")
         env.setdefault("HF_HUB_DISABLE_XET", "1")
+        # server.py binds 0.0.0.0:BERNINI_PORT. It runs under torchrun (self-relaunch)
+        # so a uvicorn --port CLI flag isn't usable; pass the assigned port via env.
+        # The scheduler-assigned port is what routing/health checks use, so it must
+        # override any BERNINI_PORT leaked in from the worker or model env.
+        port = self._get_serving_port()
+        if env.get("BERNINI_PORT") not in (None, str(port)):
+            logger.warning(
+                "Ignoring BERNINI_PORT=%s from env; the scheduler-assigned port %d "
+                "is authoritative for routing and health checks.",
+                env["BERNINI_PORT"],
+                port,
+            )
+        env["BERNINI_PORT"] = str(port)
 
         command = None
         if self.inference_backend:
@@ -70,7 +83,7 @@ class BerniniServer(InferenceServer):
         command_script = self._get_serving_command_script(env)
 
         command_args, injected = self._build_command_args(
-            port=self._get_serving_port(),
+            port=port,
             entrypoint=command,
         )
 
@@ -200,14 +213,14 @@ class BerniniServer(InferenceServer):
     def _build_command_args(
         self, port: int, entrypoint: Optional[List[str]] = None
     ) -> Tuple[List[str], List[str]]:
-        # Launch the image-embedded HTTP server. GPUStack injects only the bound
-        # host/port; the checkpoints dir is passed via BERNINI_CONFIG (env), not a
-        # CLI flag, since server.py is a plain uvicorn app.
+        # Launch the resident server. server.py self-relaunches under torchrun
+        # (nproc = allocated GPUs) and binds 0.0.0.0:BERNINI_PORT — so GPUStack
+        # passes NO torchrun / host / port CLI flags; the checkpoints dir and port
+        # go via env (BERNINI_CONFIG / BERNINI_PORT). This mirrors LightX2V, whose
+        # launcher likewise owns the torchrun fan-out.
         arguments = [
             "python3",
-            "-m",
-            "uvicorn",
-            _SERVER_APP,
+            _SERVER_SCRIPT,
         ]
         # Allow version-specific command override if configured (registry-level,
         # admin-controlled).
@@ -217,23 +230,18 @@ class BerniniServer(InferenceServer):
             port=port,
         )
 
-        # Unlike LightX2V (whose launcher owns and parses engine parameters), the
-        # command target here is uvicorn itself: an engine-style flag would abort
-        # startup, and a user --host/--port would displace the scheduler-assigned
-        # binding. The engine has no legitimate CLI surface (all its knobs are env
-        # vars — BERNINI_*), so ignore user backend parameters entirely.
+        # The command target is server.py, which self-relaunches under torchrun and
+        # takes no CLI surface (all knobs are BERNINI_* env vars). A user-supplied
+        # engine flag would reach torchrun/server.py and abort startup, so ignore
+        # user backend parameters entirely (same rationale as before).
         user_backend_parameters = self._flatten_backend_param()
         if user_backend_parameters:
             logger.warning(
                 "Bernini ignores backend_parameters %s: the serving command is "
-                "uvicorn (no engine CLI); configure the engine via model env "
+                "server.py (no engine CLI); configure the engine via model env "
                 "(BERNINI_* variables) instead.",
                 user_backend_parameters,
             )
-        # Append immutable arguments so uvicorn binds the assigned host/port.
-        extend_args_no_exist(
-            arguments, ("--host", self._worker.ip), ("--port", str(port))
-        )
 
         injected = self._get_injected_backend_parameters(arguments, [], entrypoint)
 

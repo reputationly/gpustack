@@ -25,7 +25,7 @@ from gpustack.api.exceptions import (
 from gpustack.config.config import get_global_config
 from gpustack.gateway.utils import model_instance_prefix, router_header_key
 from gpustack.http_proxy.strategies import select_least_pending_instance
-from gpustack.schemas.models import ModelInstance, ModelInstanceStateEnum
+from gpustack.schemas.models import BackendEnum, ModelInstance, ModelInstanceStateEnum
 from gpustack.schemas.video_generation_task import (
     VIDEO_TASK_TERMINAL_STATES,
     VideoGenerationTask,
@@ -107,9 +107,14 @@ _AUDIOGEN_TASK_TYPES = {"t2a", "v2a", "v2m", "tv2a", "tv2m", "svs"}
 # rv2v (source video + reference images), r2v (reference images -> video). Unlike
 # LightX2V (which infers mode from input fields), Bernini's server picks its
 # guidance_mode from task_type, so task_type is backfilled into the engine body
-# below. Bernini's generation modes t2v/t2i/i2i collide with LightX2V/existing
-# sets and are NOT Bernini's strength (deferred; add with a namespace if needed).
+# below. v2v/rv2v/r2v are Bernini-exclusive. Bernini ALSO serves t2i/i2i/t2v,
+# whose names are shared with LightX2V/image engines; since routing is by model
+# (not task_type), these are disambiguated by the resolved model's backend at
+# backfill time (see _BERNINI_SHARED_TASK_TYPES).
 _BERNINI_TASK_TYPES = {"v2v", "rv2v", "r2v"}
+# Shared-name generation modes Bernini also serves; task_type is backfilled for
+# these ONLY when the resolved model's backend is Bernini.
+_BERNINI_SHARED_TASK_TYPES = {"t2i", "i2i", "t2v"}
 # Finite set of accepted actions. task_type is the first path component of the
 # §7.2 NFS layout, so it MUST be constrained — an unsanitized value like
 # "../../tmp/x" would let save_result_path / input writes escape the output root.
@@ -701,9 +706,13 @@ async def create_video_task(request: Request, user: CurrentUserDep):
         engine_body.setdefault("audiox_task", task_type)
     # task_type is stripped as a control key, but Bernini's server selects its
     # guidance_mode from task_type (v2v/rv2v/r2v -> different guidance paths), so
-    # backfill it into the engine body. Bernini-exclusive types, so no collision
-    # with other engines; a caller-supplied task_type in the body would win.
-    if task_type in _BERNINI_TASK_TYPES:
+    # backfill it into the engine body. v2v/rv2v/r2v are Bernini-exclusive (no
+    # collision); t2i/i2i/t2v are shared names, backfilled ONLY when the resolved
+    # model's backend is Bernini (routing is by model, so this is safe and won't
+    # inject task_type into LightX2V/image engines). Caller-supplied task_type wins.
+    if task_type in _BERNINI_TASK_TYPES or (
+        model.backend == BackendEnum.BERNINI and task_type in _BERNINI_SHARED_TASK_TYPES
+    ):
         engine_body.setdefault("task_type", task_type)
     await asyncio.to_thread(_ensure_parent_dir, out_abs)
 
