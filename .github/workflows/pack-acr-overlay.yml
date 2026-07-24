@@ -65,6 +65,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # The dual-arch buildx (amd64 + QEMU arm64) doubles layer storage and runs
+      # the hosted runner right up against its ~14-20 GB free disk; 2026-07-24
+      # the "Build and push overlay" step died mid-build with "No space left on
+      # device" (so hard the runner couldn't even upload its logs). Drop the
+      # preinstalled toolchains we never use (~25-30 GB back) before anything
+      # disk-hungry runs. NOTE: only the CodeQL subdir of hostedtoolcache is
+      # removed — setup-node installs into /opt/hostedtoolcache/node.
+      - name: Free runner disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af || true
+          df -h /
+
       - name: Compute immutable tag
         id: tags
         run: |
