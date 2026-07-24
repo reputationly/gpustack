@@ -1557,6 +1557,23 @@ class InferenceBackendController:
                         f"Updated backend_source for existing built-in backend {backend.backend_name}"
                     )
 
+            # Built-in definitions can gain UI parameter hints (common_parameters)
+            # in upgrades, but seeding above is create-only, so pre-existing rows
+            # would never receive them. Fill in ONLY when the row has none — an
+            # operator-customized list is never clobbered by startup.
+            if (
+                backend
+                and not backend.common_parameters
+                and built_in_backend.common_parameters
+            ):
+                await backend.update(
+                    session,
+                    {"common_parameters": built_in_backend.common_parameters},
+                )
+                logger.info(
+                    f"Backfilled common_parameters for built-in backend {backend.backend_name}"
+                )
+
     async def _init_community_backends(self, session: AsyncSession):  # noqa: C901
         """Load community backends from community-inference-backends.yaml into database."""
         try:

@@ -3811,10 +3811,13 @@ model_sets:
         - --deploy-config
         - /deploy-configs/moss_sfx_a100_40g.yaml
 # ==========================================================================
-# vLLM-Omni diffusion audio (Phase 2): AudioX (text/video -> audio/music) and
+# vLLM-Omni diffusion audio (Phase 2): AudioX (text -> sfx, video -> music) and
 # SoulX-Singer (singing voice synthesis). Served by the vLLM-Omni built-in
 # engine's diffusion path via the async POST /v1/tasks/audiogen/ endpoint
-# (facade task_types t2a/v2a/v2m/tv2a/tv2m for AudioX, svs for SoulX). Whole-GPU
+# (facade task_types t2a/v2m/tv2m for AudioX, svs for SoulX). RETIRED 2026-07:
+# v2a/tv2a (AudioX video->audio, .wav) — video dubbing moved to LTX-2.3; "v2a"
+# is now a VIDEO task type (video in -> dubbed mp4 out, see routes/videos.py)
+# and must not be submitted against AudioX deployments. Whole-GPU
 # single card. AudioX must NOT get --trust-remote-code (it is a diffusion
 # pipeline, not a transformers remote-code model) and needs --model-class-name
 # AudioXPipeline. Offline HF cache prereqs on NFS HF_HOME: AudioX needs t5-base +
@@ -3823,7 +3826,7 @@ model_sets:
 # vllm-omni-phase2-image-deps. (SoulX SVC is a later batch.)
 # ==========================================================================
 - name: AudioX
-  description: AudioX unified diffusion audio + music generation — text and/or video into sound-effects (t2a/v2a/tv2a) or music (v2m/tv2m), 44.1 kHz stereo up to ~10s. Served by the vLLM-Omni built-in engine (diffusion, async task API), whole-GPU single card. Not for clear speech/dialogue (use a TTS model).
+  description: AudioX unified diffusion audio + music generation — text into sound-effects (t2a) or video into music (v2m/tv2m), 44.1 kHz stereo up to ~10s. Video dubbing (v2a/tv2a) retired 2026-07 — moved to LTX-2.3 (video task, dubbed mp4 out). Served by the vLLM-Omni built-in engine (diffusion, async task API), whole-GPU single card. Not for clear speech/dialogue (use a TTS model).
   home: https://github.com/ZeyueT/AudioX
   icon: /static/catalog_icons/index-tts.png
   size: 11

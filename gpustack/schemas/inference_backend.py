@@ -413,6 +413,10 @@ def get_built_in_backend() -> List[InferenceBackend]:
             ),
             health_check_path="/ready",
             parameter_format=ParameterFormatEnum.SPACE,
+            # UI hints for the backend-parameters free list. The launcher reads
+            # --profile (profiles.yaml variant, e.g. ltx2-v2a/bf16-1card) and
+            # --model-cls; --task disambiguates same-GPU-count variants.
+            common_parameters=["--profile", "--model-cls", "--task"],
             description="LightX2V video/image generation engine (first-class built-in backend).",
         ),
         # IndexTTS-2 is a first-class built-in TTS engine, self-contained the

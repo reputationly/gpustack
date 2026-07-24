@@ -80,8 +80,14 @@ _MAX_DISPATCH_RETRIES = 5
 #   s2v           — InfiniteTalk digital human (image + driving audio)
 #   sr            — SeedVR2 video super-resolution (video in, sr_ratio out-scale)
 #   vace          — Wan2.2 VACE video editing (src_video/src_mask/src_ref_images)
+#   v2a           — LTX-2.3 video dubbing (video in -> SAME pixels + AI audio
+#                   track, .mp4 out). Reassigned 2026-07: v2a used to be an
+#                   AudioX audiogen type (.wav out); that product is retired and
+#                   the task CONTRACT is now "video in, dubbed video out". The
+#                   task_type is model-agnostic — any future dubbing model that
+#                   honors the contract deploys under it (routing is by model).
 _IMAGE_TASK_TYPES = {"t2i", "i2i"}
-_VIDEO_TASK_TYPES = {"t2v", "i2v", "flf2v", "s2v", "sr", "vace"}
+_VIDEO_TASK_TYPES = {"t2v", "i2v", "flf2v", "s2v", "sr", "vace", "v2a"}
 # Audio (TTS) task types served by the IndexTTS-2 built-in engine. "tts" is the
 # facade task_type; it maps to the engine's POST /v1/tasks/audio/ (engine kind
 # "audio"). Zero-shot voice clone + emotion control, async like video.
@@ -93,13 +99,18 @@ _AUDIO_TASK_TYPES = {"tts"}
 _MUSIC_TASK_TYPES = {"t2m", "cover", "repaint"}
 # Diffusion audio-generation task types served by the vLLM-Omni built-in engine's
 # diffusion models. They map to the engine's POST /v1/tasks/audiogen/ (engine kind
-# "audiogen"): AudioX (t2a sound-effects, v2a/v2m/tv2a/tv2m video->audio/music) and
-# SoulX-Singer (svs singing voice synthesis). Distinct from TTS ("audio" kind) and
-# ACE-Step music ("music" kind); NOTE "t2m" is NOT here — it belongs to ACE-Step
-# (text-to-music), so AudioX text->music is not exposed via the facade (use v2m for
-# video->music or ACE-Step for text->music). SVC is a later batch. Async like the
-# rest; status/cancel reuse the global /v1/tasks/{id} endpoints.
-_AUDIOGEN_TASK_TYPES = {"t2a", "v2a", "v2m", "tv2a", "tv2m", "svs"}
+# "audiogen"): AudioX (t2a sound-effects, v2m/tv2m video->music) and SoulX-Singer
+# (svs singing voice synthesis). Distinct from TTS ("audio" kind) and ACE-Step
+# music ("music" kind); NOTE "t2m" is NOT here — it belongs to ACE-Step
+# (text-to-music). SVC is a later batch. Async like the rest; status/cancel reuse
+# the global /v1/tasks/{id} endpoints.
+# RETIRED 2026-07: "v2a"/"tv2a" (AudioX video->audio, .wav out) — the video-
+# dubbing product moved to LTX-2.3, and "v2a" now lives in _VIDEO_TASK_TYPES
+# with a new contract (video in -> dubbed video out). "tv2a" is gone entirely
+# (the new v2a takes an optional prompt, no separate with-text type). Drain any
+# queued AudioX v2a tasks BEFORE deploying this change — the sweeper would
+# redispatch them down the video route.
+_AUDIOGEN_TASK_TYPES = {"t2a", "v2m", "tv2m", "svs"}
 # Video-EDITING task types served by the Bernini built-in engine (native
 # Bernini-R renderer). These are Bernini-EXCLUSIVE (no LightX2V collision) and
 # map to engine kind "video" via the _engine_kind default (-> POST
