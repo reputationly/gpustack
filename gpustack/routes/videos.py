@@ -115,14 +115,17 @@ _AUDIOGEN_TASK_TYPES = {"t2a", "v2m", "tv2m", "svs"}
 # Bernini-R renderer). These are Bernini-EXCLUSIVE (no LightX2V collision) and
 # map to engine kind "video" via the _engine_kind default (-> POST
 # /v1/tasks/video/, .mp4, video latency): v2v (edit a source video by prompt),
-# rv2v (source video + reference images), r2v (reference images -> video). Unlike
-# LightX2V (which infers mode from input fields), Bernini's server picks its
-# guidance_mode from task_type, so task_type is backfilled into the engine body
-# below. v2v/rv2v/r2v are Bernini-exclusive. Bernini ALSO serves t2i/i2i/t2v,
-# whose names are shared with LightX2V/image engines; since routing is by model
-# (not task_type), these are disambiguated by the resolved model's backend at
-# backfill time (see _BERNINI_SHARED_TASK_TYPES).
-_BERNINI_TASK_TYPES = {"v2v", "rv2v", "r2v"}
+# rv2v (source video + reference images), r2v (reference images -> video),
+# mv2v (TWO source videos, multi-source edit), ads2v (TWO source videos, ad/screen
+# insertion — same inputs as mv2v but a dedicated system prompt + rv2v-chain
+# guidance in the engine). Unlike LightX2V (which infers mode from input fields),
+# Bernini's server picks its guidance_mode + system prompt from task_type, so
+# task_type is backfilled into the engine body below. These five are
+# Bernini-exclusive. Bernini ALSO serves t2i/i2i/t2v, whose names are shared with
+# LightX2V/image engines; since routing is by model (not task_type), these are
+# disambiguated by the resolved model's backend at backfill time
+# (see _BERNINI_SHARED_TASK_TYPES).
+_BERNINI_TASK_TYPES = {"v2v", "rv2v", "r2v", "mv2v", "ads2v"}
 # Shared-name generation modes Bernini also serves; task_type is backfilled for
 # these ONLY when the resolved model's backend is Bernini.
 _BERNINI_SHARED_TASK_TYPES = {"t2i", "i2i", "t2v"}
@@ -200,8 +203,19 @@ _INPUT_FIELDS = {
 # "src_ref_images" (VACE R2V references). Other fields stay single. Cap the
 # count as a facade backstop — the engine has no hard limit but many images
 # blow VRAM.
-_MULTI_INPUT_FIELDS = {"image", "src_ref_images"}
+_MULTI_INPUT_FIELDS = {"image", "src_ref_images", "src_video"}
 _MAX_INPUT_IMAGES = 5
+# src_video may carry TWO videos ONLY for Bernini mv2v/ads2v (multi-source edit /
+# ad insertion). Like src_ref_images, the facade comma-joins the refs into the
+# single src_video string of the engine request; BERNINI'S API SERVER is the one
+# that splits that comma-joined string back into the 2-element `video` list its
+# pipeline takes (server.py _build_task_data) — the facade does NOT need to (and
+# must not) reshape the field. Every OTHER src_video consumer (vace -> LightX2V,
+# Bernini v2v/rv2v) contracts a SINGLE source video — a comma-joined pair would
+# reach those engines as one invalid path, so the >1 allowance is task-type
+# scoped.
+_MAX_INPUT_VIDEOS = 2
+_MULTI_VIDEO_TASK_TYPES = {"mv2v", "ads2v"}
 
 # Max bytes for a single streamed input upload (POST /v1/videos/inputs). The UI
 # streams browser file bytes here rather than inlining base64 (which inflates by
@@ -214,11 +228,12 @@ _UPLOAD_CHUNK = 1024 * 1024
 # Total multipart body ceiling for POST /v1/videos/inputs, checked against
 # Content-Length BEFORE the body is read so an oversized upload is refused
 # without spooling to the API server's temp disk. Sized to roughly one
-# _MAX_UPLOAD_BYTES file plus framing: this makes the per-file cap effective at
-# ingress for single-file fields, and multi-file fields (src_ref_images) are
-# reference IMAGES that comfortably fit — a request can never spool more than
-# ~one max file to temp regardless of field.
-_UPLOAD_MAX_BODY = _MAX_UPLOAD_BYTES + 4 * 1024 * 1024
+# _MAX_UPLOAD_BYTES file plus framing: this keeps the per-file cap effective at
+# ingress for every field. mv2v/ads2v need TWO source videos, but the UI uploads
+# video-kind files ONE PER REQUEST (each within this cap) and merges the returned
+# refs — so the two-video allowance never requires a two-video-sized body, and a
+# single oversized file can never spool past ~one cap to temp.
+_UPLOAD_MAX_BODY = _MAX_UPLOAD_BYTES + 8 * 1024 * 1024
 
 # Control keys consumed by the facade; never forwarded verbatim to the engine.
 # "input_refs" carries the pre-materialized NFS input paths — either written by
@@ -453,9 +468,10 @@ def _as_ref_list(value: Any) -> List[Any]:
     return [value]
 
 
-def _check_input_constraints(counts: Dict[str, int]) -> None:
+def _check_input_constraints(counts: Dict[str, int], task_type: str = "") -> None:
     """Cross-field + per-field cardinality constraints on a submit's input_refs.
-    ``counts`` maps a facade field to how many items it carries.
+    ``counts`` maps a facade field to how many items it carries. ``task_type``
+    scopes the src_video allowance: only mv2v/ads2v may carry two videos.
 
     A mask edits exactly one base image; a VACE src_mask masks a src_video;
     only _MULTI_INPUT_FIELDS may carry more than one item (up to
@@ -475,13 +491,27 @@ def _check_input_constraints(counts: Dict[str, int]) -> None:
             message="src_mask requires src_video",
             is_openai_exception=True,
         )
+    # Bernini mv2v/ads2v are DEFINED as two-source-video modes (main + second
+    # video). 0/1 videos would still create a task row and only fail inside the
+    # engine; fail fast here instead (mirrors new-api's materializeBerniniInputs
+    # and the gpustack-ui client check).
+    if task_type in _MULTI_VIDEO_TASK_TYPES and counts.get("src_video", 0) != 2:
+        raise BadRequestException(
+            message=(
+                f"task_type '{task_type}' requires exactly two src_video "
+                f"inputs, got {counts.get('src_video', 0)}"
+            ),
+            is_openai_exception=True,
+        )
     for field, n in counts.items():
         if field in _MULTI_INPUT_FIELDS:
-            if n > _MAX_INPUT_IMAGES:
+            if field == "src_video":
+                cap = _MAX_INPUT_VIDEOS if task_type in _MULTI_VIDEO_TASK_TYPES else 1
+            else:
+                cap = _MAX_INPUT_IMAGES
+            if n > cap:
                 raise BadRequestException(
-                    message=(
-                        f"Too many '{field}' inputs: {n} (max {_MAX_INPUT_IMAGES})"
-                    ),
+                    message=(f"Too many '{field}' inputs: {n} (max {cap})"),
                     is_openai_exception=True,
                 )
         elif n > 1:
@@ -491,7 +521,9 @@ def _check_input_constraints(counts: Dict[str, int]) -> None:
             )
 
 
-def _resolve_input_refs(input_refs: Any, user_id: int) -> Dict[str, str]:
+def _resolve_input_refs(
+    input_refs: Any, user_id: int, task_type: str = ""
+) -> Dict[str, str]:
     """Validate the caller's pre-materialized NFS input refs and map them to
     engine path fields → {engine_field: comma-joined absolute path(s)}.
 
@@ -507,7 +539,7 @@ def _resolve_input_refs(input_refs: Any, user_id: int) -> Dict[str, str]:
         )
     root = _output_root()
     per_field = {f: _as_ref_list(input_refs.get(f)) for f in _INPUT_FIELDS}
-    _check_input_constraints({f: len(v) for f, v in per_field.items()})
+    _check_input_constraints({f: len(v) for f, v in per_field.items()}, task_type)
     overrides: Dict[str, str] = {}
     for field, (engine_field, _ext) in _INPUT_FIELDS.items():
         refs = per_field[field]
@@ -662,6 +694,19 @@ async def create_video_task(request: Request, user: CurrentUserDep):
 
     async with async_session() as session:
         model = await _resolve_target_model(session, request, user, model_name)
+        # Bernini-exclusive playstyles are meaningless on any other backend:
+        # LightX2V/custom video engines don't know these task_type values, and
+        # mv2v/ads2v additionally carry a comma-joined two-video src_video that a
+        # single-video engine would read as one invalid path. Reject with a clean
+        # 400 BEFORE admission / row creation instead of failing dirty downstream.
+        if task_type in _BERNINI_TASK_TYPES and model.backend != BackendEnum.BERNINI:
+            raise BadRequestException(
+                message=(
+                    f"task_type '{task_type}' is Bernini-only, but model "
+                    f"'{model_name}' runs backend '{model.backend}'"
+                ),
+                is_openai_exception=True,
+            )
         running = await ModelInstanceService(session).get_running_instances(model.id)
         # Backpressure: reject fast (429) before creating any row if the queue
         # for this model is already too deep (§4.1).
@@ -685,7 +730,7 @@ async def create_video_task(request: Request, user: CurrentUserDep):
     # always arrive as pre-materialized relative paths in "input_refs" — written
     # by new-api (production) or by this server's /v1/videos/inputs upload
     # endpoint (gpustack-ui admin); the submit body itself never carries bytes.
-    input_overrides = _resolve_input_refs(body.get("input_refs"), user_id)
+    input_overrides = _resolve_input_refs(body.get("input_refs"), user_id, task_type)
     # Music cover/repaint need a driving audio; t2m is pure text. Fail fast before
     # queue/GPU (image i2v-style required-input checks live in the same spirit).
     if task_type == "cover" and "reference_audio_path" not in input_overrides:
@@ -838,14 +883,19 @@ def _validate_upload_field(task_type: str, model: str, field: str, files: list) 
             message=f"No files for '{field}'", is_openai_exception=True
         )
     multi = field in _MULTI_INPUT_FIELDS
+    # src_video is only multi for the two-video Bernini modes; a vace / v2v / rv2v
+    # upload with two videos must be rejected here, not comma-joined downstream.
+    if field == "src_video" and task_type not in _MULTI_VIDEO_TASK_TYPES:
+        multi = False
     if not multi and len(files) > 1:
         raise BadRequestException(
             message=f"'{field}' accepts a single file, got {len(files)}",
             is_openai_exception=True,
         )
-    if multi and len(files) > _MAX_INPUT_IMAGES:
+    _cap = _MAX_INPUT_VIDEOS if field == "src_video" else _MAX_INPUT_IMAGES
+    if multi and len(files) > _cap:
         raise BadRequestException(
-            message=f"Too many '{field}' files: {len(files)} (max {_MAX_INPUT_IMAGES})",
+            message=f"Too many '{field}' files: {len(files)} (max {_cap})",
             is_openai_exception=True,
         )
     return multi
