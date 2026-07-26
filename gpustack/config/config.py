@@ -197,10 +197,28 @@ class Config(WorkerConfig, BaseSettings):
     # ACE-Step music: ~10-30s warm per clip behind a per-instance FIFO; 90s is a
     # sane admission ceiling.
     lightx2v_music_max_queue_wait_seconds: int = 90
+    # Diffusion audio (AudioX / SoulX-Singer). Previously read from the request
+    # path with a hardcoded 90s fallback and no declared field, which made the
+    # audiogen ceiling silently unconfigurable; declared here so /config can set it.
+    lightx2v_audiogen_max_queue_wait_seconds: int = 90
     # Per-model single-instance hot-state latency (seconds), keyed by public model
     # name (substring match, case-insensitive). Defaults from the LightX2V test
     # reports. Unknown models fall back to a per-kind default (image/video/audio).
     lightx2v_model_latency_seconds: Optional[Dict[str, int]] = None
+    # Per-model queue-wait ceiling (seconds) overriding the per-kind values above,
+    # keyed the same way as lightx2v_model_latency_seconds (case-insensitive
+    # substring match on the public model name).
+    #
+    # Why this exists: the per-kind ceilings assume every model of a kind has a
+    # comparable latency. That holds for the LightX2V image models (z-image ~8s,
+    # qwen-image-edit ~40s) and is what makes the 25s image ceiling a useful
+    # fail-fast signal. It breaks for a slow image model — HunyuanImage-3.0 on
+    # 4xA100 runs ~110s end-to-end (AR think/recaption ~90s + 8-step DiT ~12s),
+    # so `floor(1/1) * 110 = 110 > 25` rejects the SECOND concurrent request
+    # outright. Raising the shared image ceiling to fit it would also make
+    # z-image and qwen-image-edit tolerate a ~110s queue, destroying their
+    # backpressure. A per-model override keeps both behaviours.
+    lightx2v_model_queue_wait_seconds: Optional[Dict[str, int]] = None
     # When set, the server aborts at startup if the LightX2V shared NFS root
     # (<lightx2v_output_root>/inputs) isn't mounted+writable. Off by default so a
     # vanilla/dev server (no NFS) still boots — production video deployments set

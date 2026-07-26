@@ -551,18 +551,30 @@ def _resolve_input_refs(
     return overrides
 
 
-def _model_latency(cfg, model_name: str, task_type: str) -> int:
-    """Per-model single-instance latency (seconds) for the admission estimate.
-    Config table keyed by model name (case-insensitive substring match); falls
-    back to a per-kind default for unknown models."""
-    table = getattr(cfg, "lightx2v_model_latency_seconds", None) or {}
+def _lookup_by_model(table, model_name: str) -> Optional[int]:
+    """First positive int in ``table`` whose key is a case-insensitive substring
+    of ``model_name``. Shared by the latency and queue-wait tables so both use
+    identical matching semantics. Returns None when nothing matches or every
+    match is unparseable."""
     name = (model_name or "").lower()
-    for key, val in table.items():
+    for key, val in (table or {}).items():
         if key and str(key).lower() in name:
             try:
                 return int(val)
             except (TypeError, ValueError):
                 continue
+    return None
+
+
+def _model_latency(cfg, model_name: str, task_type: str) -> int:
+    """Per-model single-instance latency (seconds) for the admission estimate.
+    Config table keyed by model name (case-insensitive substring match); falls
+    back to a per-kind default for unknown models."""
+    override = _lookup_by_model(
+        getattr(cfg, "lightx2v_model_latency_seconds", None), model_name
+    )
+    if override is not None:
+        return override
     kind = _engine_kind(task_type)
     if kind == "image":
         return _DEFAULT_IMAGE_LATENCY
@@ -573,6 +585,32 @@ def _model_latency(cfg, model_name: str, task_type: str) -> int:
     if kind == "audiogen":
         return _DEFAULT_AUDIOGEN_LATENCY
     return _DEFAULT_VIDEO_LATENCY
+
+
+def _model_queue_wait(cfg, model_name: str, task_type: str) -> int:
+    """Tolerated queue wait (seconds) before admission rejects with 429.
+
+    A per-model override (``lightx2v_model_queue_wait_seconds``) wins over the
+    per-kind ceiling, so one unusually slow model does not force the whole kind's
+    backpressure open. See the config field's comment for why: the image kind
+    mixes ~8s (z-image) with ~110s (HunyuanImage-3.0) models, and a single shared
+    ceiling cannot serve both.
+    """
+    override = _lookup_by_model(
+        getattr(cfg, "lightx2v_model_queue_wait_seconds", None), model_name
+    )
+    if override is not None:
+        return override
+    kind = _engine_kind(task_type)
+    if kind == "image":
+        return getattr(cfg, "lightx2v_image_max_queue_wait_seconds", 25)
+    if kind == "audio":
+        return getattr(cfg, "lightx2v_audio_max_queue_wait_seconds", 60)
+    if kind == "music":
+        return getattr(cfg, "lightx2v_music_max_queue_wait_seconds", 90)
+    if kind == "audiogen":
+        return getattr(cfg, "lightx2v_audiogen_max_queue_wait_seconds", 90)
+    return getattr(cfg, "lightx2v_video_max_queue_wait_seconds", 150)
 
 
 async def _check_admission(
@@ -604,17 +642,7 @@ async def _check_admission(
     depth = (await session.exec(stmt)).first() or 0
     latency = _model_latency(cfg, model_name, task_type)
     est_wait = (int(depth) // instances) * latency
-    kind = _engine_kind(task_type)
-    if kind == "image":
-        max_wait = getattr(cfg, "lightx2v_image_max_queue_wait_seconds", 25)
-    elif kind == "audio":
-        max_wait = getattr(cfg, "lightx2v_audio_max_queue_wait_seconds", 60)
-    elif kind == "music":
-        max_wait = getattr(cfg, "lightx2v_music_max_queue_wait_seconds", 90)
-    elif kind == "audiogen":
-        max_wait = getattr(cfg, "lightx2v_audiogen_max_queue_wait_seconds", 90)
-    else:
-        max_wait = getattr(cfg, "lightx2v_video_max_queue_wait_seconds", 150)
+    max_wait = _model_queue_wait(cfg, model_name, task_type)
     if est_wait > int(max_wait):
         raise TooManyRequestsException(
             message=(

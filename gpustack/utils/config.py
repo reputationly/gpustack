@@ -18,7 +18,9 @@ WHITELIST_CONFIG_FIELDS = {
     "lightx2v_video_max_queue_wait_seconds",
     "lightx2v_audio_max_queue_wait_seconds",
     "lightx2v_music_max_queue_wait_seconds",
+    "lightx2v_audiogen_max_queue_wait_seconds",
     "lightx2v_model_latency_seconds",
+    "lightx2v_model_queue_wait_seconds",
 }
 
 READ_ONLY_CONFIG_FIELDS = WHITELIST_CONFIG_FIELDS.union(
