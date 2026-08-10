@@ -700,24 +700,74 @@ async def prioritize_workers_with_model_files(
     return sorted_workers
 
 
+# vLLM-Omni is the one built-in engine that is NOT single-modality: the same
+# backend serves TTS (VoxCPM2/CosyVoice3/Qwen3-TTS/MOSS-*), diffusion audiogen
+# (AudioX/SoulX-Singer), images, and — since MiniMax-H3 — video. So "one backend
+# maps to one category" does not hold for it, and the flat mapping below cannot
+# express it. These hints refine the vLLM-Omni default by model source.
+#
+# Matching is on the model source key (repo id / model-scope id / local path)
+# plus the display name, lowercased.
+#
+# This category IS load-bearing, so a wrong guess is not free. routes/videos.py
+# admits the H3-only task types (l2va / r2va) only on a model it can positively
+# identify as an H3 video deployment, and is_video_model() — i.e. this category —
+# is one of the two things it accepts as that evidence. A vLLM-Omni model
+# mis-filed as VIDEO therefore becomes eligible for video task types it cannot
+# serve; one mis-filed as TEXT_TO_SPEECH is merely denied the escape hatch (the
+# weight-path token check still admits it). Prefer under- to over-matching here,
+# and do not add a hint on a token that a speech checkpoint could also carry.
+#
+# Explicitly-declared categories always win: set_model_categories() returns
+# early when model.categories is already populated, so an operator who sets
+# categories=[video] on the model is never overridden by any of this.
+_VLLM_OMNI_CATEGORY_HINTS: List[Tuple[str, CategoryEnum]] = [
+    # MiniMax-H3 omni video (FL2VA / Ref2VA partitions). Production deployments
+    # are local paths like /nfs-data/models/MiniMax-H3-FL2VA-INT8.
+    ("minimax-h3", CategoryEnum.VIDEO),
+    ("minimax_h3", CategoryEnum.VIDEO),
+]
+
+# Fallback when no hint matches. Keeps every pre-H3 vLLM-Omni deployment (the
+# TTS fleet) classified exactly as before — this change must not re-file models
+# that are working today.
+_VLLM_OMNI_DEFAULT_CATEGORY = CategoryEnum.TEXT_TO_SPEECH
+
+
+def _vllm_omni_category(model: Model) -> CategoryEnum:
+    """Refine the vLLM-Omni category by model source; see _VLLM_OMNI_CATEGORY_HINTS."""
+    haystack = " ".join(
+        value for value in (model.name, model.model_source_key) if value
+    ).lower()
+    for token, category in _VLLM_OMNI_CATEGORY_HINTS:
+        if token in haystack:
+            return category
+    return _VLLM_OMNI_DEFAULT_CATEGORY
+
+
 def _evaluate_builtin_backend_config(model: Model) -> Optional[bool]:
     """
     First-class built-in engines (LightX2V, IndexTTS, ACE-Step, vLLM-Omni) have
     fixed profiles and non-standard architectures. Loading a HF pretrained config
     would error and mis-tag them as LLM, so skip detection entirely and declare
-    their category explicitly (LightX2V=video, IndexTTS/vLLM-Omni=text_to_speech,
+    their category explicitly (LightX2V/Bernini=video, IndexTTS=text_to_speech,
     ACE-Step=music). Returns the "categories/gpus_per_replica updated" flag, or
     None when the model is not a built-in engine (caller falls through to
     detection).
+
+    vLLM-Omni is multi-modality and does not get a fixed entry here — see
+    _vllm_omni_category.
     """
     builtin_categories = {
         BackendEnum.LIGHTX2V: CategoryEnum.VIDEO,
         BackendEnum.INDEXTTS: CategoryEnum.TEXT_TO_SPEECH,
         BackendEnum.ACESTEP: CategoryEnum.MUSIC,
-        BackendEnum.VLLM_OMNI: CategoryEnum.TEXT_TO_SPEECH,
         BackendEnum.BERNINI: CategoryEnum.VIDEO,
     }
-    category = builtin_categories.get(model.backend)
+    if model.backend == BackendEnum.VLLM_OMNI:
+        category = _vllm_omni_category(model)
+    else:
+        category = builtin_categories.get(model.backend)
     if category is None:
         return None
     categories_modified = set_model_categories(model, category)

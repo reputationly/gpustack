@@ -25,7 +25,12 @@ from gpustack.api.exceptions import (
 from gpustack.config.config import get_global_config
 from gpustack.gateway.utils import model_instance_prefix, router_header_key
 from gpustack.http_proxy.strategies import select_least_pending_instance
-from gpustack.schemas.models import BackendEnum, ModelInstance, ModelInstanceStateEnum
+from gpustack.schemas.models import (
+    BackendEnum,
+    ModelInstance,
+    ModelInstanceStateEnum,
+    is_video_model,
+)
 from gpustack.schemas.video_generation_task import (
     VIDEO_TASK_TERMINAL_STATES,
     VideoGenerationTask,
@@ -76,7 +81,11 @@ _MAX_DISPATCH_RETRIES = 5
 
 # Engine task actions (§7.2) that go to /v1/tasks/image/ rather than
 # /v1/tasks/video/. Everything else is a video task:
-#   t2v/i2v/flf2v — Wan2.2 generation
+#   t2v/i2v/flf2v — Wan2.2 generation; ALSO MiniMax-H3 (vLLM-Omni), see _H3_TASK_MAP
+#   l2va          — keyframe "last frame only" (MiniMax-H3 L2VA). Same input shape
+#                   as i2v (exactly one image); only the SEMANTICS differ (that
+#                   image is the LAST frame, not the first), so it cannot be
+#                   inferred from the request shape and must be sent explicitly.
 #   s2v           — InfiniteTalk digital human (image + driving audio)
 #   sr            — SeedVR2 video super-resolution (video in, sr_ratio out-scale)
 #   vace          — Wan2.2 VACE video editing (src_video/src_mask/src_ref_images)
@@ -87,7 +96,138 @@ _MAX_DISPATCH_RETRIES = 5
 #                   task_type is model-agnostic — any future dubbing model that
 #                   honors the contract deploys under it (routing is by model).
 _IMAGE_TASK_TYPES = {"t2i", "i2i"}
-_VIDEO_TASK_TYPES = {"t2v", "i2v", "flf2v", "s2v", "sr", "vace", "v2a"}
+_VIDEO_TASK_TYPES = {"t2v", "i2v", "l2va", "flf2v", "s2v", "r2va", "sr", "vace", "v2a"}
+
+# MiniMax-H3 (vLLM-Omni backend) task selection.
+#
+# H3 picks its task from a NESTED key, extra_params.task — there is no top-level
+# `task` field, and VideoGenerationRequest has no extra="forbid", so a top-level
+# one is silently DROPPED (no error, no effect). Same trap as the IndexTTS-2
+# emotion scalars.
+#
+# The facade's own task_type vocabulary is kept as-is (new-api's tab<->task_type
+# reverse index, playground config and billing matrix are all built on it); the
+# translation to H3's engine vocabulary happens here, exactly like the Bernini
+# guidance_mode and AudioX audiox_task backfills below.
+#
+# frame_indices tells the single FL2VA checkpoint WHERE the supplied image(s)
+# land on the timeline — this is what lets one checkpoint serve first-frame,
+# last-frame and first+last from the same weights (Wan needed two separately
+# launched instances for this). The engine accepts only these three values and
+# requires len(frame_indices) == len(images).
+#
+# H3-EXCLUSIVE task types, mirroring the _BERNINI_TASK_TYPES /
+# _BERNINI_SHARED_TASK_TYPES split.
+#
+# Only l2va is exclusive. t2v / i2v / flf2v / s2v are SHARED names that LightX2V
+# (Wan2.2) and InfiniteTalk legitimately serve, so they must not be gated on the
+# backend — routing is by model, and the backfill below already keys off it.
+#
+# l2va is different: it did not exist before H3, no other engine understands it,
+# and its input shape (exactly one image) is indistinguishable from i2v. Admitting
+# it on a LightX2V model would render a first-frame i2v with no error at all —
+# see the guard in create_video_task.
+_H3_ONLY_TASK_TYPES = {"l2va", "r2va"}
+
+# Task types that need the Ref2VA checkpoint PARTITION, not just an H3 model.
+#
+# H3 ships two partitions as two separate weight sets, and one process loads
+# exactly one of them (`pipeline_minimax_h3` raises
+# "checkpoint partition 'fl2va' supports ['fl2va','t2va'], got task='ref2va'").
+# Routing is by model, so an operator can point these at the FL2VA deployment and
+# the request is only rejected after dispatch.
+#
+# That supported set is built at LOAD time from the checkpoint's own
+# model_index.json (`pipeline_minimax_h3`, self.supported_tasks) — and a COMBINED
+# build, i.e. one weights root that also carries a Ref2VA/ subdir, gets ref2va
+# merged into it and serves both partitions from a single deployment. Nothing
+# visible from the facade distinguishes that layout from an FL2VA-only one, which
+# is why _h3_ref2va_capability reports None instead of guessing and the guard in
+# create_video_task fails open on it.
+_H3_REF2VA_TASK_TYPES = {"s2v", "r2va"}
+
+
+def _h3_ref2va_capability(model) -> bool | None:
+    """Can this model serve the ref2va partition? None = cannot tell.
+
+    Judged on what the deployment ACTUALLY LOADED, not on the display name:
+    the name is operator-chosen and arbitrary, whereas the weight path and
+    --task-type are the two things that decide which partition comes up.
+
+    Returns None (rather than False) whenever there is no positive evidence —
+    combined mode loads BOTH partitions, and an unrecognised layout must not be
+    rejected on a guess. Callers treat None as "allow, let the engine decide".
+    """
+    argv = " ".join(model.backend_parameters or []).lower()
+    # --task-type is authoritative when present: it selects the partition.
+    if "ref2va" in argv:
+        return True
+    if "fl2va" in argv:
+        return False
+    # Otherwise fall back to the weight path. Production does NOT pass
+    # --task-type (the checkpoint's model_index.json declares the partition), so
+    # this is the common case: .../MiniMax-H3/Ref2VA vs .../MiniMax-H3-FL2VA-INT8
+    source = (model.model_source_key or "").lower()
+    if "ref2va" in source:
+        return True
+    if "fl2va" in source:
+        return False
+    # Combined mode (whole MiniMax-H3 dir, both partitions) or anything we do not
+    # recognise: no evidence either way.
+    return None
+
+
+# Tokens that positively identify a MiniMax-H3 deployment from the weight path or
+# the launch argv. Same two sources _h3_ref2va_capability trusts, and for the same
+# reason: the display name is operator-chosen and arbitrary, these two are not.
+_H3_SOURCE_TOKENS = ("minimax-h3", "minimax_h3", "fl2va", "ref2va")
+
+
+def _is_h3_video_deployment(model) -> bool:
+    """Positive evidence that this vLLM-Omni deployment serves MiniMax-H3 video.
+
+    vLLM-Omni is the one built-in backend that is NOT single-modality — the same
+    backend runs the whole TTS fleet (VoxCPM2 / CosyVoice3 / Qwen3-TTS / MOSS-*)
+    — so ``backend == VLLM_OMNI`` does not mean "this model makes video".
+
+    Unlike _h3_ref2va_capability above, this one fails CLOSED, because the two
+    guards have opposite failure economics. A ref2va/fl2va partition mismatch is
+    caught by the engine and returned as a clean 4xx, so guessing wrong there
+    only costs a round trip. A video task sent to a SPEECH deployment has no such
+    backstop: POST /v1/tasks/video/ is registered on every vLLM-Omni server and
+    app.state.openai_serving_video is assigned on the non-diffusion init path
+    too, so the request is NOT refused at submit — it gets past handler
+    resolution and dies deep in the job, and any 503 on the way out used to be
+    rewritten as engine backpressure (see _submit_to_engine), i.e. a permanent
+    misconfiguration that new-api would retry forever.
+    """
+    haystack = " ".join(
+        [model.model_source_key or "", " ".join(model.backend_parameters or [])]
+    ).lower()
+    if any(token in haystack for token in _H3_SOURCE_TOKENS):
+        return True
+    # Escape hatch for a weights path that carries none of those tokens: an
+    # explicitly declared video category also counts. set_model_categories()
+    # returns early when categories are already populated, so an operator can
+    # always force this open without renaming the checkpoint directory.
+    return is_video_model(model)
+
+
+#   facade task_type -> (extra_params.task, extra_params.frame_indices)
+_H3_TASK_MAP = {
+    "t2v": ("t2va", None),
+    "i2v": ("fl2va", [0]),
+    "l2va": ("fl2va", [-1]),
+    "flf2v": ("fl2va", [0, -1]),
+    # ref2va needs its own checkpoint partition and is NOT deployed yet (only a
+    # BF16 144 GB build exists, no INT8). Mapped here so the rule is complete and
+    # this block never has to be revisited when the digital-human line lands.
+    "s2v": ("ref2va", None),
+    # Mixed-reference Ref2VA: images + videos + audio, the engine's headline mode.
+    # Same engine task as s2v; they differ only in which references the caller
+    # may send (s2v is InfiniteTalk's one-image + one-driving-audio shape).
+    "r2va": ("ref2va", None),
+}
 # Audio (TTS) task types served by the IndexTTS-2 built-in engine. "tts" is the
 # facade task_type; it maps to the engine's POST /v1/tasks/audio/ (engine kind
 # "audio"). Zero-shot voice clone + emotion control, async like video.
@@ -203,7 +343,10 @@ _INPUT_FIELDS = {
 # "src_ref_images" (VACE R2V references). Other fields stay single. Cap the
 # count as a facade backstop — the engine has no hard limit but many images
 # blow VRAM.
-_MULTI_INPUT_FIELDS = {"image", "src_ref_images", "src_video"}
+# "audio" and "video" are listed so MiniMax-H3 Ref2VA can carry several of each;
+# _input_cap() clamps them back to 1 for every other task_type, so no existing
+# single-file consumer is loosened.
+_MULTI_INPUT_FIELDS = {"image", "src_ref_images", "src_video", "audio", "video"}
 _MAX_INPUT_IMAGES = 5
 # src_video may carry TWO videos ONLY for Bernini mv2v/ads2v (multi-source edit /
 # ad insertion). Like src_ref_images, the facade comma-joins the refs into the
@@ -216,6 +359,49 @@ _MAX_INPUT_IMAGES = 5
 # scoped.
 _MAX_INPUT_VIDEOS = 2
 _MULTI_VIDEO_TASK_TYPES = {"mv2v", "ads2v"}
+
+# Per-task-type input caps that OVERRIDE the defaults above.
+#
+# MiniMax-H3 Ref2VA ("r2va") is the only task that takes genuinely MIXED
+# references — up to 9 images + 3 videos + 3 standalone audio, 12 in total — and
+# the engine enforces exactly those numbers
+# (pipeline_minimax_h3._validate_ref2va_reference_counts). The playground only
+# exposes the images+one-audio subset, but the public API must not be capped
+# below what the engine can actually do.
+#
+# Note "audio" is multi ONLY here: every other consumer of the audio field
+# (InfiniteTalk s2v driving audio, ACE-Step, TTS references) contracts exactly
+# one file, and a comma-joined pair would reach those engines as one invalid
+# path. Same reasoning as the src_video scoping.
+_H3_REF2VA_TASK_TYPE = "r2va"
+_TASK_INPUT_CAPS = {
+    _H3_REF2VA_TASK_TYPE: {"image": 9, "video": 3, "audio": 3},
+}
+# Total reference cap across all modalities (engine: "at most 12 total").
+_H3_REF2VA_MAX_TOTAL_REFS = 12
+
+
+# Fields that are multi ONLY where a task-type override grants it. They live in
+# _MULTI_INPUT_FIELDS so the plumbing can comma-join them, but their DEFAULT cap
+# stays 1 — without this they would fall through to _MAX_INPUT_IMAGES and every
+# single-file consumer (InfiniteTalk s2v driving audio, SeedVR2 source video,
+# ACE-Step, TTS references) would silently start accepting five.
+_TASK_SCOPED_MULTI_FIELDS = {"audio", "video"}
+
+
+def _input_cap(field: str, task_type: str) -> int:
+    """Max number of files allowed for a facade input field under this task."""
+    override = _TASK_INPUT_CAPS.get(task_type, {}).get(field)
+    if override is not None:
+        return override
+    if field in _TASK_SCOPED_MULTI_FIELDS:
+        return 1
+    if field == "src_video":
+        return _MAX_INPUT_VIDEOS if task_type in _MULTI_VIDEO_TASK_TYPES else 1
+    if field in _MULTI_INPUT_FIELDS:
+        return _MAX_INPUT_IMAGES
+    return 1
+
 
 # Max bytes for a single streamed input upload (POST /v1/videos/inputs). The UI
 # streams browser file bytes here rather than inlining base64 (which inflates by
@@ -504,19 +690,27 @@ def _check_input_constraints(counts: Dict[str, int], task_type: str = "") -> Non
             is_openai_exception=True,
         )
     for field, n in counts.items():
-        if field in _MULTI_INPUT_FIELDS:
-            if field == "src_video":
-                cap = _MAX_INPUT_VIDEOS if task_type in _MULTI_VIDEO_TASK_TYPES else 1
-            else:
-                cap = _MAX_INPUT_IMAGES
-            if n > cap:
-                raise BadRequestException(
-                    message=(f"Too many '{field}' inputs: {n} (max {cap})"),
-                    is_openai_exception=True,
-                )
-        elif n > 1:
+        cap = _input_cap(field, task_type)
+        if n > cap:
             raise BadRequestException(
-                message=f"'{field}' accepts a single input, got {n}",
+                message=(
+                    f"Too many '{field}' inputs: {n} (max {cap})"
+                    if cap > 1
+                    else f"'{field}' accepts a single input, got {n}"
+                ),
+                is_openai_exception=True,
+            )
+    # Engine-side total cap for mixed references; checked here so an over-large
+    # combination fails before any NFS write or queue slot.
+    if task_type == _H3_REF2VA_TASK_TYPE:
+        total_refs = sum(counts.get(f, 0) for f in ("image", "video", "audio"))
+        if total_refs > _H3_REF2VA_MAX_TOTAL_REFS:
+            raise BadRequestException(
+                message=(
+                    f"task_type '{task_type}' accepts at most "
+                    f"{_H3_REF2VA_MAX_TOTAL_REFS} references in total, "
+                    f"got {total_refs}"
+                ),
                 is_openai_exception=True,
             )
 
@@ -653,6 +847,45 @@ async def _check_admission(
         )
 
 
+def _backfill_h3_engine_params(
+    engine_body: Dict[str, Any], backend, task_type: str
+) -> None:
+    """Translate our task_type into MiniMax-H3's nested extra_params.
+
+    Gated on the resolved model's BACKEND, not on its name: routing is by model,
+    and vLLM-Omni is the only backend that speaks this vocabulary. Same shape as
+    the Bernini guidance_mode backfill.
+
+    The backend test alone does not establish that the target is an H3 model —
+    _engine_kind dispatches on task_type, never on the model, so a vLLM-Omni
+    SPEECH deployment reaches this function whenever the caller names it with a
+    video task_type. That is admission's job, not the backfill's: the H3-only
+    types are rejected by _is_h3_video_deployment in create_video_task, and for
+    the SHARED names (t2v / i2v / flf2v / s2v) writing extra_params.task onto a
+    misrouted request changes nothing — the request was already going to the
+    wrong engine, and the keys are inert to every engine but H3.
+
+    A module-level function rather than an inline block for two reasons: it keeps
+    create_video_task under the complexity cap (pre-commit allows 15 and the
+    function was already at 11 before H3), and it lets the tests exercise the real
+    code path instead of maintaining a copy of it.
+    """
+    if backend != BackendEnum.VLLM_OMNI or task_type not in _H3_TASK_MAP:
+        return
+    h3_task, frame_indices = _H3_TASK_MAP[task_type]
+    # Merge, never replace: new-api forwards the caller's metadata verbatim, so
+    # extra_params may already carry duration / audio_flow_shift / seed. Reassign
+    # explicitly — the value may be a non-dict from a direct caller.
+    extra_params = engine_body.get("extra_params")
+    if not isinstance(extra_params, dict):
+        extra_params = {}
+    engine_body["extra_params"] = extra_params
+    # A caller-supplied task wins, consistent with every other backfill here.
+    extra_params.setdefault("task", h3_task)
+    if frame_indices is not None:
+        extra_params.setdefault("frame_indices", list(frame_indices))
+
+
 async def _parse_video_request(
     request: Request,
 ) -> Tuple[Dict[str, Any], str, str, int]:
@@ -735,6 +968,60 @@ async def create_video_task(request: Request, user: CurrentUserDep):
                 ),
                 is_openai_exception=True,
             )
+        # Same guard for the H3-exclusive playstyles, and here silence is the
+        # danger rather than a hard failure: l2va carries exactly one image, so a
+        # LightX2V engine — which infers its mode from the input fields, not from
+        # task_type — accepts it happily and renders a normal FIRST-frame i2v.
+        # The user asked for "reverse from the last frame" and gets a plausible
+        # video generated from the wrong end, with no error anywhere.
+        # The H3 translation below is gated on the vLLM-Omni backend, so without
+        # this check the request would reach the engine with no extra_params.task
+        # and no frame_indices at all.
+        #
+        # The backend alone is NOT sufficient here: vLLM-Omni also runs the TTS
+        # fleet, and _engine_kind dispatches purely on task_type, so l2va aimed at
+        # a speech deployment would still be POSTed to its /v1/tasks/video/ and
+        # fail deep inside the engine rather than here. Hence the second,
+        # fail-CLOSED test — see _is_h3_video_deployment for why the polarity
+        # differs from the ref2va guard below.
+        if task_type in _H3_ONLY_TASK_TYPES and not (
+            model.backend == BackendEnum.VLLM_OMNI and _is_h3_video_deployment(model)
+        ):
+            raise BadRequestException(
+                message=(
+                    f"task_type '{task_type}' needs a MiniMax-H3 video deployment, "
+                    f"but model '{model_name}' runs backend '{model.backend}'. "
+                    f"If this IS an H3 model, declare categories=[video] on it."
+                ),
+                is_openai_exception=True,
+            )
+        # Ref2VA-partition task types on a model we can positively identify as
+        # FL2VA-only: reject at submit instead of letting it burn a queue slot
+        # and a dispatch. Deliberately fail-OPEN on None — a wrong guess here
+        # would refuse a working deployment, which is worse than the engine's
+        # own (fast, 400, self-explanatory) rejection.
+        #
+        # Failing open is cheap and clean, which is what licenses it: the engine
+        # raises OmniClientError for a partition mismatch, and vLLM-Omni defines
+        # that class as "request-scoped, surfaced as 4xx". A 4xx takes the
+        # err.status < 500 branch of the submit handler below, which DELETES the
+        # task row before re-raising as 400 — so an undeployed task costs one
+        # round trip and leaves nothing behind: no orphan row, no queue slot, and
+        # never a silently mis-rendered video (the engine's shape inference would
+        # also land on ref2va here, so even a lost extra_params.task still 400s).
+        if (
+            task_type in _H3_REF2VA_TASK_TYPES
+            and model.backend == BackendEnum.VLLM_OMNI
+            and _h3_ref2va_capability(model) is False
+        ):
+            raise BadRequestException(
+                message=(
+                    f"task_type '{task_type}' needs the MiniMax-H3 Ref2VA checkpoint, "
+                    f"but model '{model_name}' is deployed from the FL2VA partition "
+                    f"(serves t2va/fl2va only). Point this task_type at a Ref2VA deployment."
+                ),
+                is_openai_exception=True,
+            )
         running = await ModelInstanceService(session).get_running_instances(model.id)
         # Backpressure: reject fast (429) before creating any row if the queue
         # for this model is already too deep (§4.1).
@@ -798,6 +1085,7 @@ async def create_video_task(request: Request, user: CurrentUserDep):
         model.backend == BackendEnum.BERNINI and task_type in _BERNINI_SHARED_TASK_TYPES
     ):
         engine_body.setdefault("task_type", task_type)
+    _backfill_h3_engine_params(engine_body, model.backend, task_type)
     await asyncio.to_thread(_ensure_parent_dir, out_abs)
 
     # Persist BEFORE the engine accepts work: if the row were written after a
@@ -910,20 +1198,19 @@ def _validate_upload_field(task_type: str, model: str, field: str, files: list) 
         raise BadRequestException(
             message=f"No files for '{field}'", is_openai_exception=True
         )
-    multi = field in _MULTI_INPUT_FIELDS
-    # src_video is only multi for the two-video Bernini modes; a vace / v2v / rv2v
-    # upload with two videos must be rejected here, not comma-joined downstream.
-    if field == "src_video" and task_type not in _MULTI_VIDEO_TASK_TYPES:
-        multi = False
-    if not multi and len(files) > 1:
+    # A field is "multi" only where the cap actually allows more than one: a
+    # vace / v2v / rv2v upload with two videos, or an InfiniteTalk s2v with two
+    # audio files, must be rejected here rather than comma-joined into one
+    # invalid path downstream.
+    cap = _input_cap(field, task_type)
+    multi = cap > 1
+    if len(files) > cap:
         raise BadRequestException(
-            message=f"'{field}' accepts a single file, got {len(files)}",
-            is_openai_exception=True,
-        )
-    _cap = _MAX_INPUT_VIDEOS if field == "src_video" else _MAX_INPUT_IMAGES
-    if multi and len(files) > _cap:
-        raise BadRequestException(
-            message=f"Too many '{field}' files: {len(files)} (max {_cap})",
+            message=(
+                f"Too many '{field}' files: {len(files)} (max {cap})"
+                if multi
+                else f"'{field}' accepts a single file, got {len(files)}"
+            ),
             is_openai_exception=True,
         )
     return multi
@@ -1054,6 +1341,14 @@ async def upload_video_input(request: Request, user: CurrentUserDep):
         await form.close()
 
 
+# Substring that marks the engine's ONE retryable 503. vLLM-Omni's task manager
+# raises RuntimeError("Task queue is full (max N tasks)") and the route maps it to
+# 503; every other 503 it can emit is a permanent condition wearing the same
+# status code. Matched lowercased and as a substring so the "(max N tasks)" tail
+# and any future prefix do not break it.
+_ENGINE_QUEUE_FULL = "queue is full"
+
+
 class _SubmitError(NamedTuple):
     status: int
     message: str
@@ -1088,10 +1383,22 @@ async def _submit_to_engine(
         logger.warning(f"Video submit to instance {instance.id} failed: {e}")
         return None, _SubmitError(503, f"Failed to reach instance: {e}", "transient")
 
-    if resp.status == 503:
+    if resp.status == 503 and _ENGINE_QUEUE_FULL in (
+        body_bytes.decode(errors="replace").lower() if body_bytes else ""
+    ):
         # Engine per-instance FIFO is full — surface as backpressure so new-api
         # self-throttles (§6.0). least-pending already steered away from busy
         # instances; this is the residual overflow.
+        #
+        # Matched on the body, NOT on the bare status: the engine answers 503 for
+        # a dozen other conditions (uninitialised handler for the requested
+        # modality, duplicate task id, engine still warming up), none of which a
+        # retry can fix. Calling those "busy" was actively harmful — the message
+        # replaced the engine's own explanation, and kind="busy" is the one kind
+        # _redispatch treats as neither permanent nor transient, so retry_count
+        # never advanced and the sweeper re-submitted a doomed task forever.
+        # Everything else now falls through to the generic branch: detail
+        # preserved, kind="transient", retry_count bounded by _MAX_DISPATCH_RETRIES.
         return None, _SubmitError(
             503, "All instances busy, please retry shortly", "busy"
         )
