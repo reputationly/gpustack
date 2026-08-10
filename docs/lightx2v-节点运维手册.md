@@ -32,6 +32,8 @@ bash /root/lx2v-node.sh prepare-transfer
 
 > **集群批量**:238 上用 `lx2v-fleet.sh` 对所有 worker 并发跑 node 脚本子命令(自动排除 238 自身):
 > `bash /root/lx2v-fleet.sh upgrade-gpustack --offline` / `bash /root/lx2v-fleet.sh -j 3 upgrade-engine --engine vllm-omni --offline` / `bash /root/lx2v-fleet.sh status`。日志在 238 `/tmp/lx2v-fleet/<ip>.log`。
+>
+> **要做一次现网升级?** 别拼上面这些单条命令 —— 直接整段复制 **§2.5 标准升级流程**,它已按正确顺序串好(打回滚锚 → server → worker → 引擎 → UI 重建),漏一步就可能出事(如回滚锚必须在 `docker pull` 之前打)。
 
 - 所有命令须 **root** 执行,脚本放任意路径均可;
 - 全程日志:`/var/log/lx2v-node-<日期>.log`;每步打印 `[step i/N] 时间` 和耗时,长任务(load/pull/save)有进度输出——**长时间无输出再怀疑卡住,先看当前 step 是什么**(toolkit 在线下载 5-8 分钟、引擎 tar load 4-5 分钟都是正常的);
@@ -186,6 +188,69 @@ bash /root/lx2v-fleet.sh -j 3 upgrade-engine --engine vllm-omni --offline
 ```
 
 **⑤ UI 重建实例**:vLLMOmni 系(audiox/soulx/indextts-2/qwen3-tts/moss-*)逐个删实例重建到新引擎镜像;ACE-Step(ACEStep 后端,镜像没变)不用动。**server 必须先于 worker**(版本校验软 + DB/API 方向 server ≥ worker)。
+
+### 2.5 标准升级流程(通用模板,直接复制)
+
+§2.4 是一次具体升级的实录;本节是**不绑定镜像/日期**的模板,升级时整段复制,只改两处:第 ⑤ 步列哪些引擎、第 ⑦ 步重建哪些实例。
+
+**前置**:先确认要升的包**已经构建完成**(各仓 GitHub Actions → 对应 workflow 显示 success),否则 `prepare-transfer` 拉到的还是旧镜像,后面全白做。各仓出包流水线都是 `workflow_dispatch` 手动触发,push 不会自动构建。
+
+以下全部在 **manager(238)** 上执行:
+
+```bash
+# ① 打回滚锚 —— 必须是**第一步**!
+#    lx2v-dev 是浮动 tag,任何 pull 之后旧镜像就没有名字了、回滚就无从谈起。
+#    注意 prepare-transfer 自己就会 pull(它拉 arm64 六镜像,x86 上还会再拉一次
+#    amd64 把本地 tag 恢复回来,见 lx2v-node.sh 的 cmd_prepare_transfer),
+#    所以这一步必须排在 prepare-transfer **前面**,不是仅仅排在 ③ 的 pull 前面。
+docker tag crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:lx2v-dev \
+  gpustack-rollback:pre-$(date +%Y%m%d)
+docker images gpustack-rollback      # 确认锚已建再往下走
+
+# ② 刷 NFS tar(拉六镜像,digest 没变的自动跳过)
+bash /root/lx2v-node.sh prepare-transfer
+
+# ③ 升 server —— 必须先于 worker(版本校验软 + DB/API 方向 server ≥ worker)
+docker pull crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:lx2v-dev
+docker stop gpustack-server && docker rm gpustack-server
+docker run -d --name gpustack-server --restart unless-stopped -p 80:80 \
+  --volume gpustack-data:/var/lib/gpustack --volume /nfs-output:/nfs-output \
+  crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:lx2v-dev \
+  --system-default-container-registry quay.io
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost/    # 期望 200
+
+# ④ 全 worker 升 gpustack
+bash /root/lx2v-fleet.sh -j 10 upgrade-gpustack --offline
+
+# ⑤ 全 worker 换引擎镜像 —— 只列这次变了的,没变的别动(改这里)
+bash /root/lx2v-fleet.sh -j 10 upgrade-engine --engine lightx2v --offline
+bash /root/lx2v-fleet.sh -j 10 upgrade-engine --engine vllm-omni --offline
+# 可选:indextts / acestep / bernini
+
+# ⑥ 巡检:worker 状态、六镜像 ID、NFS 挂载、每卡显存、实例容器
+bash /root/lx2v-fleet.sh -j 10 status
+```
+
+**⑦ UI 重建实例**(改这里):Instance List 里把**用到了新引擎镜像的实例**逐个删除让其自动重建——**先删一个、等新的 Running 再删下一个**,服务不断。换了镜像但没重建实例 = 新代码根本没上线(实例锁旧镜像 ID)。
+
+**回滚 server**(①的锚派上用场时):
+
+```bash
+docker stop gpustack-server && docker rm gpustack-server
+docker run -d --name gpustack-server --restart unless-stopped -p 80:80 \
+  --volume gpustack-data:/var/lib/gpustack --volume /nfs-output:/nfs-output \
+  gpustack-rollback:pre-<锚的日期> \
+  --system-default-container-registry quay.io
+```
+
+数据库迁移设计为**向后兼容**(只加表/加枚举值、不改旧表),旧镜像跑新库无碍,所以回滚只需退镜像,不用动 `gpustack-data` 卷。
+
+**要点**
+
+- **并发 `-j 5`** 是吞吐与 NFS 带宽的折中。离线模式下每台都要从 NFS load 约 10G 的 tar,并发太高会互相抢带宽。若 `/tmp/lx2v-fleet/<ip>.log` 出现 load 变慢/超时/个别节点失败,降到 `-j 3` 重跑即可——**升级是幂等的**,重复执行无副作用。
+- 节点清单默认读 `/root/lx2v-nodes.txt`,manager 自身会自动排除;换清单用 `-f`。
+- 任一节点失败则整体退出码非 0,逐台日志在 `/tmp/lx2v-fleet/<ip>.log`。
+- 只升引擎、gpustack 没变时,②③④ 可整段跳过,直接从 ⑤ 开始。
 
 ---
 
