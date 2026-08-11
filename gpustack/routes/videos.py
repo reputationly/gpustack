@@ -39,6 +39,11 @@ from gpustack.schemas.video_generation_task import (
 from gpustack.schemas.workers import Worker
 from gpustack.server.db import async_session
 from gpustack.server.deps import CurrentUserDep
+from gpustack.server.video_progress import (
+    ATTEMPT_RESET,
+    elapsed_seconds,
+    normalize_progress,
+)
 from gpustack.server.services import (
     ModelInstanceService,
     ModelRouteService,
@@ -1511,6 +1516,13 @@ async def redispatch_task(
             "nfs_path": out_path,
             "params": engine_body,
             "retry_count": attempts + 1,
+            # New attempt, new clock AND new bar: the dead run's progress must
+            # not carry over, or an attempt that reached the estimate ceiling
+            # freezes its successor at 95% for the whole re-run. Normally the
+            # requeue that produced this QUEUED row already cleared it; repeated
+            # here so re-dispatch is self-sufficient for rows that were never
+            # requeued (QUEUED from birth, no free instance on an earlier sweep).
+            **ATTEMPT_RESET,
         },
     )
     logger.info(
@@ -1598,6 +1610,10 @@ async def fetch_engine_status_updates(
             "instance_id": None,
             "native_task_id": None,
             "state_message": "instance lost task; requeued",
+            # This attempt is over: without the reset the caller would see
+            # status="queued" next to the dead run's progress=80/phase="decode"
+            # (queued is a fixed tier in the client, §3.4).
+            **ATTEMPT_RESET,
         }
     if resp.status >= 400 or not body_bytes:
         return None
@@ -1609,6 +1625,8 @@ async def fetch_engine_status_updates(
 
     new_state = _ENGINE_STATE_MAP.get(status.get("status"))
     if new_state is None:
+        # Nothing to fold: an unrecognized status means we can't say what the row
+        # should become, and progress without a state would be meaningless.
         return None
     updates: Dict[str, Any] = {"state": new_state}
     if new_state == VideoTaskStateEnum.FAILED:
@@ -1616,6 +1634,60 @@ async def fetch_engine_status_updates(
         updates["error_type"] = status.get("error_type") or None
     elif status.get("status") == "processing":
         updates["state_message"] = None
+    updates.update(_progress_updates(task, status, new_state))
+    return updates
+
+
+def _progress_updates(
+    task: VideoGenerationTask, status: Dict[str, Any], new_state: VideoTaskStateEnum
+) -> Dict[str, Any]:
+    """Progress fields to fold into the row update (see
+    docs/视频任务进度上报-统一契约设计.md).
+
+    DONE persists 100 rather than leaving the last running value: §3.4 makes
+    ``progress`` 100 at ``done``, and ``_public`` is not the only reader —
+    ``VideoTaskPublic`` serializes these columns raw for the management list, so
+    a row left at 92.7 shows up there as "done · 92.7%".
+
+    FAILED/CANCELED deliberately keep whatever they reached: "died at 82% in
+    denoise" is the diagnostic, and the client treats terminal states as
+    complete regardless. No write throttling — ``updates`` always carries
+    ``state``, so the row is written on every poll regardless.
+    """
+    if new_state == VideoTaskStateEnum.DONE:
+        # phase is cleared: a finished job has no current stage.
+        return {"progress": 100.0, "phase": None}
+    if new_state != VideoTaskStateEnum.RUNNING:
+        return {}
+    now = datetime.now(timezone.utc)
+    updates: Dict[str, Any] = {}
+    # The estimate is anchored on the first poll that OBSERVES the task running,
+    # not on dispatch: the engine has its own queue, so a task can sit `pending`
+    # for minutes and anchoring at dispatch would over-report — the costlier
+    # failure (see the ceilings in video_progress). The anchor and the elapsed
+    # it feeds come from one variable so they cannot disagree; on the first poll
+    # that means elapsed=0, i.e. "just started", not "unknown".
+    started = task.run_started_at or now
+    if task.run_started_at is None:
+        updates["run_started_at"] = started
+    progress, phase, source = normalize_progress(
+        status,
+        kind=_engine_kind(task.task_type),
+        prior=task.progress,
+        elapsed=elapsed_seconds(started, now),
+        expected_seconds=_model_latency(
+            get_global_config(), task.model_name or "", task.task_type
+        ),
+    )
+    logger.debug(
+        "Task %s progress %.1f%% (phase=%s, source=%s)",
+        task.task_id,
+        progress,
+        phase,
+        source,
+    )
+    updates["progress"] = progress
+    updates["phase"] = phase
     return updates
 
 
@@ -1714,14 +1786,25 @@ async def cancel_video_task(task_id: str, request: Request, user: CurrentUserDep
 
 
 def _public(task: VideoGenerationTask) -> Dict[str, Any]:
-    """External contract: a stable public id, the lifecycle state, and the
-    internal ``nfs_path`` (new-api reads it directly off the shared mount)."""
+    """External contract: a stable public id, the lifecycle state, the internal
+    ``nfs_path`` (new-api reads it directly off the shared mount), and the
+    normalized progress.
+
+    ``progress`` is authoritative only alongside ``status``: DONE is 100 by
+    definition, and a failed job keeps whatever it had reached (the client marks
+    terminal jobs complete on its own). ``_progress_updates`` now persists the
+    100 on the DONE transition, so the coalesce below is a safety net for rows
+    that reached DONE before that (and for the pre-migration backfill).
+    """
+    done = task.state == VideoTaskStateEnum.DONE
     return {
         "task_id": task.task_id,
         "status": task.state.value if task.state else None,
         "model": task.model_name,
         "task_type": task.task_type,
-        "nfs_path": task.nfs_path if task.state == VideoTaskStateEnum.DONE else None,
+        "nfs_path": task.nfs_path if done else None,
         "error": task.state_message,
         "error_type": task.error_type,
+        "progress": 100.0 if done else round(task.progress or 0.0, 1),
+        "phase": task.phase,
     }

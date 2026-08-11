@@ -14,6 +14,7 @@ from gpustack.schemas.video_generation_task import (
 )
 from gpustack.server.db import async_session
 from gpustack.server.services import ModelInstanceService, WorkerService
+from gpustack.server.video_progress import ATTEMPT_RESET
 
 logger = logging.getLogger(__name__)
 
@@ -250,6 +251,9 @@ class VideoTaskSweeper:
                 "instance_id": None,
                 "native_task_id": None,
                 "state_message": state_message,
+                # The attempt died with its instance; its progress must not be
+                # inherited by the re-dispatch (step 3 of the same sweep).
+                **ATTEMPT_RESET,
             },
         )
         logger.info(

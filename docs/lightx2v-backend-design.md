@@ -331,7 +331,7 @@ flowchart TB
 核心是 **PG 异步队列**;**同步只是"提交+等待"的糖**。门面在 dispatcher 上,OpenAI 流量统一走队列/限流/亲和。
 
 **响应内容(GPUStack 无 OBS,§7.4)**:
-- `GET /v1/videos/{id}`(轮询):状态 + **自定义字段 `nfs_path`**(内网路径,new-api 直读用);
+- `GET /v1/videos/{id}`(轮询):状态 + **自定义字段 `nfs_path`**(内网路径,new-api 直读用)+ **进度 `progress`/`phase`**(跨引擎统一契约,引擎未适配时门面按时间估算兜底;见 [`视频任务进度上报-统一契约设计.md`](./视频任务进度上报-统一契约设计.md));
 - `GET /v1/videos/{id}/content`:**从 NFS 流式吐文件**(OpenAI/Sora 标准形态,体验区/标准客户端用);
 - `/v1/images/generations`(同步):读 NFS 回 **`b64_json`**。
 

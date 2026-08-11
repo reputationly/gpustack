@@ -58,6 +58,7 @@ COPY gpustack/api/exceptions.py                                              /tm
 COPY gpustack/config/config.py                                               /tmp/lx2v-overlay/config/config.py
 COPY gpustack/http_proxy/strategies.py                                       /tmp/lx2v-overlay/http_proxy/strategies.py
 COPY gpustack/migrations/versions/2026_07_05_2230-e1f2a3b4c5d6_add_video_generation_tasks.py /tmp/lx2v-overlay/migrations/versions/2026_07_05_2230-e1f2a3b4c5d6_add_video_generation_tasks.py
+COPY gpustack/migrations/versions/2026_08_11_1030-f3a1b2c4d5e7_add_video_task_progress.py     /tmp/lx2v-overlay/migrations/versions/2026_08_11_1030-f3a1b2c4d5e7_add_video_task_progress.py
 COPY gpustack/routes/routes.py                                               /tmp/lx2v-overlay/routes/routes.py
 COPY gpustack/routes/video_tasks.py                                          /tmp/lx2v-overlay/routes/video_tasks.py
 COPY gpustack/routes/videos.py                                               /tmp/lx2v-overlay/routes/videos.py
@@ -69,6 +70,7 @@ COPY gpustack/schemas/video_generation_task.py                               /tm
 COPY gpustack/server/server.py                                               /tmp/lx2v-overlay/server/server.py
 COPY gpustack/server/video_storage_janitor.py                                /tmp/lx2v-overlay/server/video_storage_janitor.py
 COPY gpustack/server/video_task_sweeper.py                                   /tmp/lx2v-overlay/server/video_task_sweeper.py
+COPY gpustack/server/video_progress.py                                       /tmp/lx2v-overlay/server/video_progress.py
 COPY gpustack/utils/config.py                                                /tmp/lx2v-overlay/utils/config.py
 # --- M5: built gpustack-ui dist (placeholder when building locally) ---
 COPY pack/ui-dist/ /tmp/lx2v-ui/
@@ -76,13 +78,17 @@ COPY pack/ui-dist/ /tmp/lx2v-ui/
 # Copy them onto the installed gpustack package (path detected at build time),
 # then byte-compile the new modules to fail fast on any import/syntax error.
 #
-# Migration chain fix-up: our repo's migration declares down_revision =
+# Migration chain fix-up: our repo's FIRST migration declares down_revision =
 # <fork HEAD's previous migration>, but the BASE image ships only the released
 # migration chain, which may not contain that revision (upstream-main
 # migrations that never made the release must NOT be copied in — their code
 # isn't in the image). So detect the base image's actual alembic head BEFORE
-# overlaying, then rewrite our migration's down_revision to it, and assert the
-# resulting chain resolves to our revision as the single head.
+# overlaying, then rewrite that migration's down_revision to it, and assert the
+# resulting chain resolves to our LAST revision as the single head.
+#
+# Only the chain ROOT (e1f2a3b4c5d6) is rewritten; our later migrations stay
+# chained to it. Adding one means: COPY it in above, and update the head
+# assertion below to its revision id.
 RUN set -eux; \
     GP_DIR="$(python3 -c 'import gpustack, os; print(os.path.dirname(gpustack.__file__))')"; \
     BASE_HEAD="$(python3 -c "from alembic.config import Config; from alembic.script import ScriptDirectory; c=Config(); c.set_main_option('script_location', '${GP_DIR}/migrations'); print(ScriptDirectory.from_config(c).get_current_head())")"; \
@@ -92,7 +98,7 @@ RUN set -eux; \
     MIG_FILE="${GP_DIR}/migrations/versions/2026_07_05_2230-e1f2a3b4c5d6_add_video_generation_tasks.py"; \
     sed -i "s/^down_revision: Union\[str, None\] = .*/down_revision: Union[str, None] = '${BASE_HEAD}'/" "${MIG_FILE}"; \
     grep -n "^down_revision" "${MIG_FILE}"; \
-    python3 -c "from alembic.config import Config; from alembic.script import ScriptDirectory; c=Config(); c.set_main_option('script_location', '${GP_DIR}/migrations'); h=ScriptDirectory.from_config(c).get_current_head(); assert h == 'e1f2a3b4c5d6', h; print('migration chain OK, head=' + h)"; \
+    python3 -c "from alembic.config import Config; from alembic.script import ScriptDirectory; c=Config(); c.set_main_option('script_location', '${GP_DIR}/migrations'); h=ScriptDirectory.from_config(c).get_current_head(); assert h == 'f3a1b2c4d5e7', h; print('migration chain OK, head=' + h)"; \
     python3 -m py_compile \
         "${GP_DIR}/worker/backends/lightx2v.py" \
         "${GP_DIR}/worker/backends/indextts.py" \
@@ -113,7 +119,9 @@ RUN set -eux; \
         "${GP_DIR}/schemas/video_generation_task.py" \
         "${GP_DIR}/server/video_task_sweeper.py" \
         "${GP_DIR}/server/video_storage_janitor.py" \
-        "${GP_DIR}/migrations/versions/2026_07_05_2230-e1f2a3b4c5d6_add_video_generation_tasks.py"; \
+        "${GP_DIR}/server/video_progress.py" \
+        "${GP_DIR}/migrations/versions/2026_07_05_2230-e1f2a3b4c5d6_add_video_generation_tasks.py" \
+        "${GP_DIR}/migrations/versions/2026_08_11_1030-f3a1b2c4d5e7_add_video_task_progress.py"; \
     python3 -c "from gpustack.schemas.models import BackendEnum, CategoryEnum; assert BackendEnum.LIGHTX2V and CategoryEnum.VIDEO; print('lx2v backend overlay OK')"; \
     python3 -c "from gpustack.schemas.models import BackendEnum; assert BackendEnum.INDEXTTS; print('indextts backend overlay OK')"; \
     python3 -c "from gpustack.schemas.models import BackendEnum, CategoryEnum; assert BackendEnum.ACESTEP and CategoryEnum.MUSIC; print('acestep backend + music category overlay OK')"; \

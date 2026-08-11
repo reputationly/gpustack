@@ -169,6 +169,19 @@ GET    /metrics                        → Prometheus（可选，launcher 代理
 
 状态字符串精确集合：`pending | processing | completed | failed | cancelled`（**cancelled 双 L**；门面映射 pending→ASSIGNED、processing→RUNNING、completed→DONE、failed→FAILED、cancelled→CANCELED 单 L，`gpustack/routes/videos.py:178-184`）。错一个字母 = 状态映射失效、任务假死。
 
+#### 4.1.1 进度上报（可选字段，强烈建议实现）
+
+`GET /v1/tasks/{task_id}/status` 可额外返回下列字段；不返回则门面按「时间估算」兜底，用户看到的进度条会停在固定档位。完整设计见 [`视频任务进度上报-统一契约设计.md`](./视频任务进度上报-统一契约设计.md)。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `progress` | float 0-100 | 引擎自行折算好的**全局**进度，优先级最高 |
+| `phase` | string | 受控词表：`prepare`(输入准备) / `encode`(条件编码) / `denoise`(采样) / `decode`(VAE 解码) / `save`(封装落盘) |
+| `phase_progress` | float 0-100 | 阶段内百分比 |
+| `step` / `total_steps` | int | 采样步计数，等价 `phase="denoise"` + `phase_progress`，最省事的接法 |
+
+**最小适配** = 在采样循环里报 `step/total_steps`。门面按阶段权重表折成全局 0-100（video 默认 prepare 8 / encode 12 / denoise 60 / decode 15 / save 5），并保证单调不倒退、运行中不到 100，引擎侧**不需要**自己处理这些。
+
 ### 4.2 请求体字段设计参考
 
 **LightX2V VideoTaskRequest**（`lightx2v/server/schema.py:75-88`，32 字段）核心：`prompt / negative_prompt / image_path / last_frame_path / image_mask_path / video_path / src_video / src_mask / src_ref_images(逗号分隔多图) / audio_path / save_result_path(默认 task_id) / seed(默认随机) / infer_steps / target_video_length / target_fps / target_shape / sr_ratio / video_duration / lora_name / lora_strength / resize_mode(adaptive 等 6 种)`。ImageTaskRequest 另加 `aspect_ratio="16:9"`、`i2i_denoise_strength`。

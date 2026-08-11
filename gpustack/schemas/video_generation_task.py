@@ -6,7 +6,7 @@ from sqlalchemy import JSON, Column, Text
 from sqlmodel import Field, SQLModel
 
 from gpustack.mixins import BaseModelMixin
-from gpustack.schemas.common import ListParams, PaginatedList
+from gpustack.schemas.common import ListParams, PaginatedList, UTCDateTime
 
 
 class VideoTaskStateEnum(str, Enum):
@@ -90,6 +90,22 @@ class VideoTaskBase(SQLModel):
     # transiently failed, consumes one). Capped by the sweeper's retry limit.
     retry_count: int = Field(default=0)
     error_type: Optional[str] = Field(default=None)
+
+    # Progress reporting (docs/视频任务进度上报-统一契约设计.md). ``progress`` is the
+    # normalized global 0-100 folded from whatever the engine reports (or, for
+    # engines that report nothing, estimated from elapsed time); ``phase`` is the
+    # controlled stage name behind it. Persisted because the fold is monotonic —
+    # it needs the previous value — and because it makes a running job's state
+    # visible to ops, not just to the polling client.
+    progress: float = Field(default=0)
+    phase: Optional[str] = Field(default=None)
+
+    # When the task first entered RUNNING. The elapsed-time estimate must NOT
+    # use ``updated_at``: every status poll writes the row, so that clock keeps
+    # resetting. ``created_at`` is wrong too — it includes the queue wait.
+    run_started_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(UTCDateTime(), nullable=True)
+    )
 
 
 class VideoGenerationTask(VideoTaskBase, BaseModelMixin, table=True):
