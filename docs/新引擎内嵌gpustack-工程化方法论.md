@@ -182,6 +182,8 @@ GET    /metrics                        → Prometheus（可选，launcher 代理
 
 **最小适配** = 在采样循环里报 `step/total_steps`。门面按阶段权重表折成全局 0-100（video 默认 prepare 8 / encode 12 / denoise 60 / decode 15 / save 5），并保证单调不倒退、运行中不到 100，引擎侧**不需要**自己处理这些。
 
+⚠️ **「已受理」≠「在跑」**：任务还在引擎内部队列里等的时候，状态必须是 `pending`，**不能**是 `processing`。门面一看到 `processing` 就起时间估算时钟，若把排队时段算进去，排在后面的任务等真正开跑时进度条早已顶到封顶并被单调性钉死——比不报进度更糟。照抄 `indextts/api_server/` 的 FIFO 写法天然合规（`start_task()` 取到任务才翻状态）；**若引擎是"受理即起协程、靠内部调度器串行执行"的形态（vLLM-Omni 就是），必须显式区分排队与执行**。
+
 ### 4.2 请求体字段设计参考
 
 **LightX2V VideoTaskRequest**（`lightx2v/server/schema.py:75-88`，32 字段）核心：`prompt / negative_prompt / image_path / last_frame_path / image_mask_path / video_path / src_video / src_mask / src_ref_images(逗号分隔多图) / audio_path / save_result_path(默认 task_id) / seed(默认随机) / infer_steps / target_video_length / target_fps / target_shape / sr_ratio / video_duration / lora_name / lora_strength / resize_mode(adaptive 等 6 种)`。ImageTaskRequest 另加 `aspect_ratio="16:9"`、`i2i_denoise_strength`。

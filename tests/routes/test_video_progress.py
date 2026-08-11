@@ -18,6 +18,8 @@ What is locked here is the behaviour a client actually notices:
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from gpustack.routes.videos import _progress_updates
 from gpustack.schemas.video_generation_task import (
     VideoGenerationTask,
@@ -191,8 +193,15 @@ def test_failure_and_cancellation_keep_the_progress_they_died_at():
         ), state
 
 
-def test_queued_reports_nothing():
-    assert _progress_updates(_task(), {}, VideoTaskStateEnum.QUEUED) == {}
+@pytest.mark.parametrize(
+    "state", [VideoTaskStateEnum.QUEUED, VideoTaskStateEnum.ASSIGNED]
+)
+def test_waiting_tasks_report_nothing(state):
+    # Both flavours of queueing — waiting for an instance (QUEUED) and waiting
+    # its turn inside the engine's own FIFO (ASSIGNED, engine says "pending") —
+    # leave the bar alone. The estimate clock must not tick through a queue wait;
+    # that is what would let a task hit the ceiling before doing any work.
+    assert _progress_updates(_task(), {}, state) == {}
 
 
 def test_first_running_poll_anchors_the_clock_and_folds_the_engine_payload():
