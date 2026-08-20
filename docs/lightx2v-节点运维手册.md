@@ -327,6 +327,32 @@ for n in $(seq 41 50); do printf 'gpu%-3s ' $n; ssh -n -o BatchMode=yes -o Stric
 > **2026-08-20 实测结果**:0041–0050 → 端口 43066–43075(这次恰好连号),内网 IP 依次
 > `10.0.0.230 / .77 / .41 / .121 / .87 / .80 / .176 / .66 / .63 / .25`,与 `lx2v-new.txt` 顺序一致。
 
+### 1.8 常量的唯一事实源(防手册与脚本漂移)
+
+手册正文为了可读写的是**具体值**,但这些值的权威定义在脚本顶部的"可调配置"段。**两边不一致时以脚本为准**,并回来改手册。
+
+`docs/scripts/lx2v-node.sh`:
+
+| 手册/命令里出现的值 | 脚本变量 |
+|---|---|
+| `http://10.0.0.238` | `SERVER_URL` |
+| `crpi-…cn-shanghai.personal.cr.aliyuncs.com/reputationly` | `REGISTRY` |
+| 六个镜像 tag(§0 清单) | `GPUSTACK_IMAGE` / `ENGINE_IMAGE` / `INDEXTTS_IMAGE` / `ACESTEP_IMAGE` / `BERNINI_IMAGE` / `VLLM_OMNI_IMAGE` |
+| `100.125.40.2` + `/share-LLM`、`/share-output` | `NFS_SERVER` / `NFS_MODELS_EXPORT` / `NFS_OUTPUT_EXPORT` |
+| `/nfs-models/_transfer/*.tar`、`nvidia-repo/` | `TRANSFER_DIR` + 各 `*_TAR`、`NVIDIA_REPO_DIR` |
+| `gpustack-worker`、`10150` | `WORKER_NAME` / `WORKER_PORT` |
+
+`docs/scripts/lx2v-fleet.sh`:
+
+| 值 | 脚本变量 |
+|---|---|
+| `/root/lx2v-nodes.txt`(默认清单) | `NODES_FILE`(`-f` 可覆盖) |
+| 默认并发 5 | `JOBS`(`-j` 可覆盖) |
+| `10.0.0.238`(自动排除的 manager) | `SELF_IP` |
+| `/nfs-models/_transfer/lx2v-node.sh` | `NFS_SCRIPT`(fleet 每次执行前从这里拉最新脚本) |
+
+**不在脚本里的**:跳板机 `111.172.214.16` 与各节点 NAT 端口、别名 `gpuNN` —— 唯一事实源是 Mac 的 `~/.ssh/config`(§1.7),脚本和集群都不知道它们的存在。238 的公网入口 `111.172.214.42` 同理。
+
 ---
 
 ## 2. 升级
