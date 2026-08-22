@@ -14,15 +14,21 @@
 #
 # Build (from repo root) and push to ACR:
 #   docker build -f pack/Dockerfile.acr \
-#     --build-arg BASE_IMAGE=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:latest \
+#     --build-arg BASE_IMAGE=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:v2.2.3 \
 #     -t crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:lx2v-dev .
 #   docker push crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:lx2v-dev
 #
 # NOTE on arch: server=x86, compute worker=arm64. This overlay is arch-agnostic
 # (pure .py), but build it for each arch you deploy to (or build multi-arch with
 # buildx) so the base layers match the target node.
+#
+# NOTE on BASE_IMAGE: pin it to the SAME upstream release this repo is merged up
+# to (currently v2.2.3), never a floating :latest. The overlay whole-file
+# overwrites ~38 modules; if the base is a different release those files silently
+# downgrade half the image while the rest stays newer. Sync the base first:
+#   SRC=quay.io/gpustack/gpustack:v2.2.3 ./hack/sync-image-to-acr.sh v2.2.3
 
-ARG BASE_IMAGE=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:latest
+ARG BASE_IMAGE=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:v2.2.3
 FROM ${BASE_IMAGE}
 
 # Stage the changed files, preserving their package-relative paths.
@@ -35,7 +41,11 @@ COPY gpustack/worker/model_meta.py                                           /tm
 COPY gpustack/worker/runtime_metrics_aggregator.py                           /tmp/lx2v-overlay/worker/runtime_metrics_aggregator.py
 COPY gpustack/policies/candidate_selectors/lightx2v_resource_fit_selector.py /tmp/lx2v-overlay/policies/candidate_selectors/lightx2v_resource_fit_selector.py
 COPY gpustack/scheduler/scheduler.py                                         /tmp/lx2v-overlay/scheduler/scheduler.py
-COPY gpustack/scheduler/evaluator.py                                         /tmp/lx2v-overlay/scheduler/evaluator.py
+# NOTE: scheduler/evaluator.py is deliberately NOT overlaid. Our fork used to
+# patch evaluate_runtime_version() to skip the runner runtime-version matrix for
+# the five self-contained built-in backends; upstream 3b2d50c6 (in v2.2.3)
+# deleted that check outright, so our file is now byte-identical to the base
+# image's. Overlaying it would only risk reverting future upstream fixes.
 # --- IndexTTS built-in backend (TTS) ---
 COPY gpustack/worker/backends/indextts.py                                    /tmp/lx2v-overlay/worker/backends/indextts.py
 COPY gpustack/policies/candidate_selectors/indextts_resource_fit_selector.py /tmp/lx2v-overlay/policies/candidate_selectors/indextts_resource_fit_selector.py
@@ -68,6 +78,12 @@ COPY gpustack/schemas/model_usage.py                                         /tm
 COPY gpustack/schemas/model_routes.py                                        /tmp/lx2v-overlay/schemas/model_routes.py
 COPY gpustack/schemas/video_generation_task.py                               /tmp/lx2v-overlay/schemas/video_generation_task.py
 COPY gpustack/server/server.py                                               /tmp/lx2v-overlay/server/server.py
+# InferenceBackendController.  Carries the common_parameters backfill added in
+# 2b524710 (LightX2V UI param hints): built-in seeding is create-only, so
+# pre-existing backend rows never receive hints added in a later release. This
+# file was changed in the repo but MISSING from this list until the v2.2.3
+# merge, so the backfill had never actually shipped.
+COPY gpustack/server/controllers.py                                          /tmp/lx2v-overlay/server/controllers.py
 COPY gpustack/server/video_storage_janitor.py                                /tmp/lx2v-overlay/server/video_storage_janitor.py
 COPY gpustack/server/video_task_sweeper.py                                   /tmp/lx2v-overlay/server/video_task_sweeper.py
 COPY gpustack/server/video_progress.py                                       /tmp/lx2v-overlay/server/video_progress.py

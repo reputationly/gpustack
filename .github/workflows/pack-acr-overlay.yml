@@ -20,8 +20,8 @@ on:
   workflow_dispatch:
     inputs:
       base_image:
-        description: 'Base GPUStack image (multi-arch, already in ACR)'
-        default: 'crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:latest'
+        description: 'Base GPUStack image (multi-arch, already in ACR). Pin to the upstream release this repo is merged up to — NOT :latest.'
+        default: 'crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:v2.2.3'
         required: true
       dest_tag:
         description: 'Floating ACR tag to publish'
@@ -45,6 +45,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # The overlay whole-file overwrites the base image's modules, so a file we
+      # changed but forgot to list never ships, and a file we list but no longer
+      # change reverts upstream's fixes to it. Gate the build on the list being
+      # exactly the delta against the pinned upstream release.
+      - name: Check overlay COPY list matches the upstream delta
+        run: |
+          git fetch --no-tags --depth=1 https://github.com/gpustack/gpustack.git \
+            "refs/tags/$(sed -n 's/^UPSTREAM_BASE=//p' hack/upstream-base.env):refs/tags/$(sed -n 's/^UPSTREAM_BASE=//p' hack/upstream-base.env)"
+          bash hack/check-overlay-list.sh
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v5

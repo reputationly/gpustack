@@ -94,20 +94,26 @@ def upgrade() -> None:
     op.create_index(f'ix_{TABLE}_instance_id', TABLE, ['instance_id'], unique=False)
 
     # Extend operationenum so the usage middleware can record /v1/videos
-    # submissions. Same guarded-ALTER pattern as 2024_12_26 (e6bf9e067296);
-    # non-PG dialects store the enum as VARCHAR and need no DDL.
+    # submissions. Non-PG dialects store the enum as VARCHAR and need no DDL.
+    #
+    # NOT the enum_range() guard used by 2024_12_26 (e6bf9e067296): on a fresh
+    # install every migration runs in one transaction, and enum_range() *reads*
+    # operationenum, whose AUDIO_TRANSCRIPTION value was added by an earlier
+    # ALTER TYPE in that same transaction. PostgreSQL <= 16 rejects that with
+    # UnsafeNewEnumValueUsage; PG 17 exempts types created in the transaction
+    # (which is why the bundled PG 17 never hit it, but an external PG 16 would
+    # fail to install from scratch — reproduced 2026-08-23).
+    #
+    # ADD VALUE IF NOT EXISTS is idempotent and never reads the type, so it is
+    # safe on every supported version. Requires PG >= 12 to run inside a
+    # transaction block, which the previous ALTER already required.
     conn = op.get_bind()
     if conn.dialect.name == 'postgresql':
-        existing = [
-            row[0]
-            for row in conn.execute(
-                sa.text("SELECT unnest(enum_range(NULL::operationenum))::text")
-            ).fetchall()
-        ]
-        if 'VIDEO_GENERATION' not in existing:
-            conn.execute(
-                sa.text("ALTER TYPE operationenum ADD VALUE 'VIDEO_GENERATION'")
+        conn.execute(
+            sa.text(
+                "ALTER TYPE operationenum ADD VALUE IF NOT EXISTS 'VIDEO_GENERATION'"
             )
+        )
 
 
 def downgrade() -> None:
