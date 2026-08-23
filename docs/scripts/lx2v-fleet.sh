@@ -46,8 +46,27 @@ done
 [ -f "$NODES_FILE" ] || { echo "✗ 节点清单不存在: $NODES_FILE(一行一个内网 IP)"; exit 2; }
 
 # 读清单:去注释/空行,取每行第一列(容忍 "ip 备注"),排除 manager 自身
-mapfile -t NODES < <(grep -vE '^[[:space:]]*(#|$)' "$NODES_FILE" | awk '{print $1}' | grep -vx "$SELF_IP")
-[ "${#NODES[@]}" -gt 0 ] || { echo "✗ 清单里没有可用节点(全被注释/为空/只剩 manager)"; exit 2; }
+mapfile -t RAW_NODES < <(grep -vE '^[[:space:]]*(#|$)' "$NODES_FILE" | awk '{print $1}' | grep -vx "$SELF_IP")
+[ "${#RAW_NODES[@]}" -gt 0 ] || { echo "✗ 清单里没有可用节点(全被注释/为空/只剩 manager)"; exit 2; }
+
+# 查重。重复本身不致命(同一台跑两遍是幂等的),要报出来是因为它通常是**漏机器**的信号:
+# 往清单尾部追加一批新节点时,若有几行误填成了已有 IP,总行数看着对、执行台数对、
+# FAIL=0 也对 —— 三个数字全正常,却少覆盖了同样数量的节点。2026-08-23 的 lightx2v
+# 引擎升级就这么漏了 5 台(清单 50 行/45 唯一,10.0.0.51/53/57/90/94 从未被派活),
+# 直到超分任务落到未升级的节点上跑出 6 倍耗时才被发现。
+mapfile -t DUP_NODES < <(printf '%s\n' "${RAW_NODES[@]}" | sort | uniq -d)
+if [ "${#DUP_NODES[@]}" -gt 0 ]; then
+  echo "⚠ 节点清单有重复($NODES_FILE):"
+  for d in "${DUP_NODES[@]}"; do
+    cnt=$(printf '%s\n' "${RAW_NODES[@]}" | grep -cx "$d")
+    lines=$(grep -nE "^[[:space:]]*${d//./\\.}([[:space:]]|$)" "$NODES_FILE" | cut -d: -f1 | paste -sd, -)
+    echo "    $d ×${cnt}  (行 ${lines:-?})"
+  done
+  echo "    → 已自动去重继续执行;但请核对清单:若它本应覆盖更多节点,多半是有行被误写成了已有 IP"
+fi
+
+# 去重,保留首次出现的顺序(不用 sort -u,以免打乱清单里有意安排的执行次序)
+mapfile -t NODES < <(printf '%s\n' "${RAW_NODES[@]}" | awk '!seen[$0]++')
 
 # 把 manager 上的 lx2v-node.sh 同步到 NFS,保证各节点拉到的是最新版
 if [ -f "$LOCAL_SCRIPT" ]; then
@@ -63,7 +82,9 @@ mkdir -p "$LOG_DIR"; rm -f "$LOG_DIR"/*.status 2>/dev/null || true
 QUOTED_ARGS=$(printf '%q ' "${ARGS[@]}")
 REMOTE_CMD="set -e; cp $NFS_SCRIPT /root/lx2v-node.sh; chmod +x /root/lx2v-node.sh; exec bash /root/lx2v-node.sh ${QUOTED_ARGS}"
 
-echo "==> 目标 ${#NODES[@]} 台 · 并发 ${JOBS} · 命令: lx2v-node.sh ${ARGS[*]}"
+DEDUP_NOTE=""
+[ "${#DUP_NODES[@]}" -gt 0 ] && DEDUP_NOTE="(清单 ${#RAW_NODES[@]} 行,去重后 ${#NODES[@]})"
+echo "==> 目标 ${#NODES[@]} 台 ${DEDUP_NOTE}· 并发 ${JOBS} · 命令: lx2v-node.sh ${ARGS[*]}"
 echo "    日志目录: $LOG_DIR/<ip>.log"
 
 run_one() { # run_one <ip> —— 后台任务,继承本 shell 的 SSH_OPTS/REMOTE_CMD 数组与变量
