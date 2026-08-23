@@ -20,7 +20,7 @@ against the worker-side ``Instance`` CR. State machine:
         - /delete ─► Deleting (cleanup)
 
     /delete works from **any** phase and is sticky: the controller's
-    ``_set_status`` refuses to overwrite a row that already reads
+    ``_write_status`` refuses to overwrite a row that already reads
     Deleting, so an in-flight Stopping/Starting reconcile cannot
     resurrect it.
 
@@ -45,11 +45,13 @@ from gpustack.api.exceptions import (
 from gpustack.api.tenant import (
     bypass_tenant_filter,
     TenantContext,
+    assert_cluster_visible,
     assert_org_owned_writable,
     validate_owner_principal,
 )
 from gpustack.gpu_instances import validate_k8s_object_name
 from gpustack.routes.gpu_instance_persistent_volumes import resolve_pv_type_for_ctx
+from gpustack.schemas.clusters import Cluster
 
 from gpustack.schemas import (
     GPUInstance,
@@ -60,7 +62,13 @@ from gpustack.schemas import (
     GPUInstancesPublic,
     GPUInstanceCreate,
 )
-from gpustack.schemas.gpu_instances import GPUInstancePhase, GPUInstanceStatus
+from gpustack.schemas.gpu_instances import (
+    FAILED_PHASES,
+    INTERRUPTED_PHASES,
+    TRANSITIONING_PHASES,
+    GPUInstancePhase,
+    GPUInstanceStatus,
+)
 from gpustack.schemas.principals import platform_principal_id
 from gpustack.server.db import async_session
 from gpustack.server.deps import SessionDep, TenantContextDep
@@ -138,6 +146,19 @@ async def create_gpu_instance(
         resource_label="GPU instance",
         allow_member=True,
     )
+
+    # A GPU instance is a workload, not org-owned infrastructure: it may run
+    # on any cluster the caller can see — one owned by the instance's Org, or
+    # one shared via cluster_access (e.g. the Default-Org cluster granted to
+    # every authenticated user for usage). Cluster ownership is the model-level
+    # rule; a workload only requires visibility. A cluster the caller can't see
+    # is a 404, so cross-tenant cluster ids can't be probed or targeted.
+    if create_obj.cluster_id is not None:
+        not_found = f"Cluster {create_obj.cluster_id} not found"
+        cluster = await Cluster.one_by_id(session, create_obj.cluster_id)
+        assert_cluster_visible(ctx, cluster, not_found_message=not_found)
+        if cluster.deleted_at is not None:
+            raise NotFoundException(message=not_found)
 
     persistent_volume_id = await _validate_create_obj(session, ctx, create_obj)
 
@@ -341,11 +362,11 @@ async def _validate_create_obj(
                 "name": volume.persistent.name,
             },
         )
-        if pv is None:
+        if pv is None or pv.is_deleting():
             raise InvalidException(
                 message=(
                     f"GPU instance persistent volume "
-                    f"'{volume.persistent.name}' not found"
+                    f"'{volume.persistent.name}' not found or is being deleted"
                 ),
             )
         return pv.id
@@ -372,11 +393,11 @@ async def _validate_create_obj(
             owner_principal_id=create_obj.owner_principal_id,
             name=template.spec.type_,
         )
-        if pvt is None:
+        if pvt is None or pvt.is_deleting():
             raise InvalidException(
                 message=(
                     f"GPU instance persistent volume type "
-                    f"'{template.spec.type_}' not found"
+                    f"'{template.spec.type_}' not found or is being deleted"
                 ),
             )
 
@@ -443,44 +464,30 @@ def _build_update_source(
 
 
 def _build_update_phase_source(existing_obj: GPUInstance, phase: str) -> dict:
-    """Stamp ``phase`` onto status, resetting ``count`` and ``phase_message``
-    so the controller restarts its backoff from zero on the new phase."""
+    """Stamp ``phase`` onto status, clearing ``phase_message`` so the new phase
+    starts clean."""
     base = existing_obj.status or GPUInstanceStatus()
     return {
         "status": base.model_copy(
             update={
                 "phase": phase,
                 "phase_message": None,
-                "count": 0,
             },
         ),
     }
 
 
-# Source-phase gates for each lifecycle action. /delete has no gate
-# (allowed from any phase, including ``None`` pre-create).
-_FAILED_PHASES = frozenset(
-    {
-        GPUInstancePhase.CREATE_FAILED,
-        GPUInstancePhase.SSH_KEY_CREATE_FAILED,
-        GPUInstancePhase.PV_TYPE_CREATE_FAILED,
-        GPUInstancePhase.PV_CREATE_FAILED,
-        GPUInstancePhase.INITIALIZE_FAILED,
-    }
-)
-_STOP_DISALLOWED_FROM = (
-    frozenset(
-        {
-            GPUInstancePhase.DELETING,
-            GPUInstancePhase.STOPPING,
-            GPUInstancePhase.STOPPED,
-            GPUInstancePhase.STARTING,
-            GPUInstancePhase.NOT_READY,
-        }
-    )
-    | _FAILED_PHASES
-)
-_START_ALLOWED_FROM = frozenset({GPUInstancePhase.STOPPED})
+# Source-phase gates for each lifecycle action. /delete has no gate (allowed
+# from any phase, including ``None`` pre-create). The phase categories these
+# compose from (``TRANSITIONING_PHASES`` / ``INTERRUPTED_PHASES`` /
+# ``FAILED_PHASES``) are owned by the schema.
+#
+# Stop is allowed only from a settled, running phase: disallow it while the
+# instance is transitioning, interrupted, or failed (``None`` pre-create is
+# rejected at the call site).
+_STOP_DISALLOWED_FROM = TRANSITIONING_PHASES | INTERRUPTED_PHASES | FAILED_PHASES
+# Start resumes an interrupted (Stopped) instance.
+_START_ALLOWED_FROM = INTERRUPTED_PHASES
 
 
 async def _transition_to_phase(

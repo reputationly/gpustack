@@ -27,7 +27,6 @@ from gpustack.gateway.client import (
     McpBridgeSpec,
     McpBridgeRegistry,
     WasmPluginSpec,
-    WasmPluginMatchRule,
 )
 from gpustack.gateway.labels_annotations import managed_labels, match_labels
 from gpustack.gateway.utils import (
@@ -43,6 +42,7 @@ from gpustack.gateway.utils import (
     router_header_key,
     gpustack_original_path_header,
     gpustack_fallback_path_header,
+    model_route_ingress_prefix,
 )
 from gpustack.gateway.plugins import (
     get_plugin_url_with_name_and_version,
@@ -295,20 +295,17 @@ def ext_auth_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
     resource_name = "gpustack-llm-ext-auth"
     registry = get_gpustack_higress_registry(cfg=cfg)
 
-    # this is to auth requests except for gpustack
+    # auth every path on the matched route
     default_match_rule = get_match_rules(
         match_type="blacklist",
-        paths=[("/", "prefix")],
-    )
-    gpustack_match_rule = get_match_rules(
-        match_type="whitelist",
         paths=[("/", "prefix")],
     )
 
     http_service = {
         "authorization_request": {
             "allowed_headers": [
-                {"exact": "X-GPUStack-Real-IP"},
+                {"exact": "X-Real-IP"},
+                {"exact": "X-Forwarded-For"},
                 {"exact": "x-higress-llm-model"},
                 {"exact": "x-api-key"},
                 {"exact": "cookie"},
@@ -336,16 +333,37 @@ def ext_auth_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
         "endpoint_mode": "forward_auth",
         "timeout": envs.HIGRESS_EXT_AUTH_TIMEOUT_MS,
     }
+    # Scope ext-auth to gpustack's own inference routes by route-name prefix,
+    # so unrelated traffic on a shared Higress gateway is never authenticated.
+    #
+    # gpustack model-route ingresses are named ``ai-route-route-<id>.internal``
+    # (and ``ai-route-route-<id>.fallback.internal`` for fallbacks), both of
+    # which share the ``ai-route-route-`` prefix. Other routes -- the gpustack
+    # control-plane mirror ingress, and any other tenant sharing the gateway --
+    # do not match this prefix, so the ext-auth matcher returns nil for them and
+    # the request passes through unauthenticated. This replaces the previous
+    # "global blacklist + ingress whitelist" shape and needs no hostname.
+    #
+    # Higress route names carry a ``<namespace>/`` prefix when the gpustack
+    # ingresses live in a different namespace than the gateway; mirror the
+    # ``service_namespace_prefix`` convention used elsewhere so the match still
+    # works cross-namespace (otherwise the prefix would not match and inference
+    # APIs would be left unauthenticated under FAIL_OPEN).
     namespace = cfg.get_namespace()
-    if namespace == cfg.gateway_namespace:
-        namespace = ""
-    # the ingress in plugin matchRules should not contains namespace prefix
-    # if it is in the same namespace with the gateway.
-    ingress_name = f"{namespace}/{envs.GATEWAY_MIRROR_INGRESS_NAME}".lstrip("/")
+    service_namespace_prefix = (
+        f"{namespace}/" if namespace and namespace != cfg.gateway_namespace else ""
+    )
+    route_prefix = f"{service_namespace_prefix}{model_route_ingress_prefix}"
+
     expected_spec = WasmPluginSpec(
         defaultConfig={
-            "http_service": http_service,
-            **default_match_rule,
+            "_rules_": [
+                {
+                    "_match_route_prefix_": [route_prefix],
+                    "http_service": http_service,
+                    **default_match_rule,
+                }
+            ],
         },
         defaultConfigDisable=False,
         failStrategy="FAIL_OPEN",
@@ -354,16 +372,6 @@ def ext_auth_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
         url=get_plugin_url_with_name_and_version(
             name="ext-auth", version="2.0.0", cfg=cfg
         ),
-        matchRules=[
-            WasmPluginMatchRule(
-                config={
-                    "http_service": http_service,
-                    **gpustack_match_rule,
-                },
-                configDisable=False,
-                ingress=[ingress_name],
-            )
-        ],
     )
     return resource_name, expected_spec
 
@@ -414,7 +422,7 @@ def model_pre_route_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
         phase="AUTHN",
         priority=90,
         url=get_plugin_url_with_name_and_version(
-            name="gpustack-set-header-pre-route", version="1.0.0", cfg=cfg
+            name="gpustack-set-header-pre-route", version="1.0.1", cfg=cfg
         ),
     )
     return resource_name, expected_spec
@@ -425,7 +433,7 @@ def model_mapper_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
         phase="AUTHN",
         priority=800,
         url=get_plugin_url_with_name_and_version(
-            name="gpustack-model-mapper", version="1.0.0", cfg=cfg
+            name="gpustack-model-mapper", version="1.0.1", cfg=cfg
         ),
         defaultConfigDisable=False,
         defaultConfig={"modelMapping": {}},
@@ -601,7 +609,7 @@ def generic_proxy_router_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
         phase="AUTHN",
         priority=900,
         url=get_plugin_url_with_name_and_version(
-            name="gpustack-generic-proxy-router", version="1.0.0", cfg=cfg
+            name="gpustack-generic-proxy-router", version="1.0.1", cfg=cfg
         ),
     )
     return resource_name, expected_spec
@@ -612,7 +620,6 @@ def token_usage_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
     resource_name = "gpustack-token-usage"
     expected_spec = WasmPluginSpec(
         defaultConfig={
-            'realIPToHeader': "X-GPUStack-Real-IP",
             'endpoint': {
                 "path": "/v2/usage/gateway-metrics",
                 "service_name": registry.get_service_name(),
@@ -629,7 +636,7 @@ def token_usage_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
         phase="UNSPECIFIED_PHASE",
         priority=400,
         url=get_plugin_url_with_name_and_version(
-            name="gpustack-token-usage", version="1.1.0", cfg=cfg
+            name="gpustack-token-usage", version="1.1.1", cfg=cfg
         ),
     )
     return resource_name, expected_spec
@@ -646,7 +653,7 @@ def ai_proxy_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
         priority=100,
         phase="UNSPECIFIED_PHASE",
         url=get_plugin_url_with_name_and_version(
-            name="ai-proxy", version="2.0.0", cfg=cfg
+            name="gpustack-ai-proxy", version="2.0.0-patched", cfg=cfg
         ),
     )
     return resource_name, expected_spec

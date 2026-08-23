@@ -8,12 +8,12 @@ from sqlmodel import select
 
 from gpustack.api.exceptions import (
     AlreadyExistsException,
-    ForbiddenException,
     InternalServerErrorException,
     InvalidException,
     NotFoundException,
 )
 from gpustack.security import API_KEY_PREFIX, get_secret_hash, get_key_pair
+from gpustack.server.db import async_session
 from gpustack.server.deps import SessionDep, TenantContextDep
 from gpustack.schemas.api_keys import (
     ApiKey,
@@ -107,7 +107,6 @@ def _api_key_list_fields(ctx, user_id: Optional[str]) -> dict:
 
 @router.get("", response_model=ApiKeysPublic)
 async def get_api_keys(
-    session: SessionDep,
     ctx: TenantContextDep,
     params: ApiKeyListParams = Depends(),
     user_id: Optional[str] = Query(
@@ -141,20 +140,21 @@ async def get_api_keys(
             media_type="text/event-stream",
         )
 
-    result = await ApiKey.paginated_by_query(
-        session=session,
-        fields=fields,
-        fuzzy_fields=fuzzy_fields,
-        extra_conditions=extra_conditions,
-        page=params.page,
-        per_page=params.perPage,
-        order_by=params.order_by,
-        options=[selectinload(ApiKey.user)],
-    )
+    async with async_session() as session:
+        result = await ApiKey.paginated_by_query(
+            session=session,
+            fields=fields,
+            fuzzy_fields=fuzzy_fields,
+            extra_conditions=extra_conditions,
+            page=params.page,
+            per_page=params.perPage,
+            order_by=params.order_by,
+            options=[selectinload(ApiKey.user)],
+        )
 
-    # Convert ApiKey to ApiKeyPublic
-    items = [_api_key_to_public(item) for item in result.items]
-    result.items = items
+        # Convert ApiKey to ApiKeyPublic
+        items = [_api_key_to_public(item) for item in result.items]
+        result.items = items
     return result
 
 
@@ -163,11 +163,15 @@ async def create_api_key(
     session: SessionDep, ctx: TenantContextDep, key_in: ApiKeyCreate
 ):
     user = ctx.user
-    target_org_id = ctx.target_principal_id_for_write()
-    if target_org_id is None:
-        raise ForbiddenException(
-            message="Organization context is required to create an API key"
-        )
+    # Admin "All" mode (no Org context) creates an untenant-pinned key:
+    # ``owner_principal_id`` stays NULL so ``_resolve_requested_principal_id``
+    # falls through to user-based resolution on each request and admin
+    # gets the same cross-principal ``bypass_tenant_filter`` reach as
+    # their cookie session. For every other caller — Org act-as, Org
+    # member, personal scope — ``current_principal_id`` is already
+    # non-NULL by ``_resolve_requested_principal_id`` design and pins
+    # the key to that principal.
+    target_org_id = ctx.current_principal_id
     fields = {
         "user_id": user.id,
         "owner_principal_id": target_org_id,

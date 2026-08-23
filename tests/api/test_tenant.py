@@ -7,7 +7,7 @@ import pytest
 from gpustack.api.exceptions import ForbiddenException, InvalidException
 from gpustack.api.tenant import (
     _resolve_requested_principal_id,
-    get_tenant_context,
+    resolve_tenant_context,
     require_org_role,
     require_platform_admin,
 )
@@ -102,6 +102,28 @@ def test_resolve_principal_id_prefers_api_key():
     assert _resolve_requested_principal_id(request, user, "999") == 42
 
 
+def test_resolve_principal_id_null_owner_key_falls_through_for_admin():
+    """An admin-created ``All`` mode key carries ``owner_principal_id=None``
+    (no tenant pinning). The resolver must fall through to the
+    user-based path so admin lands at ``current_principal_id=None``
+    and ``bypass_tenant_filter`` triggers — same reach as the admin
+    cookie session."""
+    user = _user(id=1, is_admin=True)
+    request = _request(api_key=_api_key(owner_principal_id=None))
+    assert _resolve_requested_principal_id(request, user, None) is None
+
+
+def test_resolve_principal_id_null_owner_key_falls_through_for_non_admin():
+    """If a NULL-owner key were somehow tied to a non-admin user
+    (e.g. demoted after key creation), the fall-through resolves to
+    their USER-principal id — personal scope — not None / bypass.
+    Guards against accidental cross-tenant reach when admin loses
+    their flag."""
+    user = _user(id=7, is_admin=False)
+    request = _request(api_key=_api_key(owner_principal_id=None))
+    assert _resolve_requested_principal_id(request, user, None) == 7
+
+
 def test_resolve_principal_id_uses_header_when_no_api_key():
     user = _user(id=1)
     request = _request()
@@ -130,7 +152,7 @@ async def test_platform_admin_without_header_has_no_org_filter():
     request = _request()
     session = _session_returning()  # no DB calls expected
 
-    ctx = await get_tenant_context(
+    ctx = await resolve_tenant_context(
         request=request,
         session=session,
         user=user,
@@ -155,7 +177,7 @@ async def test_member_uses_team_org_via_header():
         _principal(id=5, kind=PrincipalType.ORG),  # org existence check
     )
 
-    ctx = await get_tenant_context(
+    ctx = await resolve_tenant_context(
         request=request,
         session=session,
         user=user,
@@ -185,7 +207,7 @@ async def test_member_inherits_role_via_group_membership():
         _principal(id=5, kind=PrincipalType.ORG),
     )
 
-    ctx = await get_tenant_context(
+    ctx = await resolve_tenant_context(
         request=request,
         session=session,
         user=user,
@@ -208,7 +230,7 @@ async def test_personal_scope_short_circuits():
         _cluster_rows(),  # _accessible_clusters
     )
 
-    ctx = await get_tenant_context(
+    ctx = await resolve_tenant_context(
         request=request,
         session=session,
         user=user,
@@ -228,7 +250,7 @@ async def test_non_member_request_to_other_org_is_rejected():
     session = _session_returning([])  # union: no membership at all
 
     with pytest.raises(ForbiddenException):
-        await get_tenant_context(
+        await resolve_tenant_context(
             request=request,
             session=session,
             user=user,
@@ -247,7 +269,7 @@ async def test_platform_admin_can_act_in_org_without_membership():
         _principal(id=7, kind=PrincipalType.ORG),
     )
 
-    ctx = await get_tenant_context(
+    ctx = await resolve_tenant_context(
         request=request,
         session=session,
         user=user,
@@ -270,7 +292,7 @@ async def test_api_key_overrides_header():
         _principal(id=42, kind=PrincipalType.ORG),
     )
 
-    ctx = await get_tenant_context(
+    ctx = await resolve_tenant_context(
         request=request,
         session=session,
         user=user,

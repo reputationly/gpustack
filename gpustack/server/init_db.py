@@ -2,6 +2,7 @@ import asyncio
 import logging
 import threading
 import time
+import traceback
 import re
 from urllib.parse import urlparse, parse_qs, urlunparse
 from sqlalchemy.ext.asyncio import (
@@ -13,6 +14,7 @@ from sqlalchemy import DDL, event, text
 
 from gpustack import envs
 from gpustack.server import db
+from gpustack.utils.db import is_opengauss
 from gpustack.schemas.api_keys import ApiKey
 from gpustack.schemas.inference_backend import InferenceBackend
 from gpustack.schemas.model_usage import ModelUsage
@@ -73,6 +75,11 @@ async def init_db(db_url: str):
 async def init_db_engine(db_url: str):
     connect_args = {}
     if db_url.startswith("postgresql://"):
+        # Probe once to see whether we're talking to openGauss — it presents
+        # as PostgreSQL but rejects PG's millisecond-scale value for
+        # ``idle_in_transaction_session_timeout``. Skip the setting on openGauss.
+        opengauss = await is_opengauss(db_url)
+
         db_url = re.sub(r'^postgresql://', 'postgresql+asyncpg://', db_url)
         parsed = urlparse(db_url)
         # rewrite the parameters to use asyncpg with custom database schema
@@ -83,8 +90,15 @@ async def init_db_engine(db_url: str):
             option = qoptions[0]
             if option.startswith('-csearch_path='):
                 schema_name = option[len('-csearch_path=') :]
+        server_settings = {}
         if schema_name:
-            connect_args['server_settings'] = {'search_path': schema_name}
+            server_settings['search_path'] = schema_name
+        if not opengauss and envs.DB_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_SECONDS > 0:
+            server_settings['idle_in_transaction_session_timeout'] = str(
+                envs.DB_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_SECONDS * 1000
+            )
+        if server_settings:
+            connect_args['server_settings'] = server_settings
         new_parsed = parsed._replace(query={})
         db_url = urlunparse(new_parsed)
 
@@ -186,6 +200,37 @@ def listen_events(engine: AsyncEngine):
 def count_query(conn, cursor, statement, parameters, context, executemany):
     """Increment the global query counter for each query executed."""
     increment_query_count_sync()
+    _maybe_trace_sql(statement)
+
+
+# Distinct call sites already logged, so a query that fires thousands of times
+# is attributed once per caller rather than flooding the log.
+_traced_call_sites = set()
+
+
+def _maybe_trace_sql(statement: str):
+    """When GPUSTACK_DB_TRACE_SQL_SUBSTR matches ``statement``, log the Python
+    call stack once per distinct call site. Used to attribute a high-frequency
+    query seen in DB_ECHO to the code that issues it."""
+    substr = envs.DB_TRACE_SQL_SUBSTR
+    if not substr or substr not in statement:
+        return
+    stack = traceback.extract_stack()
+    frames = [
+        f
+        for f in stack
+        if "/gpustack/" in f.filename and "server/init_db.py" not in f.filename
+    ][-8:]
+    sig = tuple((f.filename, f.lineno) for f in frames)
+    if sig in _traced_call_sites:
+        return
+    _traced_call_sites.add(sig)
+    logger.info(
+        "[DB TRACE] matched %r; new call site:\n%s\nSQL: %s",
+        substr,
+        "".join(traceback.format_list(frames)),
+        statement,
+    )
 
 
 def setup_sqlite_pragmas(conn, record):
