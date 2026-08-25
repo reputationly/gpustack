@@ -5,11 +5,12 @@
 #   ./lx2v-node.sh setup-base                        # 全新节点只配基础环境(docker/NFS/toolkit),不入集群
 #   ./lx2v-node.sh install --token <GPUSTACK_TOKEN> [--worker-ip <IP>] [--offline] [--clean-residue] [--force]
 #   ./lx2v-node.sh upgrade-gpustack [--offline]     # 换 gpustack:lx2v-dev 并原参数重启 worker
-#   ./lx2v-node.sh upgrade-engine   [--engine lightx2v|indextts|acestep|vllm-omni|bernini] [--offline]
+#   ./lx2v-node.sh upgrade-engine   [--engine lightx2v|acestep|vllm-omni] [--offline]
 #                                                    # 换引擎镜像(默认 lightx2v;实例需重建才生效)
+#                                                    # indextts/bernini 已下线,不再默认分发,但 --engine 仍可手动指定
 #   ./lx2v-node.sh clean [--purge-data] [--kill-gpu-procs]   # 清理卸载残留(见下)
 #   ./lx2v-node.sh status                            # 节点健康速览
-#   ./lx2v-node.sh prepare-transfer                  # (238/有 ACR 外网的机器)拉六镜像(gpustack/lightx2v/indextts2/acestep/vllm-omni/bernini)存 NFS tar
+#   ./lx2v-node.sh prepare-transfer                  # (238/有 ACR 外网的机器)拉四镜像(gpustack/lightx2v/acestep/vllm-omni)存 NFS tar
 #
 # 残留环境(装过 GPUStack 又卸载/被清理过的节点):
 #   install 自带残留检测——异 token 的旧 worker 自动移除重建,同 token(同集群)需加 --force;
@@ -35,8 +36,9 @@ set -Eeuo pipefail
 REGISTRY="crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly"
 GPUSTACK_IMAGE="${REGISTRY}/gpustack:lx2v-dev"
 ENGINE_IMAGE="${REGISTRY}/lightx2v:arm64-a100-latest"
-# IndexTTS-2 语音合成引擎(独立 CI 出包)。tag 必须与 gpustack 内置后端注册表
-# (schemas/inference_backend.py 的 image_name)完全一致——worker 本地 load 后按名匹配。
+# [已下线 2026-08-25] IndexTTS-2 语音合成引擎。其能力已由 vllm-omni 承接
+# (indextts-2 模型现在跑在 vLLMOmni 后端上),不再默认预载/分发。
+# 变量与 upgrade-engine 分支保留,需要时:./lx2v-node.sh upgrade-engine --engine indextts
 INDEXTTS_IMAGE="${REGISTRY}/indextts2:arm64-a100-latest"
 # ACE-Step-1.5 文生音乐引擎(独立 CI 出包,同 indextts 范式)。tag 同样须与
 # gpustack 内置后端注册表(schemas/inference_backend.py 的 image_name)一致。
@@ -45,9 +47,11 @@ ACESTEP_IMAGE="${REGISTRY}/acestep:arm64-a100-latest"
 # gpustack 内置后端注册表(schemas/inference_backend.py 的 image_name)一致——
 # 后端注册在 P3;注册前本镜像仅供分发/手测,GPUStack 尚不会调度它。
 VLLM_OMNI_IMAGE="${REGISTRY}/vllm-omni:arm64-a100-latest"
-# Bernini 原生视频生成/编辑引擎(Bernini-R 渲染器;独立 CI 出包,同 indextts 范式)。
-# 已注册为 gpustack 内置后端——tag 须与 schemas/inference_backend.py 的 image_name
-# 完全一致,worker 本地 load 后按名匹配。
+# [已下线 2026-08-25] Bernini 原生视频生成/编辑引擎。不再默认预载/分发。
+# 注意它仍停留在 cu128 base:Bernini/pyproject.toml 声明 requires-python
+# ">=3.11,<3.12",与 cu130 base 的 Python 3.12 冲突,无法直接复用新 base
+# (详见 gpustack 仓 docs/cu130-py312-upgrade-2026-08-24.md §2.2)。
+# 变量与 upgrade-engine 分支保留,需要时:./lx2v-node.sh upgrade-engine --engine bernini
 BERNINI_IMAGE="${REGISTRY}/bernini:arm64-a100-latest"
 SERVER_URL="${SERVER_URL:-http://10.0.0.238}"
 NFS_SERVER="100.125.40.2"
@@ -530,7 +534,8 @@ cmd_install() {
   [ -n "$TOKEN" ] || die "install 需要 --token" \
     "在既有 worker 节点上取: docker inspect ${WORKER_NAME} --format '{{range .Config.Env}}{{println .}}{{end}}' | grep GPUSTACK_TOKEN" \
     "同一集群的注册令牌可复用于多台 worker"
-  STEP_TOTAL=12
+  # 12 -> 10:indextts2 / bernini 两个镜像预载步骤已下线(见下方注释)
+  STEP_TOTAL=10
 
   step "预检:GPU 驱动 / 架构"
   nvidia-smi -L || die "nvidia-smi 不可用" "先安装 GPU 驱动(A100 节点镜像通常自带,重装过系统的机器需补装)"
@@ -552,19 +557,18 @@ cmd_install() {
   step "镜像:lightx2v 引擎(NFS tar 优先,无则在线拉)"
   fetch_image_prefer_tar "$ENGINE_IMAGE" "$ENGINE_TAR"
 
-  step "镜像:indextts2 引擎(NFS tar 优先,无则在线拉)"
-  # 全节点预载(同 lightx2v 思路):TTS 整卡单实例,调度器可落任意空闲卡,
-  # 新节点装完即可被调度,免去"记得补跑 upgrade-engine --engine indextts"的人为坑
-  fetch_image_prefer_tar "$INDEXTTS_IMAGE" "$INDEXTTS_TAR"
+  # [2026-08-25 下线] indextts2 / bernini 不再默认预载:
+  #   - indextts2:其能力已由 vllm-omni 承接(indextts-2 模型跑在 vLLMOmni 后端上)
+  #   - bernini:已下线,且它停留在 cu128 base(requires-python >=3.11,<3.12,
+  #     与 cu130 base 的 Python 3.12 冲突,见 gpustack 仓
+  #     docs/cu130-py312-upgrade-2026-08-24.md)
+  # 两者各约 10G,50 台每台都 load 是纯浪费(磁盘 + NFS 带宽 + 时间)。
+  # 变量与 upgrade-engine 分支仍保留,需要时可手动:
+  #   ./lx2v-node.sh upgrade-engine --engine indextts|bernini [--offline]
 
   step "镜像:acestep 引擎(NFS tar 优先,无则在线拉)"
-  # 同 indextts:文生音乐整卡单实例,全节点预载即可被调度落任意空闲卡
+  # 文生音乐整卡单实例,全节点预载即可被调度落任意空闲卡
   fetch_image_prefer_tar "$ACESTEP_IMAGE" "$ACESTEP_TAR"
-
-  step "镜像:bernini 引擎(NFS tar 优先,无则在线拉)"
-  # 同 indextts/acestep:Bernini 已注册为内置后端(视频生成/编辑,整卡多卡),
-  # 全节点预载即可被调度落任意空闲卡
-  fetch_image_prefer_tar "$BERNINI_IMAGE" "$BERNINI_TAR"
 
   step "镜像:vllm-omni 引擎(soft 预载:有则装上供手测,缺则告警不阻塞)"
   # vllm-omni 尚未在 GPUStack 注册后端(P3 前不会被调度),用 soft 预载:有镜像的
@@ -720,19 +724,21 @@ cmd_status() {
 
 cmd_prepare_transfer() {
   parse_flags "$@"
-  STEP_TOTAL=7
+  # 7 -> 5:indextts2 / bernini 两个 save step 已下线
+  STEP_TOTAL=5
   # tar 必须落在共享 NFS 上;未挂载时 mkdir -p 会静默建本地目录,
   # 大 tar(引擎/indextts 各 ~10G)写进根盘且其他节点拿不到
   mountpoint -q /nfs-models || die "/nfs-models 未挂载,拒绝把 tar 写到本地盘" \
     "先挂 NFS(fstab 两行 + mount -a,见 install 的 ② 或全记录 §4.2)再重试"
   mkdir -p "$TRANSFER_DIR"
 
-  step "拉取 arm64 六镜像(x86 机器亦可)"
+  step "拉取 arm64 四镜像(x86 机器亦可)"
+  # [2026-08-25] indextts2 / bernini 已下线,不再拉取与 save(各约 10G)。
+  # NFS 上它们的旧 tar 未删除,如需临时恢复:
+  #   docker pull --platform linux/arm64 "$INDEXTTS_IMAGE" && save_tar_if_changed "$INDEXTTS_IMAGE" "$INDEXTTS_TAR"
   docker pull --platform linux/arm64 "$GPUSTACK_IMAGE"
   docker pull --platform linux/arm64 "$ENGINE_IMAGE"
-  docker pull --platform linux/arm64 "$INDEXTTS_IMAGE"
   docker pull --platform linux/arm64 "$ACESTEP_IMAGE"
-  docker pull --platform linux/arm64 "$BERNINI_IMAGE"
   # vllm-omni 未注册后端(不被调度),soft:拉不到只告警,不阻塞其余必需 tar 的产出
   docker pull --platform linux/arm64 "$VLLM_OMNI_IMAGE" \
     || echo "    ⚠️ (soft) vllm-omni pull 失败,跳过其 tar(不影响其余镜像)"
@@ -752,14 +758,8 @@ cmd_prepare_transfer() {
   step "save 引擎 tar(~10G,digest 未变则跳过)"
   save_tar_if_changed "$ENGINE_IMAGE" "$ENGINE_TAR"
 
-  step "save indextts2 tar(~10G,digest 未变则跳过)"
-  save_tar_if_changed "$INDEXTTS_IMAGE" "$INDEXTTS_TAR"
-
   step "save acestep tar(~8G,digest 未变则跳过)"
   save_tar_if_changed "$ACESTEP_IMAGE" "$ACESTEP_TAR"
-
-  step "save bernini tar(~10G,digest 未变则跳过)"
-  save_tar_if_changed "$BERNINI_IMAGE" "$BERNINI_TAR"
 
   step "save vllm-omni tar(~10G,digest 未变则跳过;soft:镜像不在本地则跳过)"
   # 与上面 soft pull 配套:vllm-omni 拉不到时本地无此镜像,跳过 save 而非 die,
