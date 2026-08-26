@@ -751,17 +751,37 @@ def _resolve_input_refs(
 
 
 def _lookup_by_model(table, model_name: str) -> Optional[int]:
-    """First positive int in ``table`` whose key is a case-insensitive substring
-    of ``model_name``. Shared by the latency and queue-wait tables so both use
-    identical matching semantics. Returns None when nothing matches or every
-    match is unparseable."""
+    """Look up ``model_name`` in a per-model seconds table: **exact match first
+    (case-insensitive), substring only as a fallback**. Shared by the latency and
+    queue-wait tables so both use identical matching semantics. Returns None when
+    nothing matches or every match is unparseable.
+
+    Why two stages. Callers that already resolved the request's ``model`` string
+    to a concrete Model pass ``model.name`` — the authoritative name — so the
+    exact pass hits and row order is irrelevant. That kills the footgun the
+    substring-only version had: a shorter key shadows a longer one
+    (``qwen-image`` matching ``qwen-image-edit``), silently applying the wrong
+    latency to whichever row happened to be listed first.
+
+    The substring fallback stays because one caller cannot resolve: the progress
+    poller reads ``task.model_name``, which is the **caller-supplied** string
+    persisted at submit time. That may be a model-route name, an owner-prefixed
+    ``owner/name``, or an upstream channel alias, none of which need equal any
+    GPUStack model name. For those, substring is still the best guess available —
+    and there row order does matter, longest key first."""
     name = (model_name or "").lower()
-    for key, val in (table or {}).items():
-        if key and str(key).lower() in name:
+    if not name:
+        return None
+    items = [(str(key).lower(), val) for key, val in (table or {}).items() if key]
+    # Two passes over the same rows, exact before substring.
+    for matches in (lambda key: key == name, lambda key: key in name):
+        for key, val in items:
+            if not matches(key):
+                continue
             try:
                 return int(val)
             except (TypeError, ValueError):
-                continue
+                continue  # unparseable row: keep looking, don't fail the submit
     return None
 
 
@@ -1030,7 +1050,13 @@ async def create_video_task(request: Request, user: CurrentUserDep):
         running = await ModelInstanceService(session).get_running_instances(model.id)
         # Backpressure: reject fast (429) before creating any row if the queue
         # for this model is already too deep (§4.1).
-        await _check_admission(session, model.id, model_name, task_type, running)
+        #
+        # Pass the RESOLVED ``model.name``, not the caller's ``model_name``: the
+        # latter may be a model-route name / owner-prefixed alias / upstream
+        # channel alias, which would miss the exact pass in _lookup_by_model and
+        # fall through to substring guessing. Here the model is already resolved,
+        # so the admission tables key off the authoritative name.
+        await _check_admission(session, model.id, model.name, task_type, running)
         instance = await select_least_pending_instance(session, running)
         if instance is None:
             raise ServiceUnavailableException(

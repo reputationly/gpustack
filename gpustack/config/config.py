@@ -201,13 +201,17 @@ class Config(WorkerConfig, BaseSettings):
     # path with a hardcoded 90s fallback and no declared field, which made the
     # audiogen ceiling silently unconfigurable; declared here so /config can set it.
     lightx2v_audiogen_max_queue_wait_seconds: int = 90
-    # Per-model single-instance hot-state latency (seconds), keyed by public model
-    # name (substring match, case-insensitive). Defaults from the LightX2V test
-    # reports. Unknown models fall back to a per-kind default (image/video/audio).
+    # Per-model single-instance hot-state latency (seconds), keyed by model name:
+    # **exact match first (case-insensitive), substring only as a fallback** (see
+    # routes/videos.py::_lookup_by_model). Admission resolves the request's model
+    # first and looks up the authoritative ``model.name``, so normally the exact
+    # pass hits and row order is irrelevant; the fallback exists for the progress
+    # poller, which only has the caller-supplied string (route name / owner-prefixed
+    # alias). Unknown models fall back to a per-kind default (image/video/audio).
     lightx2v_model_latency_seconds: Optional[Dict[str, int]] = None
     # Per-model queue-wait ceiling (seconds) overriding the per-kind values above,
-    # keyed the same way as lightx2v_model_latency_seconds (case-insensitive
-    # substring match on the public model name).
+    # keyed the same way as lightx2v_model_latency_seconds (exact-then-substring,
+    # case-insensitive).
     #
     # Why this exists: the per-kind ceilings assume every model of a kind has a
     # comparable latency. That holds for the LightX2V image models (z-image ~8s,
