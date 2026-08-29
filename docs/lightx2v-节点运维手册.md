@@ -279,6 +279,48 @@ worker 容器 Up ≠ 注册成功,server 端才是最终事实。
 
 新节点默认只对 238 免密(§1.6 ② 做的),Mac 上还进不去。Mac 走跳板 `111.172.214.16` + 每台一个 NAT 端口,别名规则见 `~/.ssh/config` 的 `# >>> gpustack-a100 (auto-generated) >>>` 段:`dev-gpustack-a100-00NN` / `gpuNN`,尾行注释内网 IP。
 
+**⓪ Mac 能直连目标机时(同一局域网、知道密码),不用走 238 跳板,直接 `ssh-copy-id`**:
+
+```bash
+# 1. 先看本机有没有现成的 key,没有才生成(已有的话千万别重生成 —— 会废掉这把 key 已经免密的所有节点)
+ls -l ~/.ssh/id_ed25519.pub || ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519
+
+# 2. 直接把公钥装到目标机(端口非默认 22 时加 -p;首次连会问 host key 指纹,核对后 yes;
+#    然后提示输一次目标机密码,装完自动帮你验一遍能不能免密登进去)
+ssh-copy-id -i ~/.ssh/id_ed25519.pub [-p <端口>] <user>@<目标机IP>
+
+# 3. 验证:免密应该能直接进去,不再要密码
+ssh [-p <端口>] <user>@<目标机IP> hostname
+```
+
+例(2026-08-24 实测,经跳板机 NAT 端口直连 111.172.214.16:43076):
+
+```bash
+ssh-copy-id -i ~/.ssh/id_ed25519.pub -p 43076 root@111.172.214.16
+```
+
+`ssh-copy-id` 自己处理换行,不会有 §0.1 坑 22 那种折行写坏 `authorized_keys` 的问题;`Number of key(s) added: 1` 且回显的 `ssh -i ... -p <端口> user@ip` 免密连上就算成功。只要 Mac 能直接 ssh 到目标(不管是局域网 IP、还是公网 IP + NAT 端口这种形式),都走这条⓪路径就够了;真正连不上、必须借 238 中转装公钥的场景才需要下面 ①-⑤ 那一整套。
+
+**装完之后怎么免密登录**:`id_ed25519` 是 ssh 默认会找的私钥,平时**不用带 `-i`**,直接:
+
+```bash
+ssh -p 43076 root@111.172.214.16
+```
+
+只要不再提示输密码就是装成功了。要是还是要密码,先看是不是端口/IP 弄错了(`ssh-copy-id` 装到了别的机器),再看目标机 `sshd_config` 里 `PubkeyAuthentication`/`AuthorizedKeysFile` 有没有被改过默认值。
+
+嫌每次都要记 `-p 43076` 麻烦,可以照 §1.7 ④ 的做法给它起个别名,写进 `~/.ssh/config`(改前先 `cp ~/.ssh/config ~/.ssh/config.bak.$(date +%F)` 备份一下):
+
+```
+Host 一个好记的名字
+    HostName 111.172.214.16
+    Port 43076
+    User root
+    IdentityFile ~/.ssh/id_ed25519
+```
+
+之后 `ssh 一个好记的名字` 就能直接免密进去,不用再拼端口和 IP。
+
 **① 借 238 把 Mac 公钥装到新节点**(238 已免密,不用输密码):
 
 ```bash
