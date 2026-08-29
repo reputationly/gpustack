@@ -726,6 +726,18 @@ _VLLM_OMNI_CATEGORY_HINTS: List[Tuple[str, CategoryEnum]] = [
     # are local paths like /nfs-data/models/MiniMax-H3-FL2VA-INT8.
     ("minimax-h3", CategoryEnum.VIDEO),
     ("minimax_h3", CategoryEnum.VIDEO),
+    # LTX-2.5 / LTX-2.3 text-to-video (also the ltx2-v2a dubbing deployment,
+    # which is video too, so the bare token is safe here).
+    ("ltx", CategoryEnum.VIDEO),
+    # Diffusion image models served through vLLM-Omni. Each token is specific to
+    # one model family; none of them can appear in a speech checkpoint's path.
+    ("ideogram", CategoryEnum.IMAGE),
+    ("krea", CategoryEnum.IMAGE),
+    ("sensenova", CategoryEnum.IMAGE),
+    # MiniMax-Music3. Matched on "music3" rather than a bare "music": the token
+    # has to stay narrow, and "minimax-music3" does not contain "minimax-h3",
+    # so it cannot be captured by the video rule above whatever the order.
+    ("music3", CategoryEnum.MUSIC),
 ]
 
 # Fallback when no hint matches. Keeps every pre-H3 vLLM-Omni deployment (the
