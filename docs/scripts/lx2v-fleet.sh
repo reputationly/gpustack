@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 # lx2v-fleet.sh — 在 manager(238)上对所有 worker 节点批量执行 lx2v-node.sh 子命令。
 #
 # 读节点清单(默认 /root/lx2v-nodes.txt,一行一个内网 IP,# 注释与空行忽略),

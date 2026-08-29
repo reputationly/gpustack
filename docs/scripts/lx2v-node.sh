@@ -134,9 +134,44 @@ watch_size() { # watch_size <pid> <file>
 
 # 镜像的 registry digest(RepoDigests,manifest-list 级,与本地拉的哪个平台无关;
 # 排序拼接防多条目顺序抖动)。本地 build 的镜像无 RepoDigests → 返回空 → 永远重 save
+# 注意:依赖本地已有该镜像(inspect 读的是本地),所以只能用在 pull 之后。
 image_digest() { # image_digest <image>
   docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$1" 2>/dev/null \
     | sort | tr '\n' ' ' || true
+}
+
+# 远端镜像指纹 —— **不拉取**即可获知"远端变没变",用于在 pull 之前就短路掉。
+#
+# 为什么不用 image_digest:它 inspect 本地镜像,必须先 pull,省不掉那一步。
+# 为什么不取 `docker manifest inspect --verbose` 里的 Descriptor.digest:
+#   多架构镜像(gpustack:lx2v-dev 就是)的 --verbose 会把每个平台的 manifest
+#   和每一层的 digest 全列出来(实测 120 个 digest),第一个是**某个平台**的
+#   manifest digest(如 536c9169…),而 RepoDigests 记的是**顶层 manifest list**
+#   的 digest(166ca063…),两者对不上 —— 直接 grep 第一个会静默拿到错的值。
+#   要精确复刻顶层 digest 得读 registry API 的 Docker-Content-Digest 响应头,
+#   那需要先换 Bearer token,而节点上 buildx/crane/skopeo/jq 一个都没有。
+# 取整体输出的 sha256 作为自洽指纹:天然覆盖所有平台与层,实测连查 3 次稳定。
+#   它不等于官方 digest(docker 会 pretty-print),但我们只需要"变没变"这一位信息。
+#   docker 版本升级若改变输出格式,指纹会变 → 多做一次 pull+save,无害。
+remote_fingerprint() { # remote_fingerprint <image>
+  docker manifest inspect --verbose "$1" 2>/dev/null | sha256sum | cut -d' ' -f1 || true
+}
+
+# 同步单个镜像到 NFS tar:远端未变则连 pull 都跳过。
+# 两道去重:① 远端指纹(省 pull)② RepoDigests(省 save,~10G 的大头)。
+# 指纹在 save 成功之后才落盘,中途失败下次会重来,不会留下"标记在但 tar 是旧的"。
+sync_image_to_nfs() { # sync_image_to_nfs <image> <tar> [docker save 额外参数...]
+  local image=$1 tar=$2; shift 2
+  local marker="${tar}.remote"
+  local fp; fp="$(remote_fingerprint "$image")"
+  if [ -n "$fp" ] && [ -f "$tar" ] \
+     && [ "$(cat "$marker" 2>/dev/null || true)" = "$fp" ]; then
+    echo "    远端未变(指纹 ${fp:0:12},$(du -h "$tar" | cut -f1) 已在 NFS),跳过 pull+save: $tar"
+    return 0
+  fi
+  docker pull --platform linux/arm64 "$image"
+  save_tar_if_changed "$image" "$tar" "$@"
+  [ -n "$fp" ] && echo "$fp" > "$marker"
 }
 
 # save 去重:tar 旁存 <tar>.digest 标记。digest 未变且 tar 在 → 跳过(~10G/次的大头)。
@@ -724,51 +759,44 @@ cmd_status() {
 
 cmd_prepare_transfer() {
   parse_flags "$@"
-  # 7 -> 5:indextts2 / bernini 两个 save step 已下线
-  STEP_TOTAL=5
+  # 7 -> 4:indextts2/bernini 已下线,且"统一 pull"那步并入各镜像的 sync
+  STEP_TOTAL=4
   # tar 必须落在共享 NFS 上;未挂载时 mkdir -p 会静默建本地目录,
   # 大 tar(引擎/indextts 各 ~10G)写进根盘且其他节点拿不到
   mountpoint -q /nfs-models || die "/nfs-models 未挂载,拒绝把 tar 写到本地盘" \
     "先挂 NFS(fstab 两行 + mount -a,见 install 的 ② 或全记录 §4.2)再重试"
   mkdir -p "$TRANSFER_DIR"
 
-  step "拉取 arm64 四镜像(x86 机器亦可)"
   # [2026-08-25] indextts2 / bernini 已下线,不再拉取与 save(各约 10G)。
   # NFS 上它们的旧 tar 未删除,如需临时恢复:
   #   docker pull --platform linux/arm64 "$INDEXTTS_IMAGE" && save_tar_if_changed "$INDEXTTS_IMAGE" "$INDEXTTS_TAR"
-  docker pull --platform linux/arm64 "$GPUSTACK_IMAGE"
-  docker pull --platform linux/arm64 "$ENGINE_IMAGE"
-  docker pull --platform linux/arm64 "$ACESTEP_IMAGE"
-  # vllm-omni 未注册后端(不被调度),soft:拉不到只告警,不阻塞其余必需 tar 的产出
-  docker pull --platform linux/arm64 "$VLLM_OMNI_IMAGE" \
-    || echo "    ⚠️ (soft) vllm-omni pull 失败,跳过其 tar(不影响其余镜像)"
+  #
+  # 原先是"先统一 pull 四镜像,再逐个 save"。现在改为每镜像一步 sync_image_to_nfs:
+  # 先查远端指纹(不拉取),未变则连 pull 都跳过 —— 省的是每次都要走一遍的 pull。
 
-  step "save gpustack tar(digest 未变则跳过;必须 > 重定向,不能 -o,坑#5)"
+  step "同步 gpustack tar(远端未变则跳过 pull+save;必须 > 重定向,不能 -o,坑#5)"
   # --platform:gpustack 镜像是多架构 manifest;containerd 镜像存储下,不带 --platform
   # 的 docker save 会尝试导出整个 manifest list(含未拉的 amd64)→ "content digest
   # not found"。指定 arm64 只导该平台,免去"先拉 amd64 占本地"的前置步骤。
-  save_tar_if_changed "$GPUSTACK_IMAGE" "$GPUSTACK_TAR" --platform linux/arm64
-  if [ "$(uname -m)" = "x86_64" ]; then
+  sync_image_to_nfs "$GPUSTACK_IMAGE" "$GPUSTACK_TAR" --platform linux/arm64
+  if [ "$(uname -m)" = "x86_64" ] && docker image inspect "$GPUSTACK_IMAGE" >/dev/null 2>&1; then
     # 238 的 server 容器与本 tag 同名:上面 --platform arm64 的 pull 已把本地 tag
     # 指向 arm64 镜像,不恢复的话之后跳过 pull 直接 docker run 会 exec format error
     echo "    恢复本地 amd64 tag(server 与本 tag 同名)..."
     docker pull --platform linux/amd64 "$GPUSTACK_IMAGE"
   fi
 
-  step "save 引擎 tar(~10G,digest 未变则跳过)"
-  save_tar_if_changed "$ENGINE_IMAGE" "$ENGINE_TAR"
+  step "同步 lightx2v tar(~8G,远端未变则跳过 pull+save)"
+  sync_image_to_nfs "$ENGINE_IMAGE" "$ENGINE_TAR"
 
-  step "save acestep tar(~8G,digest 未变则跳过)"
-  save_tar_if_changed "$ACESTEP_IMAGE" "$ACESTEP_TAR"
+  step "同步 acestep tar(~8G,远端未变则跳过 pull+save)"
+  sync_image_to_nfs "$ACESTEP_IMAGE" "$ACESTEP_TAR"
 
-  step "save vllm-omni tar(~10G,digest 未变则跳过;soft:镜像不在本地则跳过)"
-  # 与上面 soft pull 配套:vllm-omni 拉不到时本地无此镜像,跳过 save 而非 die,
-  # 保证必需的 gpustack/lightx2v/indextts/acestep/bernini tar 已经产出。
-  if docker image inspect "$VLLM_OMNI_IMAGE" >/dev/null 2>&1; then
-    save_tar_if_changed "$VLLM_OMNI_IMAGE" "$VLLM_OMNI_TAR"
-  else
-    echo "    ⚠️ (soft) vllm-omni 镜像不在本地,跳过 save"
-  fi
+  step "同步 vllm-omni tar(~11G;soft:拉不到只告警,不阻塞其余必需 tar)"
+  # vllm-omni 未注册后端(不被调度),soft:失败只告警,保证 gpustack/lightx2v/acestep
+  # 三个必需 tar 已经产出。set -e 下用 || 兜住整个 sync。
+  sync_image_to_nfs "$VLLM_OMNI_IMAGE" "$VLLM_OMNI_TAR" \
+    || echo "    ⚠️ (soft) vllm-omni 同步失败,跳过其 tar(不影响其余镜像)"
   cp -f "$0" "${TRANSFER_DIR}/lx2v-node.sh" && chmod +x "${TRANSFER_DIR}/lx2v-node.sh"
   echo "    脚本自身已同步到 ${TRANSFER_DIR}/lx2v-node.sh(已挂 NFS 的节点可直接执行)"
   echo "    提示:nvidia-repo/ 两件套如缺,在既有 GPU 节点执行:"
