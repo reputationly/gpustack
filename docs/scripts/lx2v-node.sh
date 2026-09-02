@@ -153,8 +153,27 @@ image_digest() { # image_digest <image>
 # 取整体输出的 sha256 作为自洽指纹:天然覆盖所有平台与层,实测连查 3 次稳定。
 #   它不等于官方 digest(docker 会 pretty-print),但我们只需要"变没变"这一位信息。
 #   docker 版本升级若改变输出格式,指纹会变 → 多做一次 pull+save,无害。
+# 查不到远端(网络不通 / 鉴权超时)必须返回**空**,不能返回空串的 sha256。
+# 坑#9:原写法 `docker manifest inspect ... | sha256sum` 里管道左边失败时右边照跑,
+#   得到 e3b0c442…(空输入的 sha256)—— 非空,于是被当成合法指纹。ACR 抖动时
+#   两次失败会拿到同一个 e3b0c442,marker 一旦被它写过,以后每次断网都判"远端未变"
+#   而跳过 pull+save,静默把旧 tar 当新的发下去。现在:失败/空输出 → 返回空。
 remote_fingerprint() { # remote_fingerprint <image>
-  docker manifest inspect --verbose "$1" 2>/dev/null | sha256sum | cut -d' ' -f1 || true
+  local out
+  out="$(docker manifest inspect --verbose "$1" 2>/dev/null)" || return 0
+  [ -n "$out" ] || return 0
+  printf '%s' "$out" | sha256sum | cut -d' ' -f1
+}
+
+# ACR(cn-shanghai personal)时不时 TLS handshake timeout,单发 pull 一挂就整段中止。
+# 退避重试 3 次;仍失败才交给调用方(die / soft 告警)。
+docker_pull_retry() { # docker_pull_retry <docker pull 的全部参数...>
+  local i
+  for i in 1 2 3; do
+    if docker pull "$@"; then return 0; fi
+    [ "$i" -lt 3 ] && { echo "    pull 失败(第 ${i}/3 次,ACR 抖动?),${i}0s 后重试 ..."; sleep "${i}0"; }
+  done
+  return 1
 }
 
 # 同步单个镜像到 NFS tar:远端未变则连 pull 都跳过。
@@ -169,9 +188,18 @@ sync_image_to_nfs() { # sync_image_to_nfs <image> <tar> [docker save 额外参�
     echo "    远端未变(指纹 ${fp:0:12},$(du -h "$tar" | cut -f1) 已在 NFS),跳过 pull+save: $tar"
     return 0
   fi
-  docker pull --platform linux/arm64 "$image"
+  [ -n "$fp" ] || echo "    ⚠️ 查不到远端指纹(网络/鉴权?),无法判断是否变化 → 照常 pull"
+  docker_pull_retry --platform linux/arm64 "$image" \
+    || die "pull 失败(已重试 3 次): $image" \
+         "ACR 抖动:稍后重跑 prepare-transfer(已同步的 tar 会跳过,不重来)" \
+         "NFS 上的 ${tar##*/} 仍是上一次的旧版本,别当新的发下去"
   save_tar_if_changed "$image" "$tar" "$@"
-  [ -n "$fp" ] && echo "$fp" > "$marker"
+  # 坑#10:这里必须用 if,不能写 `[ -n "$fp" ] && echo ...` —— 它是函数最后一条命令,
+  #   条件为假时函数返回 1,set -e + ERR trap 会把整段 prepare-transfer 判死(明明
+  #   pull 和 save 都成功了)。之前 fp 恒非空(见坑#9)才一直没暴露。
+  # 拿不到指纹就删掉旧 marker:留着等于宣称一个与当前 tar 未必对应的远端状态,
+  #   下次顶多多做一次 pull+save,无害。
+  if [ -n "$fp" ]; then echo "$fp" > "$marker"; else rm -f "$marker"; fi
 }
 
 # save 去重:tar 旁存 <tar>.digest 标记。digest 未变且 tar 在 → 跳过(~10G/次的大头)。
@@ -779,12 +807,6 @@ cmd_prepare_transfer() {
   # 的 docker save 会尝试导出整个 manifest list(含未拉的 amd64)→ "content digest
   # not found"。指定 arm64 只导该平台,免去"先拉 amd64 占本地"的前置步骤。
   sync_image_to_nfs "$GPUSTACK_IMAGE" "$GPUSTACK_TAR" --platform linux/arm64
-  if [ "$(uname -m)" = "x86_64" ] && docker image inspect "$GPUSTACK_IMAGE" >/dev/null 2>&1; then
-    # 238 的 server 容器与本 tag 同名:上面 --platform arm64 的 pull 已把本地 tag
-    # 指向 arm64 镜像,不恢复的话之后跳过 pull 直接 docker run 会 exec format error
-    echo "    恢复本地 amd64 tag(server 与本 tag 同名)..."
-    docker pull --platform linux/amd64 "$GPUSTACK_IMAGE"
-  fi
 
   step "同步 lightx2v tar(~8G,远端未变则跳过 pull+save)"
   sync_image_to_nfs "$ENGINE_IMAGE" "$ENGINE_TAR"
@@ -797,6 +819,19 @@ cmd_prepare_transfer() {
   # 三个必需 tar 已经产出。set -e 下用 || 兜住整个 sync。
   sync_image_to_nfs "$VLLM_OMNI_IMAGE" "$VLLM_OMNI_TAR" \
     || echo "    ⚠️ (soft) vllm-omni 同步失败,跳过其 tar(不影响其余镜像)"
+
+  # 放在所有 tar 同步之后:这一步只修本机 tag,与出 tar 无关。
+  # 早先它跟在 gpustack sync 后面,ACR 一抖就在 step 1/4 整段中止,后三个 tar 全没出。
+  if [ "$(uname -m)" = "x86_64" ] && docker image inspect "$GPUSTACK_IMAGE" >/dev/null 2>&1; then
+    # 238 的 server 容器与本 tag 同名:上面 --platform arm64 的 pull 已把本地 tag
+    # 指向 arm64 镜像,不恢复的话之后跳过 pull 直接 docker run 会 exec format error
+    echo "    恢复本地 amd64 tag(server 与本 tag 同名)..."
+    docker_pull_retry --platform linux/amd64 "$GPUSTACK_IMAGE" \
+      || die "amd64 tag 恢复失败(已重试 3 次);四个 tar 均已同步完成,只差本机 tag" \
+           "本机 ${GPUSTACK_IMAGE} 现在指向 arm64 镜像,238 上直接 docker run 会 exec format error" \
+           "网络恢复后单独补一条:docker pull --platform linux/amd64 ${GPUSTACK_IMAGE}"
+  fi
+
   cp -f "$0" "${TRANSFER_DIR}/lx2v-node.sh" && chmod +x "${TRANSFER_DIR}/lx2v-node.sh"
   echo "    脚本自身已同步到 ${TRANSFER_DIR}/lx2v-node.sh(已挂 NFS 的节点可直接执行)"
   echo "    提示:nvidia-repo/ 两件套如缺,在既有 GPU 节点执行:"

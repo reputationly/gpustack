@@ -2,7 +2,8 @@
 
 > 面向操作者的完整手册:新节点接入、gpustack/引擎升级、清理、部署模型、验证、坑与要点。
 > 脚本:`docs/scripts/lx2v-node.sh`(仓库)/ `/nfs-models/_transfer/lx2v-node.sh`(NFS 副本)。
-> 实测基准:0004/0005 两台全新节点零干预接入,各约 16 分钟(2026-07-06,部署实录 §17.8)。
+> 实测基准:0004/0005 两台全新节点零干预接入,各约 16 分钟(2026-07-06,部署实录 §17.8);
+> 最新一次 0051-0055 五台并发接入每台 6-7 分钟(2026-09-01,见 **§1.9**)。
 > 背景与踩坑原始记录:[部署实录](./lightx2v-gpustack-部署实录.md) §17 · [全记录](./lightx2v-20260706-发布部署验证全记录.md)。
 
 ---
@@ -18,16 +19,17 @@ bash /root/lx2v-node.sh upgrade-gpustack
 
 # 升级本节点的引擎镜像(之后到 UI 逐个删实例重建生效):
 bash /root/lx2v-node.sh upgrade-engine                       # lightx2v(默认)
-bash /root/lx2v-node.sh upgrade-engine --engine indextts     # IndexTTS-2 语音引擎
 bash /root/lx2v-node.sh upgrade-engine --engine acestep      # ACE-Step 文生音乐引擎
 bash /root/lx2v-node.sh upgrade-engine --engine vllm-omni    # vLLM-Omni 全模型语音/音频引擎
-bash /root/lx2v-node.sh upgrade-engine --engine bernini      # Bernini 视频生成/编辑引擎
+# 下面两个引擎已于 2026-08-25 下线(不再默认预载/分发),分支保留,需要时才手动指定:
+bash /root/lx2v-node.sh upgrade-engine --engine indextts     # IndexTTS-2(能力已由 vLLM-Omni 承接)
+bash /root/lx2v-node.sh upgrade-engine --engine bernini      # Bernini(仍停留在 cu128 base)
 
 # 节点健康速览 / 清理残留:
 bash /root/lx2v-node.sh status
 bash /root/lx2v-node.sh clean [--purge-data] [--kill-gpu-procs]
 
-# (238 上)出了新包之后,更新 NFS 上的 tar(六镜像)和脚本副本:
+# (238 上)出了新包之后,更新 NFS 上的 tar(四镜像)和脚本副本:
 bash /root/lx2v-node.sh prepare-transfer
 ```
 
@@ -42,20 +44,23 @@ bash /root/lx2v-node.sh prepare-transfer
 - 全程日志:`/var/log/lx2v-node-<日期>.log`;每步打印 `[step i/N] 时间` 和耗时,长任务(load/pull/save)有进度输出——**长时间无输出再怀疑卡住,先看当前 step 是什么**(toolkit 在线下载 5-8 分钟、引擎 tar load 4-5 分钟都是正常的);
 - 任何失败都会打印**原因分析和操作建议**,先照建议做,再看日志。
 
-**当前镜像清单**(六镜像,tag 均须与 gpustack 内置后端注册表 `schemas/inference_backend.py` 的 image_name 一致,勿改名):
+**当前镜像清单**(**四镜像**,tag 均须与 gpustack 内置后端注册表 `schemas/inference_backend.py` 的 image_name 一致,勿改名):
 
 | 镜像 | tag | 用途 |
 |---|---|---|
 | gpustack | `gpustack:lx2v-dev` | server(238,x86)+ worker |
 | lightx2v | `lightx2v:arm64-a100-latest` | 图片/视频引擎 |
-| indextts2 | `indextts2:arm64-a100-latest` | IndexTTS-2 独立语音引擎(可被 vLLM-Omni 取代,见 §4) |
 | acestep | `acestep:arm64-a100-latest` | ACE-Step 文生音乐引擎 |
 | vllm-omni | `vllm-omni:arm64-a100-latest` | vLLM-Omni 全模型语音/音频引擎(TTS/AudioX/SoulX/MOSS 等) |
-| bernini | `bernini:arm64-a100-latest` | Bernini 原生视频生成/编辑引擎(Bernini-R 渲染器) |
+
+> **2026-08-25 下线两个镜像**:`indextts2`(能力由 vLLM-Omni 承接,indextts-2 模型现跑在 vLLMOmni 后端上)、
+> `bernini`(停留在 cu128 base,其 `requires-python >=3.11,<3.12` 与 cu130 base 的 3.12 冲突)。
+> 两者各约 30G,`install` 不再预载,`lx2v-fleet.sh` 也不再分发;脚本变量与 `upgrade-engine --engine indextts|bernini`
+> 分支仍保留。**老节点上可能还留着这两个镜像**(每台约 29G 可回收),按 §3 的方式精确 `docker rmi` 删除。
 
 > **2026-07-20 出包**:gpustack 修 `/v2/model-routes` 的 category 校验(放行 `music`,否则 ACE-Step 令 new-api 拿不到模型);vLLM-Omni 修 audiogen 任务 `model` 字段(门面 strip 掉后引擎兜底填 served model,否则 AudioX/SoulX 的 t2a/v2a/v2m/svs 报 400)。**两者都要重出包 + 分别升 server / 换 vllm-omni 引擎 + 重建实例**才生效(见 §2.4)。
 >
-> 集群升级后请以各节点 `docker images` 实际 ID 为准;`status` 子命令会列出这六镜像 ID 便于比对。
+> 集群升级后请以各节点 `docker images` 实际 ID 为准;`status` 子命令会列出这些镜像 ID 便于比对。
 
 ---
 
@@ -101,7 +106,21 @@ for ip in $(cat /root/lx2v-new.txt); do ssh-copy-id -f -i /root/mac.pub root@$ip
 ### 1.1 接入前必做(两件事,顺序无所谓)
 
 1. **☠️ 安全组(最大坑,先做)**:华为云控制台把新节点安全组改成既有 GPU 节点同款 —— **`newapi` 组,不是新机默认的 `hcso` 组**。不做的症状极具迷惑性:脚本全绿、worker 注册成功、本机 healthz OK,但 **UI 永远不转 Ready**——server 到 worker 的 TCP 10150 被安全组拦(ping 是通的,更迷惑)。改完 238 下一轮探测即转 Ready,无需重装。
-2. **GPU 驱动确认**:`nvidia-smi` 能列出 4 张 A100(华为云 A100 机镜像通常自带;重装过系统的要先补驱动,脚本第 1 步会拦住)。
+
+    **不必等装完才知道有没有踩坑** —— 238 免密通了之后就能预验证(2026-09-01 起用):在节点上临时监听 10150,从 238 打过去。**通了才开始 install**,省得 30 分钟后才发现。
+
+    ```bash
+    for ip in $(awk 'NF{print $1}' /root/lx2v-new.txt); do
+      printf '%-14s ' "$ip"
+      ssh -n -o BatchMode=yes "root@$ip" 'setsid python3 -m http.server 10150 --bind 0.0.0.0 >/dev/null 2>&1 < /dev/null & sleep 1'
+      curl -sf --max-time 5 "http://$ip:10150/" >/dev/null 2>&1 && echo "238→10150 通 ✅" || echo "238→10150 不通 ❌(安全组)"
+      ssh -n -o BatchMode=yes "root@$ip" 'pkill -f "^python3 -m http.server"'
+    done
+    ```
+
+    收尾那条 `pkill` 的模式**必须锚定 `^python3`**:写成 `pkill -f 'http.server 10150'` 会连 ssh 自己那条远端命令行一起匹配上,先把自己所在的 shell 杀了,临时监听反而留在机器上(坑 26)。
+
+2. **GPU 驱动确认**:`nvidia-smi` 能列出 4 张 A100(华为云 A100 机镜像通常自带;重装过系统的要先补驱动,脚本第 1 步会拦住)。**当前全集群 55 台实测均为 580.65.06 + 内核 5.15.0-187**(2026-09-01 逐台核过;0001-0050 的 570→580 runfile 升级已于 2026-08-24 完成)。
 
 ### 1.2 分发脚本到新节点
 
@@ -131,24 +150,25 @@ token 是**集群级注册令牌,所有 worker 复用同一个**;忘了就在任
 - `--clean-residue`:残留扫描发现孤儿引擎容器时一并硬杀;
 - `--force`:检测到**同 token** 的现有 worker 时才需要(见 1.5)。
 
-### 1.4 十二个步骤与耗时参照(1-8 为早期实测;9-11 为六镜像后新增)
+### 1.4 十个步骤与耗时参照(2026-08-25 下线 indextts2/bernini 后由 12 步减为 10 步)
 
 | step | 内容 | 参考耗时 | 说明 |
 |---|---|---|---|
 | 1 | GPU 驱动/架构预检 | 5s | 没驱动在这里就停 |
 | 2 | 残留扫描 + worker IP 解析 | 5s | IP 定不下来**秒级失败**,不浪费后面时间 |
-| 3 | apt:docker.io、nfs-common | ~1.5min | 逐个装(apt 一包失败会整体中止的坑已规避) |
+| 3 | apt:docker.io、nfs-common | ~1.5min | 逐个装(apt 一包失败会整体中止的坑已规避);出厂已带 docker 则秒级 |
 | 4 | 挂 NFS + `/data`、`/nfs-data` 软链 | 秒级 | fstab 两行 + mount |
-| 5 | nvidia-container-toolkit | **5-8min** | 源配置来自 NFS `nvidia-repo/`,deb 包从 nvidia.github.io 在线下载(慢是网络,不是卡死) |
-| 6 | gpustack 镜像(NFS tar load) | ~1.5min | 4.4G |
-| 7 | lightx2v 引擎镜像 | ~4min | 9.8G |
-| 8 | indextts2 引擎镜像 | ~4min | ~10G;TTS 整卡单实例可落任意空闲卡 |
-| 9 | acestep 引擎镜像 | ~4min | ~8G;文生音乐整卡单实例,全节点预载 |
-| 10 | bernini 引擎镜像 | ~4min | ~10G;原生视频生成/编辑,已注册为内置后端,全节点预载 |
-| 11 | vllm-omni 引擎镜像(**soft**) | ~4min | ~10G;有 tar 则装、缺则告警不阻塞 install(全模型语音/音频引擎) |
-| 12 | 起 worker + 注册/healthz 验证 | ~2min | 旧容器(如有)到这一步才移除,前面失败节点仍有原 worker |
+| 5 | nvidia-container-toolkit | **5-8min** | 源配置来自 NFS `nvidia-repo/`,deb 包从 nvidia.github.io 在线下载(慢是网络,不是卡死);已配置则整步跳过 |
+| 6 | gpustack 镜像(NFS tar load) | ~1.5min | ~1.5G |
+| 7 | lightx2v 引擎镜像 | ~2min | ~8.6G |
+| 8 | acestep 引擎镜像 | ~2min | ~8.7G;文生音乐整卡单实例,全节点预载 |
+| 9 | vllm-omni 引擎镜像(**soft**) | ~3min | ~12.7G;有 tar 则装、缺则告警不阻塞 install(全模型语音/音频引擎) |
+| 10 | 起 worker + 注册/healthz 验证 | ~2min | 旧容器(如有)到这一步才移除,前面失败节点仍有原 worker |
 
-> 上表是**单台**参照(约 16 分钟)。2026-08-20 十台 `-j 10` 并发实测总耗时也是约 15 分钟 —— NFS 读带宽够,10 台同时 load 52G 没有明显互抢;15 台以上仍按 60 卡那次经验降到 `-j 3`。
+> 上表是**单台**参照。历史实测:2026-07-06 两台全新机各约 16 分钟(当时六镜像 52G);
+> 2026-08-20 十台 `-j 10` 并发同为约 15 分钟;**2026-09-01 五台 `-j 5` 只要 6-7 分钟**
+> ——四镜像后每台只 load 约 32G,且那批机器出厂已带 docker/toolkit(step 3/5 基本跳过)。
+> NFS 读带宽在 10 台并发内够用,15 台以上仍按 60 卡那次经验降到 `-j 3`。
 > 若机器出厂镜像已带 docker + toolkit,step 3/5 会被跳过(`setup-base` 可短到 47 秒),这是正常的,不是没装上 —— 用 `docker info | grep nvidia` 复核。
 
 **成功标志**:`Worker dev-gpustack-a100-000N registered with worker_id N` + `本机 healthz OK`,UI Resources → Workers 转 **Ready**。
@@ -170,6 +190,7 @@ install 第 2 步自动扫描并按场景处理:
 ### 1.6 批量扩容(多台全新节点一次接入)
 
 > 2026-08-13 实测:10 台全新 aarch64 4×A100(驱动 570.86.10)一次接入,清单 30 → 40 台。
+> 2026-09-01 复测:5 台一次接入,清单 50 → **55 台(220 卡)**,`OK=5 FAIL=0`,完整时间线见 **§1.9**。
 > 2026-08-20 复测:同样 10 台一次接入,清单 40 → **50 台(200 卡)**,`OK=10 FAIL=0`。这批机器出厂镜像已自带 docker + nvidia-container-toolkit,`setup-base` 只跑 **47 秒**(toolkit 整步被跳过,不是没装成);`install` 18:11 起、18:26 完,约 **15 分钟**,十台步进齐平无掉队。
 >
 > **本节的命令请照 §0.1 的方式执行**(heredoc 喂给 238,或保持单行)。2026-08-20 那次 `authorized_keys` 写坏,就是 §1.7 ① 的推公钥命令被终端折断造成的。
@@ -199,7 +220,9 @@ for ip in $NEW; do
 done
 ```
 
-必须是 `aarch64` + 驱动与既有节点一致(当前 570.x,cu128 就是为它锁的)。x86 进不了这套集群,镜像全是 `arm64-a100` tag。
+必须是 `aarch64`。x86 进不了这套集群,镜像全是 `arm64-a100` tag。
+
+**驱动版本不必强求一致**:引擎镜像自 2026-08-25 起是 cu130,自带 `cuda-compat`,在 570 和 580 上都验过能跑(见 `docs/cu130-py312-upgrade-2026-08-24.md` §1.1,"cu130 需驱动 ≥580"是被证伪的旧假设)。现网 55 台事实上已统一到 580.65.06。
 
 **④ 分发脚本 + `setup-base`**(装 docker/nfs-common/toolkit、挂 NFS,不入集群)
 
@@ -222,7 +245,7 @@ for ip in $NEW; do printf '%-14s ' "$ip"; tail -n1 /tmp/lx2v-bootstrap/$ip.log; 
 bash /root/lx2v-fleet.sh -f /root/lx2v-new.txt status     # 期望 OK=N,且每台 /nfs-models + /nfs-output OK
 ```
 
-**⑥ 入集群(fleet 批量 install)**——这是最重的一步,每台从 NFS load 六镜像约 52G
+**⑥ 入集群(fleet 批量 install)**——这是最重的一步,每台从 NFS load 四镜像约 32G
 
 ```bash
 read -rsp 'GPUSTACK_TOKEN: ' TOKEN; echo
@@ -241,7 +264,7 @@ tail -f /tmp/lx2v-install-new.log
 ssh root@111.172.214.42 'bash -s' <<'EOF'
 for ip in $(awk 'NF{print $1}' /root/lx2v-new.txt); do
   printf '%-14s ' "$ip"
-  imgs=$(ssh -n -o BatchMode=yes "root@$ip" 'docker images --format "{{.Repository}}" | grep -cE "gpustack|lightx2v|indextts2|acestep|vllm-omni|bernini"')
+  imgs=$(ssh -n -o BatchMode=yes "root@$ip" 'docker images --format "{{.Repository}}" | grep -cE "gpustack|lightx2v|acestep|vllm-omni"')
   wk=$(ssh -n -o BatchMode=yes "root@$ip" 'docker ps --filter name=gpustack-worker --format "{{.Status}}" | head -1 | cut -d" " -f1-2')
   hz=$(curl -sf --max-time 4 "http://$ip:10150/healthz" >/dev/null 2>&1 && echo 通 || echo 不通)
   echo "镜像=$imgs  worker=$wk  238→10150=$hz"
@@ -249,7 +272,19 @@ done
 EOF
 ```
 
-期望 `镜像=6  worker=Up ..  238→10150=通`(vllm-omni 是 soft 预载,5 也可接受)。
+期望 `镜像=4  worker=Up ..  238→10150=通`(vllm-omni 是 soft 预载,3 也可接受)。
+
+**镜像数对了不等于版本对了**:新机器可能是克隆自既有节点的系统盘、出厂就带着一批**旧** ID 的镜像(2026-09-01 的 0051-0055 就是这样)。install 走 `docker load` 会覆盖成 NFS tar 里的版本,但**必须逐台与现网基准比一次 ID**,别默认一致(坑 28):
+
+```bash
+for ip in 10.0.0.155 $(awk 'NF{print $1}' /root/lx2v-new.txt); do    # 第一个是基准节点
+  printf '%-14s ' "$ip"
+  ssh -n -o BatchMode=yes "root@$ip" 'docker images --format "{{.Repository}}:{{.Tag}} {{.ID}}" | grep -E "(gpustack:lx2v-dev|lightx2v:arm64-a100-latest|acestep:arm64-a100-latest|vllm-omni:arm64-a100-latest)" | sed "s#.*/##" | sort | awk "{printf \"%s \", \$2}"'
+  echo
+done
+```
+
+五行 ID 完全一致才算齐平;不齐就整体跑一遍 fleet `upgrade-gpustack` / `upgrade-engine`,别留版本分裂的节点(超分任务落到未升级节点上跑出 6 倍耗时的教训见 `lx2v-fleet.sh` 里的查重注释)。
 **`238→10150=通` 是安全组的唯一硬证据** —— 节点自己的 `curl 127.0.0.1:10150/healthz` 永远是通的,证明不了任何事;必须从 238 打过去。全通就不会踩坑 1/15。
 
 再确认服务端真的认了(`worker_id` 由 server 下发,比容器 `Up` 可信):
@@ -279,6 +314,23 @@ worker 容器 Up ≠ 注册成功,server 端才是最终事实。
 
 新节点默认只对 238 免密(§1.6 ② 做的),Mac 上还进不去。Mac 走跳板 `111.172.214.16` + 每台一个 NAT 端口,别名规则见 `~/.ssh/config` 的 `# >>> gpustack-a100 (auto-generated) >>>` 段:`dev-gpustack-a100-00NN` / `gpuNN`,尾行注释内网 IP。
 
+> **两条免密链路的先后可以反过来,哪条先通就用哪条当跳板**。2026-09-01 接 0051-0055 时是 **Mac 先通**(节点开着密码认证,`ssh-copy-id -p 4805N` 直接装),于是 238 的公钥不用在 5 台上各输一次密码,借 Mac 已有的免密推过去即可:
+>
+> ```bash
+> ssh -n root@111.172.214.42 'cat ~/.ssh/id_ed25519.pub' > /tmp/mgr.pub
+> ssh-keygen -l -f /tmp/mgr.pub                     # 出指纹才算拿对
+> for p in 48051 48052 48053 48054 48055; do
+>   ssh-copy-id -f -i /tmp/mgr.pub -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p $p root@111.172.214.16
+> done
+> ```
+>
+> **`-f` 不能省**:手上只有 `.pub` 没有配对私钥时,不加 `-f` 的 `ssh-copy-id` 会去找同名私钥并报
+> `failed to open ID file '/tmp/mgr': No such file or directory`(它把 `.pub` 后缀截掉了)。代价是 `-f` 跳过"是否已装"的检查,重复执行会写重复行——装完用 `grep -c '^ssh-' ~/.ssh/authorized_keys` 核一下条数。
+>
+> 还要注意 **Mac 的 zsh 交互 shell 默认不认行内 `#` 注释**(坑 24):本手册里带注释的命令直接粘进 Mac 终端会报
+> `zsh: unknown file attribute` 之类的怪错。先 `setopt interactive_comments`,或把注释删掉再粘。
+> 发给 238 的 `<<'EOF'` heredoc 块不受影响(在远端 bash 里执行)。
+
 **⓪ Mac 能直连目标机时(同一局域网、知道密码),不用走 238 跳板,直接 `ssh-copy-id`**:
 
 ```bash
@@ -293,28 +345,31 @@ ssh-copy-id -i ~/.ssh/id_ed25519.pub [-p <端口>] <user>@<目标机IP>
 ssh [-p <端口>] <user>@<目标机IP> hostname
 ```
 
-例(2026-08-24 实测,经跳板机 NAT 端口直连 111.172.214.16:43076):
+例(2026-09-01 实测,0051 经跳板机 NAT 端口直连 111.172.214.16:48051;端口段见 §1.7 ②):
 
 ```bash
-ssh-copy-id -i ~/.ssh/id_ed25519.pub -p 43076 root@111.172.214.16
+ssh-copy-id -i ~/.ssh/id_ed25519.pub -p 48051 root@111.172.214.16
 ```
+
+**端口曾被回收复用过就先清 known_hosts**,否则报 `Host key verification failed`(坑 23):
+`ssh-keygen -R "[111.172.214.16]:48051"`。
 
 `ssh-copy-id` 自己处理换行,不会有 §0.1 坑 22 那种折行写坏 `authorized_keys` 的问题;`Number of key(s) added: 1` 且回显的 `ssh -i ... -p <端口> user@ip` 免密连上就算成功。只要 Mac 能直接 ssh 到目标(不管是局域网 IP、还是公网 IP + NAT 端口这种形式),都走这条⓪路径就够了;真正连不上、必须借 238 中转装公钥的场景才需要下面 ①-⑤ 那一整套。
 
 **装完之后怎么免密登录**:`id_ed25519` 是 ssh 默认会找的私钥,平时**不用带 `-i`**,直接:
 
 ```bash
-ssh -p 43076 root@111.172.214.16
+ssh -p 48051 root@111.172.214.16
 ```
 
 只要不再提示输密码就是装成功了。要是还是要密码,先看是不是端口/IP 弄错了(`ssh-copy-id` 装到了别的机器),再看目标机 `sshd_config` 里 `PubkeyAuthentication`/`AuthorizedKeysFile` 有没有被改过默认值。
 
-嫌每次都要记 `-p 43076` 麻烦,可以照 §1.7 ④ 的做法给它起个别名,写进 `~/.ssh/config`(改前先 `cp ~/.ssh/config ~/.ssh/config.bak.$(date +%F)` 备份一下):
+嫌每次都要记 `-p 48051` 麻烦,可以照 §1.7 ④ 的做法给它起个别名,写进 `~/.ssh/config`(改前先 `cp ~/.ssh/config ~/.ssh/config.bak.$(date +%F)` 备份一下):
 
 ```
 Host 一个好记的名字
     HostName 111.172.214.16
-    Port 43076
+    Port 48051
     User root
     IdentityFile ~/.ssh/id_ed25519
 ```
@@ -336,7 +391,7 @@ EOF
 用 `ssh-copy-id` 而不是 `echo >> authorized_keys`:前者自己处理换行,后者一旦命令被折行就写出畸形两行记录(坑 22)。已经写坏了的先清:
 `ssh -n root@$ip "awk 'NF>2&&/^ssh-/' ~/.ssh/authorized_keys > /tmp/a; mv /tmp/a ~/.ssh/authorized_keys"`。
 
-**② 实测 NAT 端口,不要顺推**。端口由跳板机的 DNAT 规则定,**历史上跳过号**(0025=43047,0026 直接跳到 43051)。逐个端口连进去读内网 IP 才是准的:
+**② 实测 NAT 端口,不要顺推**。端口由跳板机的 DNAT 规则定,**历史上跳过号**(0025=43047,0026 直接跳到 43051);而且**整段端口会被重新规划** —— 2026-09-01 实测已从早期的 `430xx` 段搬到 **`48001-48055` 与编号一一对应**(0051=48051 … 0055=48055),旧文档里 0041-0050 对应 43066-43075、51 号机 43076 的记录全部作废(43076 现在直接 `Connection closed`)。所以每次扩容仍要**逐个端口连进去读内网 IP**,别照抄上一次的映射:
 
 ```bash
 for p in $(seq <起> <止>); do
@@ -368,6 +423,9 @@ for n in $(seq 41 50); do printf 'gpu%-3s ' $n; ssh -n -o BatchMode=yes -o Stric
 
 > **2026-08-20 实测结果**:0041–0050 → 端口 43066–43075(这次恰好连号),内网 IP 依次
 > `10.0.0.230 / .77 / .41 / .121 / .87 / .80 / .176 / .66 / .63 / .25`,与 `lx2v-new.txt` 顺序一致。
+>
+> **2026-09-01 实测结果**:端口段已整体重规划为 `480NN`。0051–0055 → 48051–48055,内网 IP 依次
+> `10.0.0.221 / .46 / .91 / .244 / .180`,hostname 与编号逐台对上,与 `lx2v-new.txt` 顺序一致。
 
 ### 1.8 常量的唯一事实源(防手册与脚本漂移)
 
@@ -379,7 +437,7 @@ for n in $(seq 41 50); do printf 'gpu%-3s ' $n; ssh -n -o BatchMode=yes -o Stric
 |---|---|
 | `http://10.0.0.238` | `SERVER_URL` |
 | `crpi-…cn-shanghai.personal.cr.aliyuncs.com/reputationly` | `REGISTRY` |
-| 六个镜像 tag(§0 清单) | `GPUSTACK_IMAGE` / `ENGINE_IMAGE` / `INDEXTTS_IMAGE` / `ACESTEP_IMAGE` / `BERNINI_IMAGE` / `VLLM_OMNI_IMAGE` |
+| 四个在用镜像 tag(§0 清单) | `GPUSTACK_IMAGE` / `ENGINE_IMAGE` / `ACESTEP_IMAGE` / `VLLM_OMNI_IMAGE`(已下线的 `INDEXTTS_IMAGE` / `BERNINI_IMAGE` 变量仍在,只供 `upgrade-engine` 手动指定) |
 | `100.125.40.2` + `/share-LLM`、`/share-output` | `NFS_SERVER` / `NFS_MODELS_EXPORT` / `NFS_OUTPUT_EXPORT` |
 | `/nfs-models/_transfer/*.tar`、`nvidia-repo/` | `TRANSFER_DIR` + 各 `*_TAR`、`NVIDIA_REPO_DIR` |
 | `gpustack-worker`、`10150` | `WORKER_NAME` / `WORKER_PORT` |
@@ -394,6 +452,26 @@ for n in $(seq 41 50); do printf 'gpu%-3s ' $n; ssh -n -o BatchMode=yes -o Stric
 | `/nfs-models/_transfer/lx2v-node.sh` | `NFS_SCRIPT`(fleet 每次执行前从这里拉最新脚本) |
 
 **不在脚本里的**:跳板机 `111.172.214.16` 与各节点 NAT 端口、别名 `gpuNN` —— 唯一事实源是 Mac 的 `~/.ssh/config`(§1.7),脚本和集群都不知道它们的存在。238 的公网入口 `111.172.214.42` 同理。
+
+### 1.9 实录:0051-0055 接入(2026-09-01,50 → 55 台)
+
+按 §1.6 的动线走了一遍五台扩容,全程约 40 分钟(含验收与收尾),`OK=5 FAIL=0`。与手册既有描述**不一样的地方**都已回写到对应小节,这里留一份完整时间线备查。
+
+| 步骤 | 实际 |
+|---|---|
+| 免密(Mac→节点) | 节点开着密码认证,`ssh-copy-id -p 4805N` 直接装,5 台各输一次密码 |
+| 免密(238→节点) | 借上一步的 Mac 免密推 238 公钥(§1.7 引文),**没再输密码**;238 上 `.221`/`.244` 报 `Host key verification failed`,是内网 IP 被回收复用,`ssh-keygen -R <ip>` 清掉即可 |
+| 安全组 | 用 §1.1 的临时监听法预验证,**5 台本来就在 `newapi` 组**,不用去控制台改 |
+| 摸底 | 全部 aarch64 / 4×A100 / **驱动 580.65.06** / 无 worker 残留 |
+| `setup-base` | **8-12 秒**(出厂盘已带 docker + nvidia-toolkit,step 3/5 基本跳过) |
+| `install --offline -j 5` | **每台 6-7 分钟**(四镜像约 32G) |
+| 验收 | 镜像=4 / worker Up / 238→10150 通 / `worker_id 104-108` / server 端 55 台全 READY |
+| 收尾 | 清单合并至 55 行、`~/.ssh/config` 加 gpu51-gpu55、删两个已下线镜像(每台释放 **29G**) |
+
+**这批机器不是白板**:出厂系统盘像是克隆自某台既有节点 —— docker/toolkit/NFS 全就绪,而且**预装了六个引擎镜像**(含已下线的 bernini/indextts2),连 `/var/log/nvidia-installer.log` 都是 2026-08-24(与老节点同一次驱动升级)。带来两个后果:
+
+1. 预装的 vllm-omni 是**旧 ID**(`05456c88`),`install` 的 `docker load` 会覆盖对齐,但**必须按 §1.6 ⑦ 逐台比对镜像 ID 才能确认**;
+2. 白占约 60G 磁盘(bernini 29.5G + indextts2 30.5G),按 §3 删掉后每台释放 29G(119G → 90G)。
 
 ---
 
@@ -434,7 +512,7 @@ bash /root/lx2v-node.sh upgrade-engine --engine vllm-omni    # vLLM-Omni 全模�
 bash /root/lx2v-node.sh prepare-transfer
 ```
 
-做四件事:拉**六镜像**(gpustack / lightx2v / indextts2 / acestep / bernini / vllm-omni)arm64 变体 → 按 digest 变化 save 到 NFS 六个 tar(未变的跳过;带写入进度,`.tmp`+`mv` 防半截)→ **x86 机器上自动把本地 gpustack tag 拉回 amd64**(否则 238 之后重建 server 容器会 exec format error——坑 §5.5)→ 把脚本自身同步到 `_transfer/`。vllm-omni 是 soft:拉不到只告警、不阻塞其余 tar。
+做四件事:拉**四镜像**(gpustack / lightx2v / acestep / vllm-omni)arm64 变体 → 按 digest 变化 save 到 NFS 四个 tar(未变的跳过;带写入进度,`.tmp`+`mv` 防半截)→ **x86 机器上自动把本地 gpustack tag 拉回 amd64**(否则 238 之后重建 server 容器会 exec format error——坑 §5.5)→ 把脚本自身同步到 `_transfer/`。vllm-omni 是 soft:拉不到只告警、不阻塞其余 tar。已下线的 indextts2/bernini 不再同步,NFS 上那两个旧 tar 是历史遗留。
 
 ### 2.4 一次完整现网升级(以 2026-07-20 gpustack + vllm-omni 为例)
 
@@ -473,14 +551,14 @@ bash /root/lx2v-fleet.sh -j 3 upgrade-engine --engine vllm-omni --offline
 ```bash
 # ① 打回滚锚 —— 必须是**第一步**!
 #    lx2v-dev 是浮动 tag,任何 pull 之后旧镜像就没有名字了、回滚就无从谈起。
-#    注意 prepare-transfer 自己就会 pull(它拉 arm64 六镜像,x86 上还会再拉一次
+#    注意 prepare-transfer 自己就会 pull(它拉 arm64 四镜像,x86 上还会再拉一次
 #    amd64 把本地 tag 恢复回来,见 lx2v-node.sh 的 cmd_prepare_transfer),
 #    所以这一步必须排在 prepare-transfer **前面**,不是仅仅排在 ③ 的 pull 前面。
 docker tag crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:lx2v-dev \
   gpustack-rollback:pre-$(date +%Y%m%d)
 docker images gpustack-rollback      # 确认锚已建再往下走
 
-# ② 刷 NFS tar(拉六镜像,digest 没变的自动跳过)
+# ② 刷 NFS tar(拉四镜像,digest 没变的自动跳过)
 bash /root/lx2v-node.sh prepare-transfer
 
 # ③ 升 server —— 必须先于 worker(版本校验软 + DB/API 方向 server ≥ worker)
@@ -498,9 +576,9 @@ bash /root/lx2v-fleet.sh -j 10 upgrade-gpustack --offline
 # ⑤ 全 worker 换引擎镜像 —— 只列这次变了的,没变的别动(改这里)
 bash /root/lx2v-fleet.sh -j 10 upgrade-engine --engine lightx2v --offline
 bash /root/lx2v-fleet.sh -j 10 upgrade-engine --engine vllm-omni --offline
-# 可选:indextts / acestep / bernini
+# 可选:acestep;indextts / bernini 已下线,只在明确需要时手动指定
 
-# ⑥ 巡检:worker 状态、六镜像 ID、NFS 挂载、每卡显存、实例容器
+# ⑥ 巡检:worker 状态、四镜像 ID、NFS 挂载、每卡显存、实例容器
 bash /root/lx2v-fleet.sh -j 10 status
 ```
 
@@ -532,7 +610,7 @@ docker run -d --name gpustack-server --restart unless-stopped -p 80:80 \
 ```bash
 bash /root/lx2v-node.sh status
 ```
-一屏看:worker 容器状态/healthz、六镜像 ID(gpustack/lightx2v/indextts2/acestep/bernini/vllm-omni,与 §0 清单比对)、NFS 挂载、每卡显存、引擎实例容器(按 runtime label 精确识别,含 -init/-unhealthy-restart)。
+一屏看:worker 容器状态/healthz、镜像 ID(四镜像 gpustack/lightx2v/acestep/vllm-omni,与 §0 清单比对;老节点上可能还列出已下线的 indextts2/bernini)、NFS 挂载、每卡显存、引擎实例容器(按 runtime label 精确识别,含 -init/-unhealthy-restart)。
 
 ```bash
 bash /root/lx2v-node.sh clean                     # 删 worker + 硬杀全部引擎实例容器(kill+sleep+rm -f)
@@ -541,6 +619,27 @@ bash /root/lx2v-node.sh clean --kill-gpu-procs    # 追加 kill -9 GPU 上全部
 ```
 
 镜像默认全保留(重装可增量复用)。若本机历史上跑过**匿名卷**,老数据可能在 64 位 hash 卷里,`docker volume ls` 逐个确认后再清。
+
+**回收已下线镜像的磁盘(indextts2 / bernini,每台约 29G)**——`clean` 不碰镜像,要单独删:
+
+```bash
+# 238 上,对一批节点(改 -f 换清单;先确认没有容器在用这两个镜像)
+R=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly
+for ip in $(awk 'NF{print $1}' /root/lx2v-new.txt); do
+  printf '%-14s ' "$ip"
+  ssh -n -o BatchMode=yes "root@$ip" "
+    docker ps -a --format '{{.Image}}' | grep -Ei 'bernini|indextts' && { echo '有容器在用,跳过'; exit 0; }
+    docker rmi ${R}/bernini:arm64-a100-latest ${R}/indextts2:arm64-a100-latest >/dev/null 2>&1
+    df -h / | tail -1"
+done
+```
+
+> ☠️ **绝对不要用 `docker image prune` / `docker system prune` 清这批机器**(坑 27)。
+> 节点用的是 **containerd 镜像存储**(`docker info` 里 `Storage Driver: overlayfs` +
+> `driver-type: io.containerd.snapshotter.v1`),该存储下 `docker images -f dangling=true`
+> 会把**正在用的** `lightx2v` / `gpustack` / `acestep` 一并报成悬空(它们在 `docker images -a`
+> 里明明带着 tag)—— prune 一把就把在用镜像删了。只能按 tag 精确 `docker rmi`。
+> 判断某个镜像是不是真悬空,以 `docker images -a` 里 `REPOSITORY` 是否为 `<none>` 为准。
 
 ---
 
@@ -650,7 +749,12 @@ curl -s -X POST http://10.0.0.238/v1/videos -H "Authorization: Bearer $KEY" \
 | 20 | **杀了 ssh,远端还在跑** | 上面那批 ssh 被 kill 后,远端 `pgrep -al apt` 仍见 `apt-get install nvidia-container-toolkit` | ssh 无 tty 时远端进程变孤儿继续执行。**别急着重跑**——打断 apt 会留 dpkg 半配置状态;等它跑完再重跑(`setup-base`/`install` 都幂等) |
 | 21 | **`cat >>` 合并节点清单粘连** | `lx2v-nodes.txt` 里出现 `10.0.0.4710.0.0.236` 这种畸形行,两个 IP 同时丢失 | 源文件末尾无换行符所致。用 `awk 'NF{print $1}' a.txt b.txt \| sort -u` 合并(awk 按记录读,不受影响);合并后 `grep -c .` 核行数 |
 | 22 | **长命令粘进终端被折行截断** | 退出码 0、回显一片 `ok`,但结果是错的。实例:公钥被折成两行写进 `authorized_keys`(`cat -A` 可见第二行以空格开头),ssh 一直 `Permission denied`;另一例 `mountpoint -q` 与参数被拆开,报 `bad usage` + `/nfs-output: Is a directory` | 见 **§0.1**:多步操作走 `ssh 238 'bash -s' <<'EOF'`,终端里只敲短单行;写公钥用 `ssh-copy-id -f -i`(自己处理换行)而非 `echo >>`;**每个写入操作配独立校验**,别信 `&& echo ok` |
-| 23 | **NAT 端口复用导致 host key 失效** | Mac 上新配的别名 `ssh gpu41` 报 `Host key verification failed`;端口是通的、公钥也装了 | 回收的机器把 NAT 端口留给了新机,本地 `known_hosts` 还存着老机器的 key。清掉重采:`ssh-keygen -R "[111.172.214.16]:<端口>"`。另注意 **`nc -z` 探不出真假**(NAT 网关对任意端口都回 open),判端口只能真 ssh 进去读 `hostname -I` |
+| 23 | **NAT 端口复用导致 host key 失效** | Mac 上新配的别名 `ssh gpu41` 报 `Host key verification failed`;端口是通的、公钥也装了 | 回收的机器把 NAT 端口留给了新机,本地 `known_hosts` 还存着老机器的 key。清掉重采:`ssh-keygen -R "[111.172.214.16]:<端口>"`。另注意 **`nc -z` 探不出真假**(NAT 网关对任意端口都回 open),判端口只能真 ssh 进去读 `hostname -I`。**内网 IP 同样会被回收**:238 上 ssh 新节点报同样的错时,清的是 `ssh-keygen -R <内网IP>` |
+| 24 | **Mac 的 zsh 不认行内 `#` 注释** | 从手册粘一段带注释的命令进 Mac 终端,报 `zsh: unknown file attribute: ^%` + `ssh-copy-id: ERROR: Too many arguments`,而同样的命令在节点上跑没问题 | zsh 交互 shell 默认 `interactive_comments` 关闭,`#` 之后的中文被当成参数、`(...)` 被当成 glob 限定符。`setopt interactive_comments`,或粘之前删掉注释。发给 238 的 heredoc 块不受影响(远端是 bash) |
+| 25 | **只有 `.pub` 时 `ssh-copy-id` 报找不到 ID 文件** | `failed to open ID file '/tmp/mgr': No such file or directory` —— 文件明明是 `/tmp/mgr.pub` | 不加 `-f` 时它会截掉 `.pub` 去找配对私钥。**加 `-f`**(手册各处都这么写)。代价是跳过去重检查,装完用 `grep -c '^ssh-' ~/.ssh/authorized_keys` 核条数 |
+| 26 | **`pkill -f` 把自己杀了** | `ssh node "pkill -f 'http.server 10150'"` 退出码正常,但目标进程还在 | `-f` 匹配整条命令行,ssh 远端执行的那条 `bash -c pkill -f http.server 10150` 自己也命中,先杀了自身所在的 shell。模式要锚定进程名开头:`pkill -f "^python3 -m http.server"` |
+| 27 | ☠️ **containerd 存储下 `docker image prune` 会删在用镜像** | `docker images -f dangling=true` 把带 tag 的 `lightx2v`/`gpustack`/`acestep` 也列为悬空 | 节点用的是 containerd 镜像存储(`docker info`: `overlayfs` + `io.containerd.snapshotter.v1`),该 filter 不可信。**只按 tag 精确 `docker rmi`,永不 prune**;判真悬空看 `docker images -a` 的 `REPOSITORY` 是否 `<none>`(见 §3) |
+| 28 | **新机预装的镜像是旧版本** | 新节点 `docker images` 数量对得上,但某个引擎跑出来行为/性能和现网不一致 | 新机器可能克隆自既有节点系统盘,带着一批旧 ID 镜像(0051-0055 的 vllm-omni 就是)。`install` 的 `docker load` 会覆盖,但**必须按 §1.6 ⑦ 逐台与基准节点比对镜像 ID** 才算数,别以"镜像已经在了"为准 |
 
 ## 6. 脚本自身的升级
 
