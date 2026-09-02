@@ -78,6 +78,25 @@ class VideoTaskBase(SQLModel):
     instance_id: Optional[int] = Field(default=None, index=True)
     native_task_id: Optional[str] = Field(default=None)
 
+    # When THIS attempt entered the mapped instance's engine queue. Orders the
+    # tasks within one instance's FIFO for the queue-position report.
+    #
+    # It has to be its own column, for the same reason run_started_at does:
+    # ``updated_at`` is rewritten by every status poll, and ``created_at`` is
+    # wrong in the one case the report has to get right — a requeued task keeps
+    # its original creation time while rejoining the engine queue at the BACK,
+    # so ordering by created_at would report it ahead of tasks that are really
+    # in front of it. Attempt-scoped, so it is cleared by ATTEMPT_RESET.
+    #
+    # Both dispatch paths stamp it only after the engine ACCEPTS the submit,
+    # never at row-insert time — the row is written before the submit to avoid
+    # orphaning the job, so a first dispatch is NULL here for up to the submit
+    # timeout. NULL therefore means "no place in any queue yet", and the report
+    # answers "unknown" rather than ordering by a time the engine never saw.
+    assigned_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(UTCDateTime(), nullable=True)
+    )
+
     # Result location. GPUStack only writes NFS and returns nfs_path (§7.3);
     # new-api reads it and owns OBS upload / delivery URLs.
     nfs_path: Optional[str] = Field(default=None)

@@ -63,10 +63,17 @@ SOURCE_NONE = "none"
 # successor at 95% for the entire re-run, which is exactly the "reads as hung"
 # failure the ceilings above exist to avoid. Every caller that ends an attempt
 # (requeue, re-dispatch) folds this in.
+#
+# ``assigned_at`` rides along for the same reason: it marks the attempt's place
+# in an instance's engine queue, and a dead attempt holds no place. Leaving a
+# stale value behind would put a requeued task's *old* position into the queue
+# report while it is waiting for a fresh instance. A caller that STARTS a new
+# attempt must set it again after folding this in — see redispatch_task.
 ATTEMPT_RESET: dict[str, Any] = {
     "progress": 0.0,
     "phase": None,
     "run_started_at": None,
+    "assigned_at": None,
 }
 
 

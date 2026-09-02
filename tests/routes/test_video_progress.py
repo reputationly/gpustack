@@ -39,7 +39,6 @@ from gpustack.server.video_progress import (
     normalize_progress,
 )
 
-
 # ── source priority ─────────────────────────────────────────────────────────
 
 
@@ -149,7 +148,17 @@ def test_attempt_reset_clears_every_field_the_fold_reads():
     # Anything the fold carries forward has to be listed here, or a dead
     # attempt's state leaks into its retry. run_started_at especially: leaving it
     # set makes the retry's first poll look minutes old.
-    assert ATTEMPT_RESET == {"progress": 0.0, "phase": None, "run_started_at": None}
+    #
+    # assigned_at is not read by the fold, but it is attempt-scoped for the same
+    # reason: it marks the attempt's place in an instance's engine queue, and a
+    # dead attempt holds no place. Left behind, a requeued task reports its old
+    # position while it is waiting for a fresh instance.
+    assert ATTEMPT_RESET == {
+        "progress": 0.0,
+        "phase": None,
+        "run_started_at": None,
+        "assigned_at": None,
+    }
 
 
 def test_attempt_reset_fields_exist_on_the_row():

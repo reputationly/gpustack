@@ -11,7 +11,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 import aiohttp
 from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse
-from sqlalchemy import func
+from sqlalchemy import and_, func, or_
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -1141,6 +1141,15 @@ async def create_video_task(request: Request, user: CurrentUserDep):
                 params=engine_body,
                 state=VideoTaskStateEnum.ASSIGNED,
                 instance_id=instance.id,
+                # assigned_at stays NULL until the submit below succeeds: the
+                # engine has accepted nothing yet, and this row exists only to
+                # keep a crash from orphaning the job. Stamping it here would
+                # date the attempt up to _SUBMIT_TIMEOUT before the engine
+                # actually queued it, so two tasks racing onto the same
+                # instance could be reported in the opposite order to the one
+                # the engine will run them in. Within this window
+                # _queue_counts reports "unknown", which is the contract's
+                # documented answer for a task mid-dispatch.
                 nfs_path=out_abs,
                 output_root=out_root,
             ),
@@ -1173,12 +1182,22 @@ async def create_video_task(request: Request, user: CurrentUserDep):
                     message=err.message, is_openai_exception=True
                 )
             raise BadRequestException(message=err.message, is_openai_exception=True)
-        await task.update(session, {"native_task_id": native_task_id})
+        await task.update(
+            session,
+            {
+                "native_task_id": native_task_id,
+                # Lands with native_task_id, because they record the same
+                # event: the engine took the job, so this attempt now holds a
+                # place in that instance's FIFO. Same instant redispatch_task
+                # uses, so both dispatch paths order by the same clock.
+                "assigned_at": datetime.now(timezone.utc),
+            },
+        )
     logger.info(
         f"Video task {public_id} assigned to instance {instance.id} "
         f"(native={native_task_id}, model={model_name})"
     )
-    return _public(task)
+    return await _public_with_queue(task)
 
 
 def _stream_upload_to_nfs(src, abs_path: str) -> int:
@@ -1544,11 +1563,32 @@ async def redispatch_task(
             "retry_count": attempts + 1,
             # New attempt, new clock AND new bar: the dead run's progress must
             # not carry over, or an attempt that reached the estimate ceiling
-            # freezes its successor at 95% for the whole re-run. Normally the
-            # requeue that produced this QUEUED row already cleared it; repeated
-            # here so re-dispatch is self-sufficient for rows that were never
-            # requeued (QUEUED from birth, no free instance on an earlier sweep).
+            # freezes its successor at 95% for the whole re-run.
+            #
+            # Redundant today, and kept anyway: every row that reaches this
+            # function has already been reset, because **no row is ever QUEUED
+            # from birth**. The one insert path (create_video_task) writes
+            # ASSIGNED, and the only two writers of QUEUED — the sweeper's
+            # _requeue and the engine-404 fold in fetch_engine_status_updates —
+            # each fold ATTEMPT_RESET in themselves. Repeating it keeps
+            # re-dispatch correct on its own terms instead of by reading two
+            # other call sites.
+            #
+            # Do not "simplify" by weakening that invariant: _queue_counts'
+            # QUEUED branch counts ALL in-flight rows for the model rather than
+            # only those created before the task, and that is only right
+            # because a queued row's created_at is its ORIGINAL submission —
+            # older than the tasks that took the instances while it was dead.
+            # A new insert path that writes QUEUED would silently make the
+            # queue report answer "starting now" to a task behind a full fleet.
             **ATTEMPT_RESET,
+            # MUST stay after the spread: ATTEMPT_RESET clears assigned_at
+            # (the dead attempt's queue slot is gone) and this new attempt's
+            # slot is now. A dict literal keeps the LAST value for a repeated
+            # key, so this line's position is load-bearing — moving it above
+            # the spread would silently null the column and drop this task out
+            # of the queue-position ordering.
+            "assigned_at": datetime.now(timezone.utc),
         },
     )
     logger.info(
@@ -1569,18 +1609,18 @@ async def get_video_task(task_id: str, request: Request, user: CurrentUserDep):
             raise NotFoundException(message="Task not found", is_openai_exception=True)
         _authorize_task(task, user)
         if task.state in VIDEO_TASK_TERMINAL_STATES:
-            return _public(task)
+            return await _public_with_queue(task, session)
         if not task.instance_id or not task.native_task_id:
             # Requeued and not yet re-dispatched by the sweeper.
-            return _public(task)
+            return await _public_with_queue(task, session)
 
         instance = await ModelInstanceService(session).get_by_id(task.instance_id)
         if not instance or instance.state != ModelInstanceStateEnum.RUNNING:
             # Instance is gone; leave the row for the death-requeue sweeper.
-            return _public(task)
+            return await _public_with_queue(task, session)
         worker: Worker = await WorkerService(session).get_by_id(instance.worker_id)
         if not worker:
-            return _public(task)
+            return await _public_with_queue(task, session)
 
     # Session closed — the worker round-trip (up to _STATUS_TIMEOUT) must not
     # pin a pooled DB connection, same convention as openai.py's proxy path.
@@ -1599,7 +1639,7 @@ async def get_video_task(task_id: str, request: Request, user: CurrentUserDep):
             if fresh and fresh.state not in VIDEO_TASK_TERMINAL_STATES:
                 await fresh.update(session, updates)
                 task = fresh
-    return _public(task)
+    return await _public_with_queue(task)
 
 
 async def fetch_engine_status_updates(
@@ -1782,7 +1822,7 @@ async def cancel_video_task(task_id: str, request: Request, user: CurrentUserDep
             raise NotFoundException(message="Task not found", is_openai_exception=True)
         _authorize_task(task, user)
         if task.state in VIDEO_TASK_TERMINAL_STATES:
-            return _public(task)
+            return await _public_with_queue(task, session)
         instance = None
         worker = None
         native_task_id = task.native_task_id
@@ -1808,7 +1848,7 @@ async def cancel_video_task(task_id: str, request: Request, user: CurrentUserDep
         )
     async with async_session() as session:
         task = await VideoGenerationTask.one_by_field(session, "task_id", task_id)
-    return _public(task)
+    return await _public_with_queue(task)
 
 
 def _public(task: VideoGenerationTask) -> Dict[str, Any]:
@@ -1833,4 +1873,148 @@ def _public(task: VideoGenerationTask) -> Dict[str, Any]:
         "error_type": task.error_type,
         "progress": 100.0 if done else round(task.progress or 0.0, 1),
         "phase": task.phase,
+    }
+
+
+async def _public_with_queue(
+    task: VideoGenerationTask, session: Optional[AsyncSession] = None
+) -> Dict[str, Any]:
+    """``_public`` plus the queue report. Every status-returning route goes
+    through here so a caller never has to know which routes bothered to compute
+    it.
+
+    Pass ``session`` when one is already open. Without it this opens its own,
+    and a caller that is already inside ``async with async_session()`` would
+    hold two pooled connections at once — on the GET poll path, which every
+    in-flight task hits every 15s, that doubles peak checkouts for one COUNT.
+    """
+    body = _public(task)
+    body.update(await _queue_info(task, session))
+    return body
+
+
+async def _queue_info(
+    task: VideoGenerationTask, session: Optional[AsyncSession] = None
+) -> Dict[str, Any]:
+    """How many generations must finish before this task starts, and roughly
+    how long that is.
+
+    ``queue_ahead`` is deliberately in units of *generations on this task's own
+    path*, not "rows in the table". A model with 8 instances draining 8 jobs at
+    once must not tell the 8th submitter "7 people ahead of you" when nobody is
+    actually in front of them. So:
+
+    - ASSIGNED — the task already sits in one instance's engine FIFO, and only
+      that instance's earlier tasks block it. Tasks on the other seven
+      instances are irrelevant, which makes this both the smaller number and
+      the honest one.
+    - QUEUED — no instance yet, so fall back to the fleet-wide estimate
+      ``depth_ahead // instances``: the same arithmetic ``_check_admission``
+      uses to decide whether to accept the job in the first place, so the
+      number a client sees cannot contradict the reason it was let in.
+
+    ``None`` means "cannot say" and the client should fall back to a plain
+    "queued" message — never guessed at, because a wrong position is worse than
+    no position.
+    """
+    unknown = {"queue_ahead": None, "estimated_start_seconds": None}
+    if task.state in VIDEO_TASK_TERMINAL_STATES:
+        return unknown
+    if task.state == VideoTaskStateEnum.RUNNING:
+        return {"queue_ahead": 0, "estimated_start_seconds": 0}
+
+    cfg = get_global_config()
+    # task.model_name is the CALLER-supplied string, which is why the lookup
+    # below can only substring-match — see _lookup_by_model's docstring. This is
+    # the poller case it describes, so table row order (longest key first)
+    # matters for the value we get back.
+    latency = _model_latency(cfg, task.model_name, task.task_type)
+
+    if session is not None:
+        return await _queue_counts(session, task, latency)
+    async with async_session() as own_session:
+        return await _queue_counts(own_session, task, latency)
+
+
+async def _queue_counts(
+    session: AsyncSession, task: VideoGenerationTask, latency: int
+) -> Dict[str, Any]:
+    """The two counting queries behind ``_queue_info``; split out only so the
+    caller can decide where the session comes from."""
+    unknown = {"queue_ahead": None, "estimated_start_seconds": None}
+    if task.state == VideoTaskStateEnum.ASSIGNED:
+        if task.instance_id is None or task.assigned_at is None:
+            # Mid-dispatch, or a row that predates the assigned_at column
+            # and was not caught by the backfill. No position to report.
+            return unknown
+        stmt = (
+            select(func.count())
+            .select_from(VideoGenerationTask)
+            .where(
+                VideoGenerationTask.instance_id == task.instance_id,
+                # Enum MEMBERS, not .value: the ORM persists the member
+                # NAME, so filtering by the lower-case value matches
+                # nothing (same trap documented in
+                # select_least_pending_instance).
+                VideoGenerationTask.state.in_(
+                    [VideoTaskStateEnum.ASSIGNED, VideoTaskStateEnum.RUNNING]
+                ),
+                VideoGenerationTask.assigned_at.is_not(None),
+                VideoGenerationTask.assigned_at < task.assigned_at,
+            )
+        )
+        ahead = int((await session.exec(stmt)).first() or 0)
+        return {
+            "queue_ahead": ahead,
+            "estimated_start_seconds": ahead * latency,
+        }
+
+    # QUEUED: no instance yet, so the question is when a slot frees up.
+    #
+    # EVERY queued row is a requeued one — the insert path is born ASSIGNED
+    # (see create_video_task) and only the sweeper's _requeue and the
+    # engine-404 fold ever write QUEUED. So its created_at is the ORIGINAL
+    # submission, older than the tasks that took the instances while this one
+    # was dead: counting "rows created before me" would exclude exactly the
+    # work that is blocking us, and answer 0 — which the contract reads as
+    # "starting now" — for a task queued behind a fully busy fleet.
+    #
+    # What is really ahead of a task holding no slot:
+    #   - every in-flight row on this model, whenever it was created, because
+    #     each one occupies engine capacity we are waiting on;
+    #   - queued peers created before us. A tiebreak, not a promise: the
+    #     sweeper drains QUEUED in no particular order (no ORDER BY), so this
+    #     is the fairest split available between rows that are all waiting.
+    # floor(that / instances) is the arithmetic _check_admission used to let
+    # the task in, over a subset of the rows it counted — so the number can
+    # never exceed, and never contradict, the admission estimate.
+    if task.model_id is None:
+        return unknown
+    instances = len(
+        await ModelInstanceService(session).get_running_instances(task.model_id)
+    )
+    if instances <= 0:
+        # Nothing is draining the queue; any number would be a fiction.
+        return unknown
+    stmt = (
+        select(func.count())
+        .select_from(VideoGenerationTask)
+        .where(
+            VideoGenerationTask.model_id == task.model_id,
+            or_(
+                VideoGenerationTask.state.in_(
+                    [VideoTaskStateEnum.ASSIGNED, VideoTaskStateEnum.RUNNING]
+                ),
+                and_(
+                    VideoGenerationTask.state == VideoTaskStateEnum.QUEUED,
+                    VideoGenerationTask.created_at < task.created_at,
+                ),
+            ),
+        )
+    )
+    depth_ahead = int((await session.exec(stmt)).first() or 0)
+    ahead = depth_ahead // instances
+    return {
+        "queue_ahead": ahead,
+        "estimated_start_seconds": ahead * latency,
     }

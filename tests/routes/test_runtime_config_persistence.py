@@ -34,8 +34,12 @@ LATENCY = {"ltx2.5-hd": 265, "z-image": 7}
 QUEUE_WAIT = {"ltx2.5-hd": 530, "z-image": 25}
 
 MIGRATIONS = os.path.join(os.path.dirname(gpustack.__file__), "migrations")
-# The revision this table's migration is chained to.
-PREVIOUS_REVISION = "f3a1b2c4d5e7"
+# Last revision before the fork's own chain. Stamping HERE rather than directly
+# in front of the runtime_configs migration keeps ``upgrade(head)`` valid as the
+# chain grows: a later revision may touch a table an earlier one creates (the
+# assigned_at migration ALTERs video_generation_tasks, created by e1f2a3b4c5d6),
+# and stamping past that creation made the upgrade fail with "no such table".
+PREVIOUS_REVISION = "c4d7e8f9a0b1"
 
 
 def _build_table_via_migration(db_path) -> None:
@@ -50,8 +54,9 @@ def _build_table_via_migration(db_path) -> None:
     cfg = AlembicConfig()
     cfg.set_main_option("script_location", MIGRATIONS)
     cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
-    # Stamp instead of replaying the whole chain: an upstream revision uses
-    # create_foreign_key, which SQLite cannot do. We only care about this one.
+    # Stamp instead of replaying the whole chain: upstream revisions use
+    # create_foreign_key, which SQLite cannot do. Everything from
+    # PREVIOUS_REVISION on is this fork's, and does replay.
     alembic_command.stamp(cfg, PREVIOUS_REVISION)
     alembic_command.upgrade(cfg, "head")
 
