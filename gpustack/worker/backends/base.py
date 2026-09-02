@@ -648,7 +648,8 @@ class InferenceServer(ABC):
             A ContainerEnvConfig containing container configuration:
             - user: Run as specific UID (int)
             - group: Run as specific GID (int)
-            - shm_size_gib: Shared memory size in GiB (float, default 10.0)
+            - shm_size_gib: Shared memory size in GiB (float; 默认取自
+              ContainerEnvConfig.shm_size_gib,那里写了为什么不是 10)
         """
         config = ContainerEnvConfig()
 
@@ -672,15 +673,23 @@ class InferenceServer(ABC):
                     f"Invalid GPUSTACK_MODEL_RUNTIME_GID value: {gid_str}, ignoring"
                 )
 
-        # Read shared memory size in GiB
-        shm_str = env.get("GPUSTACK_MODEL_RUNTIME_SHM_SIZE_GIB", "10")
-        try:
-            config.shm_size_gib = float(shm_str)
-        except ValueError:
-            logger.warning(
-                f"Invalid GPUSTACK_MODEL_RUNTIME_SHM_SIZE_GIB value: {shm_str}, using default 10.0"
-            )
-            config.shm_size_gib = 10.0
+        # Read shared memory size in GiB.
+        #
+        # 默认值只此一处 —— 从 ContainerEnvConfig 取,别再在这里写字面量。之前这里和
+        # schema 各写一个 "10",改一处另一处不动,静默分叉。默认值为什么是 32 而不是
+        # 10,见 ContainerEnvConfig.shm_size_gib 的注释(视频模型的 worker→APIServer
+        # 结果走 /dev/shm,超了是 SIGBUS,报出来却像通信故障)。
+        default_shm_size_gib = ContainerEnvConfig.model_fields["shm_size_gib"].default
+        shm_str = env.get("GPUSTACK_MODEL_RUNTIME_SHM_SIZE_GIB")
+        if shm_str is not None:
+            try:
+                config.shm_size_gib = float(shm_str)
+            except ValueError:
+                logger.warning(
+                    f"Invalid GPUSTACK_MODEL_RUNTIME_SHM_SIZE_GIB value: {shm_str}, "
+                    f"using default {default_shm_size_gib}"
+                )
+                config.shm_size_gib = default_shm_size_gib
 
         return config
 

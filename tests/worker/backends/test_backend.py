@@ -1274,3 +1274,49 @@ def test_configured_env_no_injection_when_not_triggered(monkeypatch):
     env = server._get_configured_env()
 
     assert "NVIDIA_DISABLE_REQUIRE" not in env
+
+
+# ── /dev/shm 上限 ────────────────────────────────────────────────────────────
+#
+# 2026-09-02:LTX-2.5 两阶段在 GPUStack 上跑 2K 13 秒稳定崩溃,而同镜像同参数手工
+# 起容器(大 shm)连跑 14 发零失败 —— 唯一差异就是这里的默认 10 GiB。多进程推理后端
+# 把 worker → APIServer 的结果走 /dev/shm 传,视频模型这一份是整段片子
+# (W×H×F×3×4);写越界拿到的是 SIGBUS,上层只报
+# `Diffusion worker(s) died unexpectedly: [...(exitcode=None)]` 加一串 NCCL 断连,
+# **看起来像显存不足或通信故障**。排查代价极高,所以这两条钉死。
+
+
+def test_shm_default_covers_2k_video_payload():
+    """默认 shm 必须放得下对外最大的视频档,否则是静默 SIGBUS 而不是可读的报错。"""
+    from gpustack.schemas.inference_backend import ContainerEnvConfig
+
+    # 2K 15 秒:2496×1408×361 帧,float32 RGB
+    needed_gib = 2496 * 1408 * 361 * 3 * 4 / (1 << 30)
+    assert needed_gib > 10, "前提变了:2K 15 秒不再超过旧默认值,这条测试要重写"
+    assert ContainerEnvConfig().shm_size_gib >= needed_gib, (
+        f"默认 shm {ContainerEnvConfig().shm_size_gib} GiB 放不下 2K 15 秒需要的 "
+        f"{needed_gib:.1f} GiB;超了不会报 OOM,是 SIGBUS 静默杀 worker"
+    )
+
+
+def test_shm_env_override_and_default_single_source():
+    """环境变量能覆盖;未设置/设错时回落到 schema 的默认值,不是就地写死的字面量。"""
+    from gpustack.schemas.inference_backend import ContainerEnvConfig
+    from gpustack.worker.backends.base import InferenceServer
+
+    default = ContainerEnvConfig().shm_size_gib
+
+    assert InferenceServer._get_container_env_config({}).shm_size_gib == default
+    assert (
+        InferenceServer._get_container_env_config(
+            {"GPUSTACK_MODEL_RUNTIME_SHM_SIZE_GIB": "64"}
+        ).shm_size_gib
+        == 64.0
+    )
+    # 填了垃圾值要回落到同一个默认,而不是另一个硬编码数
+    assert (
+        InferenceServer._get_container_env_config(
+            {"GPUSTACK_MODEL_RUNTIME_SHM_SIZE_GIB": "not-a-number"}
+        ).shm_size_gib
+        == default
+    )

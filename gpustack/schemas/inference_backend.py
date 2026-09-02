@@ -26,7 +26,26 @@ class ContainerEnvConfig(BaseModel):
 
     user: Optional[int] = None
     group: Optional[int] = None
-    shm_size_gib: float = 10.0
+    # /dev/shm 上限。多进程推理后端(vLLM / vLLM-Omni 的 MultiProcExecutor)把
+    # worker → APIServer 的结果走共享内存传,视频类模型这一份是整段片子:
+    # W×H×F×3×4(float32 RGB)。LTX-2.5 两阶段在 4×A100 上实测——
+    #
+    #   1080p 15 秒 1920×1088×361 =  9.05 GB  ✅
+    #   2K    13 秒 2496×1408×313 = 13.2  GB  ❌ 旧默认 10 GiB 下必死
+    #   2K    15 秒 2496×1408×361 = 15.2  GB  ❌
+    #
+    # 超了写不进 tmpfs,拿到的是 **SIGBUS**:worker 进程瞬间消失,没有 Python 栈、
+    # 没有 CUDA OOM、`Process.exitcode` 取不到,上层只报
+    # `Diffusion worker(s) died unexpectedly: [...(exitcode=None)]`,后面跟一串
+    # NCCL TCPStore 断连——**看起来像显存不足或通信故障,其实是共享内存写越界**。
+    # 2026-09-02 排查这个花了大半天,现网 GPU0 峰值 35.5/40 GiB(余 5.4 GB)照样死,
+    # 把 shm 从 10 GiB 换成大值后同一形状连跑 14 发零失败,只此一个变量。
+    #
+    # 32 GiB 覆盖到 2K 15 秒还留一倍余量。tmpfs 是按需占用、不预分配,抬高上限本身
+    # 不吃内存;代价只是失控进程能多占 22 GiB 宿主内存才失败。相对"静默 SIGBUS +
+    # 误导性报错"这个代价值得。单个模型要另设走
+    # GPUSTACK_MODEL_RUNTIME_SHM_SIZE_GIB(见 base.py::_get_container_env_config)。
+    shm_size_gib: float = 32.0
 
 
 class VersionConfig(BaseModel):
