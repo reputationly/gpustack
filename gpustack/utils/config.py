@@ -5,7 +5,6 @@ from transformers.hf_argparser import string_to_bool
 
 from gpustack.config.config import Config
 
-
 WHITELIST_CONFIG_FIELDS = {
     "debug",
     "system_default_container_registry",
@@ -135,3 +134,25 @@ def apply_registry_override_to_image(
     #    If both are not reachable, use docker.io as default.
     prefix = fallback_registry + "/" if fallback_registry else ""
     return f"{prefix}{image}"
+
+
+def apply_config_side_effects(updates: Dict[str, Any]) -> None:
+    """Apply the process-level effects that some config fields carry.
+
+    Setting the attribute on ``Config`` is not always the whole change:
+    ``debug`` must also move the root logger's level, and it has to be done with
+    an explicit ``setLevel`` because ``logging.basicConfig`` (inside
+    ``setup_logging``) is a no-op once handlers exist — a later
+    ``setup_logging(True)`` leaves the level exactly where it was.
+
+    **Both writers must call this.** ``routes/config.py::set_config`` handles a
+    live edit; ``server.py::_apply_persisted_config`` replays stored overrides
+    at boot. While only the request path applied the effects, a persisted
+    ``debug=True`` came back after a restart as ``config.debug is True`` with
+    the logger still at INFO — the setting silently reverted on exactly the
+    upgrade that persistence exists to survive.
+    """
+    if "debug" in updates:
+        logging.getLogger().setLevel(
+            logging.DEBUG if bool(updates["debug"]) else logging.INFO
+        )

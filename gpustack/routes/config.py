@@ -7,6 +7,7 @@ from gpustack.config.config import Config, set_global_config
 from gpustack.utils.config import (
     WHITELIST_CONFIG_FIELDS,
     READ_ONLY_CONFIG_FIELDS,
+    apply_config_side_effects,
     coerce_value_by_field,
 )
 
@@ -56,10 +57,49 @@ async def set_config(request: Request):
             updates[k] = coerce_value_by_field(k, v)
     for k, v in updates.items():
         setattr(cfg, k, v)
-    if "debug" in updates:
-        logging.getLogger().setLevel(
-            logging.DEBUG if bool(updates["debug"]) else logging.INFO
-        )
+    apply_config_side_effects(updates)
     set_global_config(cfg)
-    logger.info("Applied runtime config updates")
+    await _persist_runtime_config(updates)
+    logger.info("Applied runtime config updates: %s", sorted(updates))
     return "ok"
+
+
+async def _persist_runtime_config(updates: Dict[str, Any]) -> None:
+    """Store the overrides so they survive a restart.
+
+    Without this the whole endpoint is a scratchpad: ``setattr`` above only
+    touches the in-memory ``Config``, so a container rebuild or image upgrade
+    reverts every edit to whatever the startup arguments said — silently, which
+    is the worst part. ``server.py`` replays these rows right after the database
+    is ready.
+
+    **No database means no persistence, not an error.** This router is also
+    mounted on the worker (see the security note at the top of this file), where
+    ``db.engine`` is None; there the previous in-memory-only behaviour is the
+    correct one and must not turn into a 500.
+
+    When a database *is* present, a write failure is surfaced. Swallowing it
+    would leave the caller believing the value is saved while the next restart
+    quietly discards it — exactly the failure mode this table exists to remove.
+    """
+    if not updates:
+        return
+
+    from gpustack.server import db
+
+    if db.engine is None:
+        logger.debug(
+            "No database bound (worker mount); runtime config updates stay in memory."
+        )
+        return
+
+    from gpustack.server.db import async_session
+    from gpustack.schemas.runtime_config import RuntimeConfig
+
+    async with async_session() as session:
+        for key, value in updates.items():
+            existing = await RuntimeConfig.first_by_field(session, "key", key)
+            if existing is None:
+                await RuntimeConfig.create(session, {"key": key, "value": value})
+            else:
+                await existing.update(session, {"value": value})

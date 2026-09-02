@@ -16,6 +16,7 @@ from gpustack import envs
 from gpustack.server import db
 from gpustack.utils.db import is_opengauss
 from gpustack.schemas.api_keys import ApiKey
+from gpustack.schemas.runtime_config import RuntimeConfig
 from gpustack.schemas.inference_backend import InferenceBackend
 from gpustack.schemas.model_usage import ModelUsage
 from gpustack.schemas.models import Model, ModelInstance
@@ -136,6 +137,10 @@ async def create_db_and_tables(engine: AsyncEngine):
                 CloudCredential.__table__,
                 WorkerPool.__table__,
                 Credential.__table__,
+                # Runtime config overrides set through PUT /v2/config. Created here
+                # as well as by the alembic migration so a fresh install (which
+                # never replays migrations from scratch) still gets the table.
+                RuntimeConfig.__table__,
             ],
         )
 

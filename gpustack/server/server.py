@@ -44,7 +44,7 @@ from gpustack.security import (
 from gpustack.server.app import create_app
 from gpustack.server.passwords import set_password
 from gpustack.server.services import provision_bootstrap_admin_orgs
-from gpustack.config.config import Config
+from gpustack.config.config import Config, set_global_config
 from gpustack.schemas.config import GatewayModeEnum
 from gpustack.config import registration
 from gpustack.server.catalog import init_model_catalog
@@ -266,6 +266,7 @@ class Server:
 
         self._run_migrations()
         await self._prepare_data()
+        await self._apply_persisted_config()
 
         # Fail-fast NFS check (runs on every server — the /videos facade serves
         # everywhere and reads pre-materialized inputs off the shared mount).
@@ -373,6 +374,81 @@ class Server:
         except Exception as e:
             raise RuntimeError(f"Database migration failed: {e}") from e
         logger.info("Database migration completed.")
+
+    async def _apply_persisted_config(self):
+        """Replay the config overrides stored by ``PUT /v2/config``.
+
+        **Persisted overrides win over the startup configuration** (CLI args,
+        ``--config-file`` YAML, env). That ordering is the entire point: a value
+        an operator changed in the UI has to still be there after the next image
+        upgrade. Startup arguments are the *initial* configuration, not a
+        standing instruction — before this table existed, every upgrade silently
+        reverted the admission tuning and nobody found out until a model started
+        getting 429s at the wrong depth.
+
+        The cost of that ordering is that editing a startup argument stops
+        taking effect once the same field has an override row, which is
+        invisible unless we say so. Hence the per-field log line naming the
+        startup value that lost, and how to drop the row.
+
+        Runs after ``_prepare_data`` (database ready) and before the app is
+        built, so every consumer of ``get_global_config`` sees the final values.
+        Never fatal: a server that cannot read this table must still boot on its
+        startup configuration rather than refuse to start.
+        """
+        from gpustack.schemas.runtime_config import RuntimeConfig
+        from gpustack.utils.config import (
+            WHITELIST_CONFIG_FIELDS,
+            apply_config_side_effects,
+        )
+
+        try:
+            async with async_session() as session:
+                rows = await RuntimeConfig.all(session)
+        except Exception as e:
+            logger.warning(
+                "Could not read persisted runtime config, "
+                "continuing with the startup configuration: %s",
+                e,
+            )
+            return
+
+        applied = []
+        for row in rows:
+            # A field dropped from the whitelist between releases keeps its row
+            # (so a rollback still finds it) but must not be re-applied.
+            if row.key not in WHITELIST_CONFIG_FIELDS:
+                logger.warning(
+                    "Ignoring persisted runtime config %r: no longer a "
+                    "settable field.",
+                    row.key,
+                )
+                continue
+            previous = getattr(self._config, row.key, None)
+            if previous == row.value:
+                continue
+            setattr(self._config, row.key, row.value)
+            applied.append((row.key, previous, row.value))
+
+        if not applied:
+            return
+
+        set_global_config(self._config)
+        # Same process-level effects the request path applies. Without this a
+        # persisted debug=True would restore config.debug but leave the root
+        # logger at INFO — setup_logging() cannot fix it later because
+        # basicConfig is a no-op once handlers exist.
+        apply_config_side_effects({key: value for key, _, value in applied})
+        for key, previous, value in applied:
+            logger.info(
+                "Runtime config from database: %s = %r "
+                "(startup configuration said %r; "
+                "delete from runtime_configs where key='%s' to go back to it)",
+                key,
+                value,
+                previous,
+                key,
+            )
 
     async def _prepare_data(self):
         self._setup_data_dir(self._config.data_dir)
