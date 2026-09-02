@@ -35,6 +35,9 @@ FROM ${BASE_IMAGE}
 # --- M1-M3: backend enum / registration / scheduling ---
 COPY gpustack/schemas/models.py                                              /tmp/lx2v-overlay/schemas/models.py
 COPY gpustack/schemas/inference_backend.py                                   /tmp/lx2v-overlay/schemas/inference_backend.py
+# base.py 与 inference_backend.py 成对:容器 /dev/shm 上限的默认值只在 schema 里定
+# 一份,base.py 负责读它。只叠其中一个,另一个仍是基础镜像的旧版本,默认值就分叉了。
+COPY gpustack/worker/backends/base.py                                        /tmp/lx2v-overlay/worker/backends/base.py
 COPY gpustack/worker/backends/lightx2v.py                                    /tmp/lx2v-overlay/worker/backends/lightx2v.py
 COPY gpustack/worker/serve_manager.py                                        /tmp/lx2v-overlay/worker/serve_manager.py
 COPY gpustack/worker/model_meta.py                                           /tmp/lx2v-overlay/worker/model_meta.py
@@ -127,6 +130,7 @@ RUN set -eux; \
         "${GP_DIR}/worker/backends/bernini.py" \
         "${GP_DIR}/policies/candidate_selectors/bernini_resource_fit_selector.py" \
         "${GP_DIR}/schemas/inference_backend.py" \
+        "${GP_DIR}/worker/backends/base.py" \
         "${GP_DIR}/scheduler/scheduler.py" \
         "${GP_DIR}/scheduler/evaluator.py" \
         "${GP_DIR}/worker/model_meta.py" \
