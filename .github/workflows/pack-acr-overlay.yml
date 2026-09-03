@@ -149,6 +149,15 @@ jobs:
           tags: |
             ${{ env.ACR_REPO }}:${{ github.event.inputs.dest_tag }}
             ${{ env.ACR_REPO }}:${{ steps.tags.outputs.version }}
+          # 让镜像自报家门。升级时按浮动 tag 拉(lx2v-node.sh 也写死用它),拉完靠
+          # 这几个 label 回答「跑的到底是哪次构建、哪个 commit」,不必把不可变 tag
+          # 抄进命令行。image.version 尤其关键:它是不可变 tag 本身,
+          # docker inspect 一句就能读出来,回滚时照着它 pull 即可。
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.tags.outputs.version }}
+            org.opencontainers.image.base.name=${{ github.event.inputs.base_image }}
+            io.lx2v.ui.revision=${{ env.ui_sha }}
 
       - name: Summary
         run: |

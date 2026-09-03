@@ -546,14 +546,21 @@ bash /root/lx2v-fleet.sh -j 3 upgrade-engine --engine vllm-omni --offline
 
 **前置**:先确认要升的包**已经构建完成**(各仓 GitHub Actions → 对应 workflow 显示 success),否则 `prepare-transfer` 拉到的还是旧镜像,后面全白做。各仓出包流水线都是 `workflow_dispatch` 手动触发,push 不会自动构建。
 
-**并且记下那次构建的不可变 tag** —— 在 workflow 日志里搜 `lx2v-` 就能看到,形如
-`lx2v-20260902-1627-68d91408`(日期-时分-commit 短 sha),③ 用它、不要用 `lx2v-dev`。
+**命令里一律用浮动 tag `lx2v-dev`,不用每次改**——出包流水线把浮动 tag 和不可变 tag
+放在**同一次 push** 里推(`pack-acr-overlay.yml` 的 `tags:` 两行),两者永远指向同一个
+digest,所以浮动 tag **不会指错、只会指旧**。防「指旧」靠 ③ 里那道 digest 闸,不靠改命令。
+`lx2v-node.sh:37` 本来也写死了 `:lx2v-dev`,全部 worker 一直走浮动,只给 server 钉版本
+等于防护漏一半。
 
-> **实录(2026-09-03 00:27)**:按本流程升 server,拿到的却是**上一版**镜像。原因是
-> `lx2v-dev` 是浮动 tag,而那次升级开始时新包还在构建中(00:03 开始、00:36 才推上去),
-> `docker pull` 只能拉到当时 ACR 上的旧版。全程无任何报错——容器起来了、`curl` 也回 200,
-> 只是新代码根本不在里面。**浮动 tag 的问题不是它会失败,是它失败得毫无声音**;
-> 钉不可变 tag 之后,pull 不到就直接报错,不会静默降级到旧版。
+> **实录(2026-09-03 00:27)**:按本流程升 server,拿到的却是**上一版**镜像。那次升级
+> 开始时新包还在构建中(00:03 开始、00:36 才推上去),`docker pull` 只能拉到当时 ACR 上
+> 的旧版。全程无任何报错——容器起来了、`curl` 也回 200,只是新代码根本不在里面。
+> **真正的坑不是 tag 浮动,是"新包还没推完就去 pull"这个时序,而它失败得毫无声音。**
+> 现在 ③ 会在 pull 后比对 digest:没变就直接退出,不会静默把旧代码当新的装上去。
+
+**不可变 tag 仍然每次都推**(形如 `lx2v-20260903-0818-53247e4c`,日期-时分-commit 短 sha),
+只是不再进升级命令,而是**记进升级日志**,和 ① 的回滚锚一起作为回滚坐标。拉下来之后
+想知道跑的是哪一版,不用翻日志,③.1 直接从镜像 label 里读。
 
 以下全部在 **manager(238)** 上执行:
 
@@ -573,11 +580,15 @@ docker images gpustack-rollback      # 确认锚已建再往下走
 bash /root/lx2v-node.sh prepare-transfer
 
 # ③ 升 server —— 必须先于 worker(版本校验软 + DB/API 方向 server ≥ worker)
-#    TAG 填前置里记下的不可变 tag。用浮动的 lx2v-dev 会在「新包还没推完」时
-#    静默拉到上一版(2026-09-03 实录),而钉版本拉不到会直接报错。
-TAG=lx2v-20260902-1627-68d91408          # ← 每次升级改这里
-IMG=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:$TAG
+#    整段照抄即可,没有需要每次改的地方。
+IMG=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:lx2v-dev
+#    pull 前先记下当前跑的镜像 ID,pull 后比一比 —— 这道闸卡的就是 2026-09-03 那个
+#    「新包还没推完就来 pull」的时序:那时 lx2v-dev 还指着旧 digest,ID 不变,直接退出,
+#    而不是把旧代码当新的装上去。ID 变了就说明确实拉到了新包。
+OLD=$(docker inspect --format '{{.Image}}' gpustack-server)
 docker pull $IMG
+NEW=$(docker image inspect --format '{{.Id}}' $IMG)
+[ "$OLD" != "$NEW" ] || { echo "镜像 ID 没变 —— 新包还没推上来,别升"; exit 1; }
 docker stop gpustack-server && docker rm gpustack-server
 docker run -d --name gpustack-server --restart unless-stopped -p 80:80 \
   --volume gpustack-data:/var/lib/gpustack --volume /nfs-output:/nfs-output \
@@ -586,15 +597,22 @@ docker run -d --name gpustack-server --restart unless-stopped -p 80:80 \
 curl -s -o /dev/null -w '%{http_code}\n' http://localhost/    # 期望 200
 
 # ③.1 验证「跑的确实是你要的那版」——200 只证明进程活着,不证明代码换了。
-#     迁移链头是最省事的判据:它随 overlay 一起进镜像,对不上就是没换成。
+#     镜像自带 label(出包流水线打的),直接问它是哪次构建、哪个 commit:
+docker inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' $IMG
+docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' $IMG
+# 期望:第一行就是本次的不可变 tag(lx2v-日期-时分-sha),第二行是 main 上对应的 commit。
+# 把第一行抄进升级日志,回滚坐标就有了。
+#     (label 是 2026-09-03 之后的构建才有;更早的镜像这两行是空的,退回下面的迁移链判据。)
+
+# ③.2 迁移是否真的跑到位 —— 和 ③.1 不重复:③.1 管「镜像换没换」,这条管「DB 跟上没」。
 docker exec gpustack-server python3 -c "
 from alembic.config import Config; from alembic.script import ScriptDirectory
 c=Config(); c.set_main_option('script_location','/usr/local/lib/python3.11/dist-packages/gpustack/migrations')
 print('image head =', ScriptDirectory.from_config(c).get_current_head())"
 docker exec gpustack-server su postgres -c \
   "psql -d gpustack -tAc 'SELECT version_num FROM alembic_version;'"   # 两者应一致
-# 期望:两行输出相同,且等于你这次要上的那个 revision。
-# 不一致 = 迁移没跑成功;image head 停在旧 revision = 镜像根本没换。
+# 不一致 = 迁移没跑成功。注意这条**不能**单独用来判断镜像换没换:
+# 两次构建之间若没有新迁移,head 本来就一样,对上了也说明不了什么——那是 ③.1 的活。
 
 # ④ 全 worker 升 gpustack
 bash /root/lx2v-fleet.sh -j 10 upgrade-gpustack --offline
@@ -619,6 +637,11 @@ docker run -d --name gpustack-server --restart unless-stopped -p 80:80 \
   gpustack-rollback:pre-<锚的日期> \
   --system-default-container-registry quay.io
 ```
+
+**锚丢了怎么办**(同日升两次被覆盖、或那台机器上压根没打):用**上一次**升级日志里 ③.1
+记下的不可变 tag 直接 pull 回去——`docker pull …/gpustack:lx2v-20260903-0818-53247e4c`,
+再用它替掉上面的 `gpustack-rollback:pre-<锚的日期>`。不可变 tag 不会被后续构建覆盖,
+这正是它虽然不进升级命令、却仍然每次都推的理由。
 
 数据库迁移设计为**向后兼容**(只加表/加枚举值、不改旧表),旧镜像跑新库无碍,所以回滚只需退镜像,不用动 `gpustack-data` 卷。
 
