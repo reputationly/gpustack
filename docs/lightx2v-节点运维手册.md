@@ -546,6 +546,15 @@ bash /root/lx2v-fleet.sh -j 3 upgrade-engine --engine vllm-omni --offline
 
 **前置**:先确认要升的包**已经构建完成**(各仓 GitHub Actions → 对应 workflow 显示 success),否则 `prepare-transfer` 拉到的还是旧镜像,后面全白做。各仓出包流水线都是 `workflow_dispatch` 手动触发,push 不会自动构建。
 
+**并且记下那次构建的不可变 tag** —— 在 workflow 日志里搜 `lx2v-` 就能看到,形如
+`lx2v-20260902-1627-68d91408`(日期-时分-commit 短 sha),③ 用它、不要用 `lx2v-dev`。
+
+> **实录(2026-09-03 00:27)**:按本流程升 server,拿到的却是**上一版**镜像。原因是
+> `lx2v-dev` 是浮动 tag,而那次升级开始时新包还在构建中(00:03 开始、00:36 才推上去),
+> `docker pull` 只能拉到当时 ACR 上的旧版。全程无任何报错——容器起来了、`curl` 也回 200,
+> 只是新代码根本不在里面。**浮动 tag 的问题不是它会失败,是它失败得毫无声音**;
+> 钉不可变 tag 之后,pull 不到就直接报错,不会静默降级到旧版。
+
 以下全部在 **manager(238)** 上执行:
 
 ```bash
@@ -557,18 +566,35 @@ bash /root/lx2v-fleet.sh -j 3 upgrade-engine --engine vllm-omni --offline
 docker tag crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:lx2v-dev \
   gpustack-rollback:pre-$(date +%Y%m%d)
 docker images gpustack-rollback      # 确认锚已建再往下走
+#    ⚠️ 锚名带日期,**同一天升第二次会把锚覆盖到刚升上去的那版**,
+#    等于把「升级前」的退路弄丢。同日重跑请改个后缀,例如 pre-$(date +%Y%m%d)-2。
 
 # ② 刷 NFS tar(拉四镜像,digest 没变的自动跳过)
 bash /root/lx2v-node.sh prepare-transfer
 
 # ③ 升 server —— 必须先于 worker(版本校验软 + DB/API 方向 server ≥ worker)
-docker pull crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:lx2v-dev
+#    TAG 填前置里记下的不可变 tag。用浮动的 lx2v-dev 会在「新包还没推完」时
+#    静默拉到上一版(2026-09-03 实录),而钉版本拉不到会直接报错。
+TAG=lx2v-20260902-1627-68d91408          # ← 每次升级改这里
+IMG=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:$TAG
+docker pull $IMG
 docker stop gpustack-server && docker rm gpustack-server
 docker run -d --name gpustack-server --restart unless-stopped -p 80:80 \
   --volume gpustack-data:/var/lib/gpustack --volume /nfs-output:/nfs-output \
-  crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:lx2v-dev \
+  $IMG \
   --system-default-container-registry quay.io
 curl -s -o /dev/null -w '%{http_code}\n' http://localhost/    # 期望 200
+
+# ③.1 验证「跑的确实是你要的那版」——200 只证明进程活着,不证明代码换了。
+#     迁移链头是最省事的判据:它随 overlay 一起进镜像,对不上就是没换成。
+docker exec gpustack-server python3 -c "
+from alembic.config import Config; from alembic.script import ScriptDirectory
+c=Config(); c.set_main_option('script_location','/usr/local/lib/python3.11/dist-packages/gpustack/migrations')
+print('image head =', ScriptDirectory.from_config(c).get_current_head())"
+docker exec gpustack-server su postgres -c \
+  "psql -d gpustack -tAc 'SELECT version_num FROM alembic_version;'"   # 两者应一致
+# 期望:两行输出相同,且等于你这次要上的那个 revision。
+# 不一致 = 迁移没跑成功;image head 停在旧 revision = 镜像根本没换。
 
 # ④ 全 worker 升 gpustack
 bash /root/lx2v-fleet.sh -j 10 upgrade-gpustack --offline
@@ -602,6 +628,22 @@ docker run -d --name gpustack-server --restart unless-stopped -p 80:80 \
 - 节点清单默认读 `/root/lx2v-nodes.txt`,manager 自身会自动排除;换清单用 `-f`。
 - 任一节点失败则整体退出码非 0,逐台日志在 `/tmp/lx2v-fleet/<ip>.log`。
 - 只升引擎、gpustack 没变时,②③④ 可整段跳过,直接从 ⑤ 开始。
+- **③ 的 `docker run` 不带 `--config-file`,这是对的,别自己加回去。** 准入两表
+  (`lightx2v_model_latency_seconds` / `lightx2v_model_queue_wait_seconds`)现在**落在库里**
+  (`runtime_configs` 表),server 启动时由 `_apply_persisted_config()` 重放,重建容器不会丢。
+  改这两张表走 UI 的 Video Storage 页,或 `PUT /v2/config`——**不要**改
+  `/etc/gpustack/config.yaml`:那个文件是 2026-09-02 落库功能上线前的过渡产物,
+  当时靠手工加 `--config-file` 生效;本流程重建容器时不传该参数,所以它现在是个
+  **没人读的死文件**(2026-09-02 就有人改过它、以为生效了)。确认落库版已上线后可以直接删掉。
+
+  验证配置还在(重建后跑一次):
+
+  ```bash
+  docker exec gpustack-server su postgres -c \
+    "psql -d gpustack -tAc 'SELECT key FROM runtime_configs;'"      # 应列出两张表
+  curl -s -H "Authorization: Bearer <admin-key>" http://localhost/v2/config \
+    | python3 -c 'import json,sys;d=json.load(sys.stdin);print({k:len(v or {}) for k,v in d.items() if k.startswith("lightx2v_model_")})'
+  ```
 
 ---
 
