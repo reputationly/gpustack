@@ -369,6 +369,11 @@ Save 后:调度到 1 张空闲卡 → launcher 起引擎 → `/ready` 503→200 
 
 **方案 A 收官(同日深夜)**:0003 onboard(NFS tar 零下载;新坑:apt 一次装多包一个找不到会整体中止 → docker.io/nfs-common 都没装上;nvidia-container-toolkit 不在 Ubuntu 源,把 163 的 `/etc/apt/sources.list.d/nvidia-container-toolkit.list` + keyring 经 NFS 拷过去即可;**0003 安全组与旧节点不同 → ping 通但 TCP 10150 超时**,换成 0002 同款安全组解决)。最终拓扑:**z-image ×4 @163(1卡/实例)+ wan2.2-t2v ×2 @0002/0003(4卡/实例),12 卡满负荷全内置**。双实例 least-pending 分流验证通过;并发提交存在平局随机撞车(4 并发落 3 实例)属设计内 advisory 行为,new-api 生产流量无影响。管理页 download 置灰 = poll-on-GET 未被触发(GET 一次即推进,10min sweeper 兜底),见交接文档待办 #6。
 
+> **追注(2026-09-03)**:上面「撞车属设计内 advisory 行为」这条**定性已作废**。撞车的根因是
+> tie-break 用了 `random.choice`——车队空闲时全员平局,随机让 3 并发只有 22% 完美散开。
+> 已改为进程内轮转游标(`strategies.py`),并发的 N 次提交依次拿 0/1/2… 槽。现象记录保留,
+> 结论按这条追注为准。
+
 **新坑**:
 | # | 坑 | 修法 |
 |---|---|---|

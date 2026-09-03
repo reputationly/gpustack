@@ -24,7 +24,7 @@
 | 组件 | 文件 | 要点 |
 |---|---|---|
 | M4a 任务表 | `gpustack/schemas/video_generation_task.py` + 迁移 `2026_07_05_2230-e1f2a3b4c5d6` | 亲和映射(公开 task_id ↔ instance_id+native_task_id)+ 状态机 QUEUED→ASSIGNED→RUNNING→DONE/FAILED/CANCELED;`owner_user_id`=GPUStack principal(鉴权),`user_id`=new-api 终端用户(路径用) |
-| M4-1 负载感知 LB | `gpustack/http_proxy/strategies.py` | `select_least_pending_instance()`:数任务表在飞(ASSIGNED/RUNNING)`GROUP BY instance_id` 选最空实例,平局随机 |
+| M4-1 负载感知 LB | `gpustack/http_proxy/strategies.py` | `select_least_pending_instance()`:数任务表在飞(ASSIGNED/RUNNING)`GROUP BY instance_id` 选最空实例;**平局按进程内轮转游标**(候选按 id 排序后取模,游标键=平局实例 id 元组),**不是随机**——车队空闲时全员平局、tie-break 决定一切,随机会撞车(3 并发只有 22% 完美散开,现网实测过)。仅在单进程 server 下成立(读改写之间无 `await`);哪天开多 worker 需把占位并进 ASSIGNED 插入的同一事务 |
 | M4-2 门面 | `gpustack/routes/videos.py` | `POST /v1/videos`(base64/URL 输入落 NFS→least-pending→提交引擎 `/v1/tasks/{image,video}/`→记映射→返 task_id)· `GET /v1/videos/{id}`(**poll-on-GET**,无后台轮询器)· `GET .../content`(NFS 流式) |
 | M4-3 死亡重派 | `gpustack/server/video_task_sweeper.py` | leader-only 5s 循环,四步:⓪非终态超 24h→FAILED(timeout) ①实例**连续 3 轮**非 RUNNING→在飞任务标回 QUEUED(防状态抖动误判;ASSIGNED 无 native id 超 120s 也回收=门面提交中途崩) ②在飞任务 updated_at 停滞超 10min→服务端主动向引擎查状态回填(客户端弃轮询兜底) ③QUEUED 走 `redispatch_task` 重派(重试上限 5,引擎 4xx 拒绝立即 FAILED,503/无实例不耗额度;**每次重派换新输出路径 `-r{n}` 后缀**,防误判重派时新旧引擎写同一文件) |
 | Janitor(原推迟,后补做) | `gpustack/server/video_storage_janitor.py` | leader-only 10min:①按天目录 TTL ②水位驱逐(超高水位→最旧优先删到低水位)③安全门(不删今天目录 + 不删非终态任务的输出**和输入**目录 + **DONE 后 6h 取件宽限**);全部 FS 操作走 `asyncio.to_thread` |

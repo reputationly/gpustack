@@ -1,7 +1,6 @@
 from abc import ABC, abstractmethod
 import logging
-import random
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import itertools
 
 from sqlmodel import col, func, select
@@ -10,6 +9,17 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from gpustack.schemas.models import ModelInstance
 
 logger = logging.getLogger(__name__)
+
+# Rotating tie-break cursor for ``select_least_pending_instance`` (see its
+# docstring for why ties must NOT be broken randomly). Keyed by the tuple of
+# tied instance ids so a fleet whose composition changes gets its own rotation
+# rather than inheriting an offset that no longer means anything.
+#
+# Grows by one entry per distinct tied-set; bounded by the subsets of a single
+# model's instance list, which is a handful of rows in practice. Deliberately
+# not evicted: an entry is 2 small ints, and dropping one would only restart
+# that set's rotation at 0.
+_tie_break_cursor: Dict[Tuple[int, ...], int] = {}
 
 
 class LoadBalancingStrategy(ABC):
@@ -54,10 +64,30 @@ async def select_least_pending_instance(
     of ``max_queue_size`` fills). This replaces the load-blind round-robin the
     gateway uses for stateless LLM traffic.
 
-    Ties are broken randomly to avoid a thundering herd onto the lowest-id
-    instance while several requests observe the same pre-insert counts. Returns
-    ``None`` only when ``instances`` is empty; the caller decides whether an
-    all-busy fleet should surface as 503.
+    Ties are broken by a process-wide rotating cursor, NOT randomly. Several
+    requests routinely observe the same pre-insert counts: the count is read
+    here, but the ASSIGNED row that would change it is only written much later
+    (``/v1/videos`` resolves input refs and builds the engine body in between,
+    in a *separate* session), so a burst of concurrent submits all see the same
+    numbers. When the fleet is idle every instance ties, "least pending" carries
+    no information at all, and the tie-break decides everything.
+
+    Random tie-breaking loses that: three concurrent submits onto three idle
+    instances each roll independently, so they spread perfectly only 6/27 ≈ 22%
+    of the time — 67% of the time two collide onto one instance (one task
+    queues behind the other while a third instance sits idle) and 11% of the
+    time all three pile onto one. That was observed in production.
+
+    The cursor makes it deterministic instead: read-modify-write of
+    ``_tie_break_cursor`` contains no ``await``, so under the server's
+    single-process asyncio loop (``Server.serve()``, no uvicorn ``workers``) it
+    is atomic — three concurrent callers take slots 0, 1, 2 and fill the fleet.
+    **This holds only while the server is single-process**; running multiple
+    workers would need the reservation moved into the same transaction as the
+    ASSIGNED insert (``SELECT ... FOR UPDATE``).
+
+    Returns ``None`` only when ``instances`` is empty; the caller decides
+    whether an all-busy fleet should surface as 503.
     """
     if not instances:
         return None
@@ -94,10 +124,25 @@ async def select_least_pending_instance(
 
     # Instances with no in-flight row don't appear in the GROUP BY result → 0.
     min_pending = min(pending_by_instance.get(inst.id, 0) for inst in instances)
-    least_loaded = [
-        inst for inst in instances if pending_by_instance.get(inst.id, 0) == min_pending
-    ]
-    return random.choice(least_loaded)
+    # Sorted by id so the cursor key and the slot order are stable across calls;
+    # without it a reordered ``instances`` list would silently reshuffle who
+    # gets slot 0 and reintroduce collisions.
+    least_loaded = sorted(
+        (
+            inst
+            for inst in instances
+            if pending_by_instance.get(inst.id, 0) == min_pending
+        ),
+        key=lambda inst: inst.id,
+    )
+    if len(least_loaded) == 1:
+        return least_loaded[0]
+    # No ``await`` between the read and the write — that is what makes this
+    # atomic on the single-process event loop (see the docstring).
+    key = tuple(inst.id for inst in least_loaded)
+    idx = _tie_break_cursor.get(key, 0) % len(least_loaded)
+    _tie_break_cursor[key] = idx + 1
+    return least_loaded[idx]
 
 
 class LeastPendingStrategy(LoadBalancingStrategy):
