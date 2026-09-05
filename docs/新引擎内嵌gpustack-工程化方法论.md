@@ -295,7 +295,7 @@ CMD ["python3", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8
 
 **镜像**：
 - 节点有旧镜像：`docker pull --platform linux/arm64 <ACR>`（base 复用只拉增量）。
-- 全新节点：238 上 `lx2v-node.sh prepare-transfer`（pull 三镜像 → `docker save IMG > /nfs-models/_transfer/xx.tar`）→ 节点 `docker load`。
+- 全新节点：238 上 `lx2v-node.sh prepare-transfer`（pull 五镜像 → `docker save IMG > /nfs-models/_transfer/xx.tar`）→ 节点 `docker load`。
 - 坑：多架构 tag 在 x86 上直接 save 报 `content digest not found`，先 `pull --platform linux/arm64`；`docker save -o` 在 NFS 上失败还留隐藏 `.tmp-*` 半截文件占几 G，**用 shell 重定向**。
 
 ---
@@ -470,16 +470,18 @@ docker logs gpustack-server | grep -E "Init built-in backend|migration"   # alem
 
 | 命令 | 用途 | 关键参数 |
 |---|---|---|
-| `install` | 新节点接入（9 步 ~16min） | `--token` `--worker-ip` `--offline` `--clean-residue` `--force` |
+| `install` | 新节点接入（11 步） | `--token` `--worker-ip` `--offline` `--clean-residue` `--force` |
 | `upgrade-gpustack` | 升级 worker 镜像 | `--offline` |
-| `upgrade-engine` | 升级引擎镜像 | `--engine {lightx2v\|indextts}` |
+| `upgrade-engine` | 升级引擎镜像 | `--engine {lightx2v\|acestep\|vllm-omni\|breeze}`（`indextts`/`bernini` 已下线，分支保留供手动指定） |
 | `status` | 一屏巡检 worker/镜像/NFS/显存/实例 | — |
 | `clean` | 清残留 | `--purge-data` `--kill-gpu-procs` |
-| `prepare-transfer` | （238 专用）出包后 pull 三镜像 → save tar → NFS | — |
+| `prepare-transfer` | （238 专用）出包后 pull 五镜像 → save tar → NFS | — |
 
-install 九步：驱动/架构预检(5s) → 残留扫描+IP 解析(5s) → apt docker.io/nfs-common(1.5min，逐个装) → **先写 fstab 再 mount -a**（`-t nfs -o vers=3,timeo=600,nolock,noresvport,_netdev`）+ 软链 → nvidia-container-toolkit(5-8min) → gpustack tar load(4.4G/1.5min) → lightx2v tar load(9.8G/4min) → indextts2 tar load(10G/4min) → 起 worker 验证 `Worker registered` + UI Ready。
+install 十一步：驱动/架构预检(5s) → 残留扫描+IP 解析(5s) → apt docker.io/nfs-common(1.5min，逐个装) → **先写 fstab 再 mount -a**（`-t nfs -o vers=3,timeo=600,nolock,noresvport,_netdev`）+ 软链 → nvidia-container-toolkit(5-8min) → gpustack tar load(~1.5G) → lightx2v tar load(~8.6G) → acestep tar load(~8.7G) → vllm-omni tar load(~12.7G，soft) → breeze-tts tar load(~26G，soft) → 起 worker 验证 `Worker registered` + UI Ready。
 
-批量（60 卡实录）：`lx2v-fleet.sh upgrade-gpustack`（并发 5）/ `-j 3 upgrade-engine`（大 tar 降并发防 NFS 抢）。
+引擎镜像随接入进度增删，**步数与清单以 `docs/scripts/lx2v-node.sh` 为唯一事实源**（`STEP_TOTAL` 与各 `*_IMAGE` 变量），本节只是量级参照。新接一个引擎要同步改的地方见 §13 checklist 的 P4 一项。
+
+批量（60 卡实录）：`lx2v-fleet.sh upgrade-gpustack`（并发 5）/ `-j 3 upgrade-engine`（大 tar 降并发防 NFS 抢；**超过 20G 的 tar 再降到 `-j 2`**，breeze-tts 的 26G 就属于这一档）。
 
 **新节点第一坑**：脚本全绿、注册成功但 UI 永不 Ready = server→worker **TCP 10150** 被安全组拦（`curl http://<worker>:10150/healthz` 超时确认），加入既有节点同款安全组。
 
@@ -657,6 +659,16 @@ cd gpustack && uv run --no-sync pytest        # 2026-07-14 全绿：1238 passed,
 - [ ] NFSRoot == lightx2v_output_root，双侧启动探测
 
 **P4 部署**
+- [ ] **运维脚本先接引擎**（漏了会在部署当天才炸）：`docs/scripts/lx2v-node.sh` 加
+      `<ENGINE>_IMAGE` / `<ENGINE>_TAR` 两个变量、`upgrade-engine` 的 case 分支（连同 `die`
+      提示里的可选值）、`prepare-transfer` 的 sync 步、`install` 的预载步、`status` 的
+      镜像 grep；**两处 `STEP_TOTAL` 要同步加一**，否则进度条错位。
+      `lx2v-fleet.sh` 补用法示例与并发建议。改完 `bash -n` 过一遍。
+      不改的话 `upgrade-engine --engine <新引擎>` 直接 die「未知引擎」，
+      离线节点也拿不到 tar。
+- [ ] **同步改运维手册**（`docs/lightx2v-节点运维手册.md`）：§0 速查卡与镜像清单表、
+      §1.4 步骤表、§1.8 常量事实源、§2.2/§2.3 命令与 prepare-transfer 说明、§3 巡检描述。
+      §1.8 自己写着「两边不一致时以脚本为准，并回来改手册」——就是指这一步。
 - [ ] server 换 tag（看迁移+backend 注册日志）；prepare-transfer 更新 NFS tar；fleet 升级
 - [ ] UI 部署：GPUs/Replica 显式、--profile pin、错峰、清场、Shmem 红线
 - [ ] 新节点安全组核查（TCP 10150）
