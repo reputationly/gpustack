@@ -5,12 +5,12 @@
 #   ./lx2v-node.sh setup-base                        # 全新节点只配基础环境(docker/NFS/toolkit),不入集群
 #   ./lx2v-node.sh install --token <GPUSTACK_TOKEN> [--worker-ip <IP>] [--offline] [--clean-residue] [--force]
 #   ./lx2v-node.sh upgrade-gpustack [--offline]     # 换 gpustack:lx2v-dev 并原参数重启 worker
-#   ./lx2v-node.sh upgrade-engine   [--engine lightx2v|acestep|vllm-omni] [--offline]
+#   ./lx2v-node.sh upgrade-engine   [--engine lightx2v|acestep|vllm-omni|breeze] [--offline]
 #                                                    # 换引擎镜像(默认 lightx2v;实例需重建才生效)
 #                                                    # indextts/bernini 已下线,不再默认分发,但 --engine 仍可手动指定
 #   ./lx2v-node.sh clean [--purge-data] [--kill-gpu-procs]   # 清理卸载残留(见下)
 #   ./lx2v-node.sh status                            # 节点健康速览
-#   ./lx2v-node.sh prepare-transfer                  # (238/有 ACR 外网的机器)拉四镜像(gpustack/lightx2v/acestep/vllm-omni)存 NFS tar
+#   ./lx2v-node.sh prepare-transfer                  # (238/有 ACR 外网的机器)拉五镜像(gpustack/lightx2v/acestep/vllm-omni/breeze-tts)存 NFS tar
 #
 # 残留环境(装过 GPUStack 又卸载/被清理过的节点):
 #   install 自带残留检测——异 token 的旧 worker 自动移除重建,同 token(同集群)需加 --force;
@@ -53,6 +53,9 @@ VLLM_OMNI_IMAGE="${REGISTRY}/vllm-omni:arm64-a100-latest"
 # (详见 gpustack 仓 docs/cu130-py312-upgrade-2026-08-24.md §2.2)。
 # 变量与 upgrade-engine 分支保留,需要时:./lx2v-node.sh upgrade-engine --engine bernini
 BERNINI_IMAGE="${REGISTRY}/bernini:arm64-a100-latest"
+# Breeze TTS 2 音色设计引擎(独立 CI 出包,同 acestep 范式)。接替 MOSS-VoiceGen:
+# 纯文字描述造声线,无参考音频。已在 GPUStack 注册为内置后端 BreezeTTS,会被调度。
+BREEZE_IMAGE="${REGISTRY}/breeze-tts:arm64-a100-latest"
 SERVER_URL="${SERVER_URL:-http://10.0.0.238}"
 NFS_SERVER="100.125.40.2"
 NFS_MODELS_EXPORT="/share-LLM"
@@ -64,6 +67,7 @@ INDEXTTS_TAR="${TRANSFER_DIR}/indextts2-arm64-a100.tar"
 ACESTEP_TAR="${TRANSFER_DIR}/acestep-arm64-a100.tar"
 VLLM_OMNI_TAR="${TRANSFER_DIR}/vllm-omni-arm64-a100.tar"
 BERNINI_TAR="${TRANSFER_DIR}/bernini-arm64-a100.tar"
+BREEZE_TAR="${TRANSFER_DIR}/breeze-tts-arm64-a100.tar"
 NVIDIA_REPO_DIR="${TRANSFER_DIR}/nvidia-repo"
 WORKER_NAME="gpustack-worker"
 WORKER_PORT=10150
@@ -598,7 +602,8 @@ cmd_install() {
     "在既有 worker 节点上取: docker inspect ${WORKER_NAME} --format '{{range .Config.Env}}{{println .}}{{end}}' | grep GPUSTACK_TOKEN" \
     "同一集群的注册令牌可复用于多台 worker"
   # 12 -> 10:indextts2 / bernini 两个镜像预载步骤已下线(见下方注释)
-  STEP_TOTAL=10
+  # 10 -> 11:新增 breeze-tts 预载
+  STEP_TOTAL=11
 
   step "预检:GPU 驱动 / 架构"
   nvidia-smi -L || die "nvidia-smi 不可用" "先安装 GPU 驱动(A100 节点镜像通常自带,重装过系统的机器需补装)"
@@ -638,6 +643,12 @@ cmd_install() {
   # 节点自动装上(供 docker run 手测全模型语音),缺镜像的节点不卡 install。
   # 注册进 gpustack 后,把这里的 soft 去掉即回归"预载即要求"。
   fetch_image_prefer_tar "$VLLM_OMNI_IMAGE" "$VLLM_OMNI_TAR" soft
+
+  step "镜像:breeze-tts 引擎(soft 预载:有则装上,缺则告警不阻塞)"
+  # 已注册后端 BreezeTTS,会被调度落任意空闲卡,故与 acestep 同样全节点预载。
+  # 但它约 26G(base 25.9G + app 层),与 vllm-omni 同量级,故用 soft:ACR 一抖
+  # 不该卡住整个 install。缺镜像的节点在实例创建时由 runtime 现拉(慢但可用)。
+  fetch_image_prefer_tar "$BREEZE_IMAGE" "$BREEZE_TAR" soft
 
   step "起 worker 并验证注册"
   docker rm -f "$WORKER_NAME" 2>/dev/null || true
@@ -736,7 +747,8 @@ cmd_upgrade_engine() {
     acestep)   img="$ACESTEP_IMAGE";   tar="$ACESTEP_TAR" ;;
     vllm-omni) img="$VLLM_OMNI_IMAGE"; tar="$VLLM_OMNI_TAR" ;;
     bernini)   img="$BERNINI_IMAGE";   tar="$BERNINI_TAR" ;;
-    *) die "未知引擎: $ENGINE_SEL" "--engine 只支持 lightx2v | indextts | acestep | vllm-omni | bernini" ;;
+    breeze)    img="$BREEZE_IMAGE";    tar="$BREEZE_TAR" ;;
+    *) die "未知引擎: $ENGINE_SEL" "--engine 只支持 lightx2v | indextts | acestep | vllm-omni | bernini | breeze" ;;
   esac
   STEP_TOTAL=2
   step "当前引擎镜像(${ENGINE_SEL})"
@@ -766,7 +778,7 @@ cmd_status() {
   echo "--- 本机 healthz:"
   curl -sf --max-time 3 "http://127.0.0.1:${WORKER_PORT}/healthz" && echo "  OK" || echo "  不通"
   echo "--- 镜像:"
-  docker images --format '  {{.ID}}  {{.Repository}}:{{.Tag}}' | grep -E "gpustack|lightx2v|indextts|acestep|vllm-omni|bernini" || true
+  docker images --format '  {{.ID}}  {{.Repository}}:{{.Tag}}' | grep -E "gpustack|lightx2v|indextts|acestep|vllm-omni|bernini|breeze-tts" || true
   echo "--- NFS:"
   mountpoint -q /nfs-models && echo "  /nfs-models OK" || echo "  /nfs-models 未挂载"
   mountpoint -q /nfs-output && echo "  /nfs-output OK" || echo "  /nfs-output 未挂载"
@@ -788,7 +800,8 @@ cmd_status() {
 cmd_prepare_transfer() {
   parse_flags "$@"
   # 7 -> 4:indextts2/bernini 已下线,且"统一 pull"那步并入各镜像的 sync
-  STEP_TOTAL=4
+  # 4 -> 5:新增 breeze-tts
+  STEP_TOTAL=5
   # tar 必须落在共享 NFS 上;未挂载时 mkdir -p 会静默建本地目录,
   # 大 tar(引擎/indextts 各 ~10G)写进根盘且其他节点拿不到
   mountpoint -q /nfs-models || die "/nfs-models 未挂载,拒绝把 tar 写到本地盘" \
@@ -819,6 +832,11 @@ cmd_prepare_transfer() {
   # 三个必需 tar 已经产出。set -e 下用 || 兜住整个 sync。
   sync_image_to_nfs "$VLLM_OMNI_IMAGE" "$VLLM_OMNI_TAR" \
     || echo "    ⚠️ (soft) vllm-omni 同步失败,跳过其 tar(不影响其余镜像)"
+
+  step "同步 breeze-tts tar(~26G;soft:拉不到只告警,不阻塞其余必需 tar)"
+  # 26G 是这批里最大的一个(base 25.9G),ACR 抖一下就前功尽弃,故同样 soft 兜住。
+  sync_image_to_nfs "$BREEZE_IMAGE" "$BREEZE_TAR" \
+    || echo "    ⚠️ (soft) breeze-tts 同步失败,跳过其 tar(不影响其余镜像)"
 
   # 放在所有 tar 同步之后:这一步只修本机 tag,与出 tar 无关。
   # 早先它跟在 gpustack sync 后面,ACR 一抖就在 step 1/4 整段中止,后三个 tar 全没出。

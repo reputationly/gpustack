@@ -11,12 +11,14 @@
 #   bash lx2v-fleet.sh -j 3 upgrade-engine --engine lightx2v --offline   # 大 tar 降并发防 NFS 抢
 #   bash lx2v-fleet.sh upgrade-engine --engine indextts --offline
 #   bash lx2v-fleet.sh -j 3 upgrade-engine --engine bernini --offline    # 批量分发 bernini 引擎镜像
+#   bash lx2v-fleet.sh -j 2 upgrade-engine --engine breeze --offline     # Breeze TTS 2(~26G,并发压到 2)
 #   bash lx2v-fleet.sh status                                    # 全体巡检
 #   bash lx2v-fleet.sh -f /path/other-nodes.txt <子命令...>       # 换清单
 #   bash lx2v-fleet.sh --seq <子命令...>                          # 串行(= -j 1)
 #
 # 选项(必须放在 lx2v-node.sh 子命令之前):
-#   -j N        并发数(默认 5)。engine --offline 建议 3,避免多台同时从 NFS load 10G tar 抢带宽。
+#   -j N        并发数(默认 5)。engine --offline 建议 3,避免多台同时从 NFS load 10G tar 抢带宽;
+#               breeze 的 tar 约 26G(是这批里最大的),建议再降到 2。
 #   -f FILE     节点清单路径(默认 /root/lx2v-nodes.txt)。
 #   --seq       串行执行。
 #   --          显式结束选项解析,其后全部透传给 lx2v-node.sh。
