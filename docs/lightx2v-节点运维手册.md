@@ -633,6 +633,50 @@ bash /root/lx2v-fleet.sh -j 10 upgrade-engine --engine vllm-omni --offline
 bash /root/lx2v-fleet.sh -j 10 status
 ```
 
+> **⑤ 只改了 Python 代码时,不要加 `--offline`**(实测 2026-09-05,LightX2V 反相双跑上线)。
+>
+> `docker save` 导出**整个镜像的所有层**,`docker pull` 只拉**变更层**。纯代码迭代的 app 层
+> (`COPY . /opt/LightX2V` + `pip install -e --no-deps`)实测只有 **35.5MB**,底下 23.8GB 的
+> base(CUDA / flash_attn / SageAttention 的编译产物)一个字节不动:
+>
+> | 路径 | 每节点 | 55 台合计 |
+> | --- | --- | --- |
+> | 在线增量拉(不加 `--offline`) | ~38MB 走 ACR | **~2.1GB** |
+> | `prepare-transfer` + `--offline` | 8.7GB 走 NFS | **~478GB** |
+>
+> 差 230 倍,而 NFS 是**共享瓶颈** —— 同一个 NFS 正在给跑着的实例喂模型权重。
+> 并发也不必压到 `-j 3`,实测 55 台并发 5 一次过、FAIL=0。
+> `--offline` 保留给它原本的两个场景:**全新节点** 与 **ACR 不通**;base 换代时也仍然要走 tar。
+>
+> **② 能不能跳,看这次升不升 server/worker**:
+> - **只升引擎**(不动 server/worker)→ ② 可以整步跳过,直接 ⑤ 不带 `--offline`。
+> - **联合升级**(③ server / ④ worker 也在内)→ **② 照跑**,worker 那条路仍然吃 tar,
+>   跳了会让 ④ 拿不到镜像。此时 ⑤ 依然建议去掉 `--offline`,省的是 NFS 带宽,
+>   与 ② 是否跑过无关。
+>
+> **⚠️ 加了 `--offline` 却没先跑 `prepare-transfer` = 静默装旧版。** NFS 上那个 tar 是上次
+> 出包留下的,`docker load` 会成功、日志全绿、FAIL=0,但装上去的是**旧镜像**。
+> `upgrade-engine` 的默认路径是先 pull、失败才回退 tar,**不加就不会踩这个坑**。
+
+> **⑥ 的详细输出不在 stdout。** `lx2v-fleet.sh` 只往 stdout 打 `✅ <ip>`,每台的内容落在
+> `/tmp/lx2v-fleet/<ip>.log`。所以 `bash lx2v-fleet.sh status | grep <镜像>` **永远是空的**。
+> 核镜像 ID 要 grep 日志:
+>
+> ```bash
+> # 看 ID 分布(期望只有一个 ID,台数 == 清单台数)
+> grep -h "lightx2v:arm64-a100-latest" /tmp/lx2v-fleet/*.log | awk '{print $1}' | sort | uniq -c
+>
+> # 严格核对:按清单逐台比。/tmp 里常有旧清单留下的残留日志(实测 55 台却有 98 个 .log),
+> # 只看总数会有假阳性 —— 必须以 /root/lx2v-nodes.txt 为准逐台点名。
+> EXPECT=<期望的 12 位镜像 ID>
+> for ip in $(grep -vE '^[[:space:]]*(#|$)' /root/lx2v-nodes.txt | awk '{print $1}' \
+>             | grep -vx 10.0.0.238 | sort -u); do
+>   id=$(grep "lightx2v:arm64-a100-latest" /tmp/lx2v-fleet/$ip.log 2>/dev/null \
+>        | awk '{print $1}' | grep -E '^[0-9a-f]{12}$' | head -1)
+>   [ "$id" = "$EXPECT" ] || echo "✗ $ip -> ${id:-<无日志>}"
+> done
+> ```
+
 **⑦ UI 重建实例**(改这里):Instance List 里把**用到了新引擎镜像的实例**逐个删除让其自动重建——**先删一个、等新的 Running 再删下一个**,服务不断。换了镜像但没重建实例 = 新代码根本没上线(实例锁旧镜像 ID)。
 
 **回滚 server**(①的锚派上用场时):
