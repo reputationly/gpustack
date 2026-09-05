@@ -287,10 +287,11 @@ _VALID_TASK_TYPES = (
 )
 
 # Facade input field -> (engine request field, default extension). Inputs are
-# NOT sent as base64/URL anymore: new-api (the trusted caller) pre-materializes
-# every input onto the shared NFS and passes a relative path under <root>/inputs
-# in the request's "input_refs"; the facade validates and maps it to the engine
-# path field here (see docs/lightx2v-nfs-input-design.md §4). The extension is
+# NOT sent as base64/URL anymore: new-api (the trusted caller) places every input
+# on the shared NFS and passes a path relative to <root> in the request's
+# "input_refs" — either a freshly materialized upload under inputs/, or a previous
+# task's product referenced in place (§4.2); the facade validates and maps it to
+# the engine path field here (see docs/lightx2v-nfs-input-design.md §4). The extension is
 # retained only for documentation of the expected content per field.
 _INPUT_FIELDS = {
     "image": ("image_path", ".png"),
@@ -603,14 +604,19 @@ def _validate_input_ref(ref: Any, root: str, user_id: int, field: str) -> str:
     """Validate one caller-supplied relative input ref and return the absolute
     engine-visible path.
 
-    new-api (the only holder of the facade key) has already written the file to
-    the shared NFS under the §3 convention
-    (inputs/<task_type>-<model>/YYYY/MM/DD/<user_id>/<gid>-<field>[-i].<ext>).
+    new-api (the only holder of the facade key) has already placed the file on
+    the shared NFS, in one of two layouts, both ending in .../<user_id>/<file>:
+
+      - a freshly materialized upload, under the §3 convention
+        inputs/<task_type>-<model>/YYYY/MM/DD/<user_id>/<gid>-<field>[-i].<ext>
+      - a previous task's RESULT, <feature>-<model>/YYYY/MM/DD/<user_id>/<id>.<ext>,
+        referenced in place (see below)
+
     The facade never trusts a raw absolute path (IDOR): it only accepts a path
     RELATIVE to <root> and re-derives the absolute path itself. Rejects (400):
     non-string/empty; absolute; anything that (after normpath/realpath) escapes
-    <root>/inputs; a user_id segment != the request user (cross-tenant read); a
-    missing file.
+    <root>; a user_id segment != the request user (cross-tenant read); a missing
+    file.
     """
     if not isinstance(ref, str) or not ref.strip():
         raise BadRequestException(
@@ -623,26 +629,39 @@ def _validate_input_ref(ref: Any, root: str, user_id: int, field: str) -> str:
             is_openai_exception=True,
         )
     norm = os.path.normpath(ref)
-    # inputs/ subtree only: results live under <root>/<feature>/... (not inputs/),
-    # so this also blocks using another task's OUTPUT as an input.
-    if norm != "inputs" and not norm.startswith("inputs" + os.sep):
-        raise BadRequestException(
-            message=f"Input ref for '{field}' must be under inputs/",
-            is_openai_exception=True,
-        )
+    # Storage-root subtree — deliberately wider than inputs/ alone. This used to
+    # be "inputs/ only", whose stated purpose was to block using another task's
+    # OUTPUT as an input; new-api now does exactly that on purpose: when the
+    # caller passes back a product URL we issued (image-to-image, keyframe /
+    # reference-to-video), the bytes are already on this same NFS, so it
+    # references them in place instead of copying them into inputs/ first.
+    # Rationale and the full argument for why this does not weaken isolation:
+    # docs/lightx2v-nfs-input-design.md §4.2.
+    #
+    # Tenant isolation never rested on this prefix — it rests on the
+    # parent-dir == user_id check below, which both layouts satisfy
+    # (.../<user_id>/<file>). Containment is still enforced, just against the
+    # storage root rather than <root>/inputs.
+    #
+    # Lifetime is safe: video_storage_janitor._protected_day_dirs derives the
+    # protected day dirs from a task's params input-path fields via parent.parent,
+    # which is layout-agnostic — a referenced product's day dir is protected for
+    # as long as the referencing task is non-terminal.
     abs_path = os.path.join(root, norm)
     resolved = os.path.realpath(abs_path)
-    inputs_root = os.path.realpath(os.path.join(root, "inputs"))
-    if not resolved.startswith(inputs_root + os.sep):
+    root_real = os.path.realpath(root)
+    if not resolved.startswith(root_real + os.sep):
         raise BadRequestException(
-            message=f"Input ref for '{field}' escapes the inputs root",
+            message=f"Input ref for '{field}' escapes the storage root",
             is_openai_exception=True,
         )
     # Tenant binding: the file's immediate parent dir is the owning user_id (§3).
     # Check it on the REALPATH-resolved target, not the raw ref — otherwise a
-    # symlink under inputs/<user>/ pointing into another tenant's dir would pass
-    # (it stays under inputs_root and the raw segment reads as this user) yet the
-    # engine would read the other tenant's file. Resolving first closes that.
+    # symlink under <user>/ pointing into another tenant's dir would pass (it
+    # stays under the storage root and the raw segment reads as this user) yet
+    # the engine would read the other tenant's file. Resolving first closes that.
+    # This is now the ONLY thing standing between tenants, since the prefix
+    # restriction above was widened — do not weaken it.
     if Path(resolved).parent.name != str(user_id):
         raise BadRequestException(
             message=f"Input ref for '{field}' does not match the request user",
