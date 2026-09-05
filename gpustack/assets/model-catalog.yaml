@@ -3768,6 +3768,44 @@ model_sets:
       backend: VoxBox
       env:
         GPUSTACK_MODEL_VRAM_CLAIM: "12884901888" # 12 GiB, it depends on the audio length. This value works for ~10 minutes audio input.
+- name: Breeze-TTS-2
+  description: Breeze TTS 2 designs a brand-new voice from a natural-language description alone (no reference audio), and can also clone from reference audio plus its exact transcript. First-class built-in engine with an async task API; runs whole-GPU exclusive (1 instance/card).
+  home: https://github.com/breezeblue-ai/breeze-tts
+  icon: /static/catalog_icons/index-tts.png
+  size: 7
+  categories:
+    - text_to_speech
+  licenses:
+    - other
+  release_date: "2026-08-25"
+  # Whole-GPU exclusive: BreezeTTSResourceFitSelector books each chosen GPU's
+  # whole free VRAM (1 instance/card). Steady-state VRAM is flat at ~8.4 GiB
+  # regardless of text length (the CUDA graphs run off a StaticCache
+  # preallocated at max_seq_len), but graph capture during warmup peaks higher
+  # — 8.67 GiB on the default nocodec tier — so the card is dedicated rather
+  # than co-scheduled. The engine image comes from the built-in backend
+  # registry (schemas/inference_backend.py), not gpustack-runner.
+  #
+  # NOTE the weights are under the BreezeBlue Research and Non-Commercial
+  # License (the inference code is Apache-2.0). Self-hosted output is
+  # non-commercial unless BreezeBlue grants written permission.
+  specs:
+    - mode: standard
+      gpu_filters:
+        vendor: nvidia
+      quantization: BF16
+      source: model_scope
+      model_scope_model_id: BreezeBlue/Breeze-TTS-2
+      backend: BreezeTTS
+      backend_version: "1.0.0"
+    - mode: standard
+      gpu_filters:
+        vendor: nvidia
+      quantization: BF16
+      source: huggingface
+      huggingface_repo_id: BreezeBlue/Breeze-TTS-2
+      backend: BreezeTTS
+      backend_version: "1.0.0"
 - name: IndexTTS-2
   description: IndexTTS-2 is a zero-shot voice-cloning TTS model with emotion control (8-dim emotion vector or natural-language emotion). First-class built-in engine with an async task API for long-text dubbing; runs whole-GPU exclusive (1 instance/card).
   home: https://github.com/index-tts/index-tts
