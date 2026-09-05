@@ -483,6 +483,36 @@ def get_built_in_backend() -> List[InferenceBackend]:
             description="IndexTTS-2 zero-shot voice-clone TTS engine (first-class built-in backend).",
         ),
         InferenceBackend(
+            backend_name=BackendEnum.BREEZE_TTS.value,
+            is_built_in=True,
+            default_version="1.0.0",
+            version_configs=VersionConfigDict(
+                root={
+                    # Breeze TTS 2 arm64/A100 engine image (reputationly/breeze-tts,
+                    # built by the independent CI -> ACR). Same wiring as IndexTTS:
+                    # floating tag so a rebuilt image is picked up without editing
+                    # this row, custom_framework="cuda" (NOT built_in_frameworks) so
+                    # BackendFrameworkFilter accepts cuda A100 workers that have no
+                    # gpustack-runner and get_image_name returns this explicit image
+                    # for the BUILT_IN row.
+                    "1.0.0": VersionConfig(
+                        image_name=(
+                            "crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com"
+                            "/reputationly/breeze-tts:arm64-a100-latest"
+                        ),
+                        custom_framework="cuda",
+                    ),
+                }
+            ),
+            # /ready stays 503 through model load AND the CUDA-graph warmup
+            # (~195 s end to end on A100, of which ~142 s is capture), so the
+            # scheduler never routes a request at an instance that would make
+            # the first user wait out the capture.
+            health_check_path="/ready",
+            parameter_format=ParameterFormatEnum.SPACE,
+            description="Breeze TTS 2 voice-design / voice-clone TTS engine (first-class built-in backend).",
+        ),
+        InferenceBackend(
             backend_name=BackendEnum.BERNINI.value,
             is_built_in=True,
             default_version="1.0.0",

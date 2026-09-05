@@ -68,6 +68,7 @@ class BackendEnum(str, Enum):
     ACESTEP = "ACEStep"
     VLLM_OMNI = "vLLMOmni"
     BERNINI = "Bernini"
+    BREEZE_TTS = "BreezeTTS"
     CUSTOM = "Custom"
 
 

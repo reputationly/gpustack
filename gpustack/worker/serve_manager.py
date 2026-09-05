@@ -45,6 +45,7 @@ from gpustack.utils.command import resolve_executor_backend
 from gpustack.worker.backends.vllm import VLLMServer
 from gpustack.worker.backends.vox_box import VoxBoxServer
 from gpustack.worker.backends.lightx2v import LightX2VServer
+from gpustack.worker.backends.breeze import BreezeTTSServer
 from gpustack.worker.backends.indextts import IndexTTSServer
 from gpustack.worker.backends.bernini import BerniniServer
 from gpustack.worker.backends.acestep import ACEStepServer
@@ -93,6 +94,7 @@ _SERVER_CLASS_MAPPING = {
     BackendEnum.ACESTEP: ACEStepServer,
     BackendEnum.VLLM_OMNI: VLLMOmniServer,
     BackendEnum.BERNINI: BerniniServer,
+    BackendEnum.BREEZE_TTS: BreezeTTSServer,
 }
 
 

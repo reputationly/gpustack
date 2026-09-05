@@ -481,6 +481,11 @@ _DEFAULT_IMAGE_LATENCY = 20
 _DEFAULT_VIDEO_LATENCY = 90
 # IndexTTS-2 at RTF~3 does a short line (5-8s audio) in a handful of seconds;
 # 20s is a conservative per-instance fallback that also absorbs longer lines.
+# NOT sufficient for every audio engine: Breeze TTS 2 runs at RTF 0.657 on the
+# default tier, so its 600-char ceiling (111s of audio) takes ~71s of wall
+# clock. A Breeze deployment must set a per-model override via
+# lightx2v_model_latency_seconds, otherwise _check_admission's queue estimate
+# is off by 3-4x on long scripts.
 _DEFAULT_AUDIO_LATENCY = 20
 # ACE-Step turbo/xl-turbo generate a 30s clip in ~10s warm; longer clips scale
 # but stay well under a minute. 30s is a conservative per-instance fallback.
