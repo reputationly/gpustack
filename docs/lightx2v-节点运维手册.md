@@ -519,7 +519,7 @@ bash /root/lx2v-node.sh upgrade-engine --engine breeze       # Breeze TTS 2 音�
 bash /root/lx2v-node.sh prepare-transfer
 ```
 
-做四件事:拉**五镜像**(gpustack / lightx2v / acestep / vllm-omni / breeze-tts)arm64 变体 → 按 digest 变化 save 到 NFS 四个 tar(未变的跳过;带写入进度,`.tmp`+`mv` 防半截)→ **x86 机器上自动把本地 gpustack tag 拉回 amd64**(否则 238 之后重建 server 容器会 exec format error——坑 §5.5)→ 把脚本自身同步到 `_transfer/`。vllm-omni 与 breeze-tts 都是 soft:拉不到只告警、不阻塞其余 tar(breeze 的 tar 约 26G,ACR 一抖不该让前面几个白同步)。已下线的 indextts2/bernini 不再同步,NFS 上那两个旧 tar 是历史遗留。
+做四件事:拉**五镜像**(gpustack / lightx2v / acestep / vllm-omni / breeze-tts)arm64 变体 → 按 digest 变化 save 到 NFS 五个 tar(未变的跳过;带写入进度,`.tmp`+`mv` 防半截)→ **x86 机器上自动把本地 gpustack tag 拉回 amd64**(否则 238 之后重建 server 容器会 exec format error——坑 §5.5)→ 把脚本自身同步到 `_transfer/`。vllm-omni 与 breeze-tts 都是 soft:拉不到只告警、不阻塞其余 tar(breeze 的 tar 约 26G,ACR 一抖不该让前面几个白同步)。已下线的 indextts2/bernini 不再同步,NFS 上那两个旧 tar 是历史遗留。
 
 ### 2.4 一次完整现网升级(以 2026-07-20 gpustack + vllm-omni 为例)
 
