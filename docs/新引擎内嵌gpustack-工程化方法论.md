@@ -648,7 +648,23 @@ cd gpustack && uv run --no-sync pytest        # 2026-07-14 全绿：1238 passed,
 - [ ] worker/backends/<engine>.py（挂载只读 GPUSTACK_EXTRA_MOUNTS）+ serve_manager 映射
 - [ ] selector（profile 固定卡数）+ scheduler elif
 - [ ] 门面 4 处：task_type 白名单 / _engine_kind / _output_ext / _model_latency
-- [ ] janitor 输入保护键覆盖新 `*_path` 字段；model-catalog + 图标；UI 4 处枚举
+- [ ] **输入路径字段名要么复用既有键，要么同步加进 janitor 保护清单**
+      （`server/video_storage_janitor.py` 的路径键列表）。这条容易漏，因为漏了
+      不会立刻出错：janitor 只在 TTL 到期或水位驱逐时才动手，所以症状是
+      「长队列时偶发地把还没跑完的任务的参考音频删了」，极难复现和归因。
+      Breeze 接入时是因为照抄了 IndexTTS 的 `spk_audio_path` 才碰巧安全的，
+      当时若起名 `ref_audio_path` 就会踩上。
+- [ ] **按后端枚举分流的位置逐个核**：除 scheduler/serve_manager 外，还有
+      `worker/model_meta.py` 的「不探 `/v1/models`」白名单（异步任务型引擎都要进，
+      漏了每次实例转 RUNNING 刷一条无用告警）。核法：
+      `grep -rn "BackendEnum.LIGHTX2V" gpustack/ --include="*.py"`，逐个文件确认
+      新引擎也在。**别拿已下线的引擎当基准**（如 IndexTTS），它自己的接入可能
+      就是陈旧或缺失的。
+- [ ] model-catalog + 图标；UI 4 处枚举
+- [ ] **按模型的时延与排队上限配套设默认值**：`_check_admission` 按
+      `(在途数 ÷ 实例数) × 时延` 估等待，超过按类别上限即 429。只配时延不配上限，
+      一个比基准引擎慢的新模型会在第二条并发就被拒。两个键都在
+      gpustack-ui 的 Storage Settings 页，兜底表也在那儿（`DEFAULT_LATENCY`）。
 - [ ] **Dockerfile.acr COPY 清单加新文件** + import 断言 + 迁移（如有新表）
 - [ ] overlay 出包双架构，构建断言全绿
 

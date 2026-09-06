@@ -189,8 +189,17 @@ class Config(WorkerConfig, BaseSettings):
     lightx2v_admission_enabled: bool = True
     # Tolerated queue wait (seconds) before rejecting, per engine kind. Image is
     # the sync link (aligned with new-api's ~25s QUEUED timeout); video is async
-    # (poll-based), so it tolerates much longer; audio (IndexTTS TTS) is async too
-    # — short lines at RTF~3 behind a per-instance FIFO of 8, 60s is a sane default.
+    # (poll-based), so it tolerates much longer; audio (TTS) is async too.
+    #
+    # ⚠️ The audio ceiling is the one most likely to need a per-model override.
+    # It was calibrated on IndexTTS-2 (RTF≈0.3, short lines behind a per-instance
+    # FIFO of 8), but "audio" now covers engines whose RTF differs by more than
+    # 2x — Breeze TTS 2 measures 0.66 on its default tier, and a 600-char script
+    # (its ceiling, ~111s of audio) takes ~71s of wall clock on one card.
+    # Admission estimates wait as (depth // instances) * per-model latency, so
+    # with a latency of 75 the very first queued request already exceeds 60 and
+    # gets a 429. Any engine slower than IndexTTS MUST set both
+    # lightx2v_model_latency_seconds and lightx2v_model_queue_wait_seconds.
     lightx2v_image_max_queue_wait_seconds: int = 25
     lightx2v_video_max_queue_wait_seconds: int = 150
     lightx2v_audio_max_queue_wait_seconds: int = 60
