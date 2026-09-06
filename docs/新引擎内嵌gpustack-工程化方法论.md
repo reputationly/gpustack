@@ -477,11 +477,11 @@ docker logs gpustack-server | grep -E "Init built-in backend|migration"   # alem
 | `clean` | 清残留 | `--purge-data` `--kill-gpu-procs` |
 | `prepare-transfer` | （238 专用）出包后 pull 五镜像 → save tar → NFS | — |
 
-install 十一步：驱动/架构预检(5s) → 残留扫描+IP 解析(5s) → apt docker.io/nfs-common(1.5min，逐个装) → **先写 fstab 再 mount -a**（`-t nfs -o vers=3,timeo=600,nolock,noresvport,_netdev`）+ 软链 → nvidia-container-toolkit(5-8min) → gpustack tar load(~1.5G) → lightx2v tar load(~8.6G) → acestep tar load(~8.7G) → vllm-omni tar load(~12.7G，soft) → breeze-tts tar load(~26G，soft) → 起 worker 验证 `Worker registered` + UI Ready。
+install 十一步：驱动/架构预检(5s) → 残留扫描+IP 解析(5s) → apt docker.io/nfs-common(1.5min，逐个装) → **先写 fstab 再 mount -a**（`-t nfs -o vers=3,timeo=600,nolock,noresvport,_netdev`）+ 软链 → nvidia-container-toolkit(5-8min) → gpustack tar load(~1.5G) → lightx2v tar load(~8.6G) → acestep tar load(~8.7G) → vllm-omni tar load(~12.7G，soft) → breeze-tts tar load(~8.9G，soft) → 起 worker 验证 `Worker registered` + UI Ready。
 
 引擎镜像随接入进度增删，**步数与清单以 `docs/scripts/lx2v-node.sh` 为唯一事实源**（`STEP_TOTAL` 与各 `*_IMAGE` 变量），本节只是量级参照。新接一个引擎要同步改的地方见 §13 checklist 的 P4 一项。
 
-批量（60 卡实录）：`lx2v-fleet.sh upgrade-gpustack`（并发 5）/ `-j 3 upgrade-engine`（大 tar 降并发防 NFS 抢；**超过 20G 的 tar 再降到 `-j 2`**，breeze-tts 的 26G 就属于这一档）。
+批量（60 卡实录）：`lx2v-fleet.sh upgrade-gpustack`（并发 5）/ `-j 3 upgrade-engine`（大 tar 降并发防 NFS 抢；**超过 20G 的 tar 再降到 `-j 2`**）。⚠️ 判据是 **tar** 体积不是镜像体积——`docker save` 存的是压缩层，约为 `docker images` 所报体积的三分之一（breeze-tts 镜像 25.9G，tar 只有 8.9G），拿镜像大小定并发会把 8G 档误判成 26G 档。
 
 **新节点第一坑**：脚本全绿、注册成功但 UI 永不 Ready = server→worker **TCP 10150** 被安全组拦（`curl http://<worker>:10150/healthz` 超时确认），加入既有节点同款安全组。
 

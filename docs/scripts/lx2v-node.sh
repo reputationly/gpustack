@@ -646,8 +646,9 @@ cmd_install() {
 
   step "镜像:breeze-tts 引擎(soft 预载:有则装上,缺则告警不阻塞)"
   # 已注册后端 BreezeTTS,会被调度落任意空闲卡,故与 acestep 同样全节点预载。
-  # 但它约 26G(base 25.9G + app 层),与 vllm-omni 同量级,故用 soft:ACR 一抖
-  # 不该卡住整个 install。缺镜像的节点在实例创建时由 runtime 现拉(慢但可用)。
+  # tar 约 8.9G(镜像 25.9G,压缩层约三分之一),与 lightx2v/acestep 同量级。
+  # soft 的理由是它新接入:缺镜像的节点在实例创建时由 runtime 现拉(慢但可用),
+  # 不该因此卡住整个 install。
   fetch_image_prefer_tar "$BREEZE_IMAGE" "$BREEZE_TAR" soft
 
   step "起 worker 并验证注册"
@@ -833,8 +834,10 @@ cmd_prepare_transfer() {
   sync_image_to_nfs "$VLLM_OMNI_IMAGE" "$VLLM_OMNI_TAR" \
     || echo "    ⚠️ (soft) vllm-omni 同步失败,跳过其 tar(不影响其余镜像)"
 
-  step "同步 breeze-tts tar(~26G;soft:拉不到只告警,不阻塞其余必需 tar)"
-  # 26G 是这批里最大的一个(base 25.9G),ACR 抖一下就前功尽弃,故同样 soft 兜住。
+  step "同步 breeze-tts tar(~8.9G;soft:拉不到只告警,不阻塞其余必需 tar)"
+  # tar 存的是压缩层,约为镜像的三分之一:镜像 25.9G → tar 8.9G,与 lightx2v(8.1G)、
+  # acestep(8.2G)同量级。soft 的理由不是体积而是它新接入、非必需,ACR 抖一下
+  # 不该让前面几个 tar 白同步。
   sync_image_to_nfs "$BREEZE_IMAGE" "$BREEZE_TAR" \
     || echo "    ⚠️ (soft) breeze-tts 同步失败,跳过其 tar(不影响其余镜像)"
 

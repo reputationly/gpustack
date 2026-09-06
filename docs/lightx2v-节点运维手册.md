@@ -36,7 +36,7 @@ bash /root/lx2v-node.sh prepare-transfer
 
 > **集群批量**:238 上用 `lx2v-fleet.sh` 对所有 worker 并发跑 node 脚本子命令(自动排除 238 自身):
 > `bash /root/lx2v-fleet.sh upgrade-gpustack --offline` / `bash /root/lx2v-fleet.sh -j 3 upgrade-engine --engine vllm-omni --offline` / `bash /root/lx2v-fleet.sh status`。日志在 238 `/tmp/lx2v-fleet/<ip>.log`。
-> **breeze 要把并发压到 2**:`-j 3` 是按 ~10G tar 定的,breeze 的 tar 约 26G(这批里最大),按 3 并发从 NFS load 会抢爆带宽。
+> **定并发看 tar 体积,不是镜像体积**:tar 存的是压缩层,约为镜像的三分之一(breeze 镜像 25.9G → tar 8.9G,与 lightx2v 的 8.1G 同档),所以 breeze 用常规的 `-j 3` 即可。
 >
 > **要一次接入多台全新节点?** 看 **§1.6 批量扩容** —— `lx2v-fleet.sh` 对全新节点用不了(它从 NFS 拉脚本,而新节点还没挂 NFS),必须先 scp + `setup-base` 把 NFS 挂上再让 fleet 接管。
 >
@@ -54,7 +54,7 @@ bash /root/lx2v-node.sh prepare-transfer
 | lightx2v | `lightx2v:arm64-a100-latest` | 图片/视频引擎 |
 | acestep | `acestep:arm64-a100-latest` | ACE-Step 文生音乐引擎 |
 | vllm-omni | `vllm-omni:arm64-a100-latest` | vLLM-Omni 全模型语音/音频引擎(TTS/AudioX/SoulX/MOSS 等) |
-| breeze-tts | `breeze-tts:arm64-a100-latest` | Breeze TTS 2 音色设计引擎(2026-09-05 接入,接替 MOSS-VoiceGen)。**约 26G,是这批里最大的**,批量分发 `-j 2` |
+| breeze-tts | `breeze-tts:arm64-a100-latest` | Breeze TTS 2 音色设计引擎(2026-09-05 接入,接替 MOSS-VoiceGen)。镜像 25.9G / tar 8.9G,批量分发同 lightx2v 用 `-j 3` |
 
 > **2026-08-25 下线两个镜像**:`indextts2`(能力由 vLLM-Omni 承接,indextts-2 模型现跑在 vLLMOmni 后端上)、
 > `bernini`(停留在 cu128 base,其 `requires-python >=3.11,<3.12` 与 cu130 base 的 3.12 冲突)。
@@ -166,14 +166,14 @@ token 是**集群级注册令牌,所有 worker 复用同一个**;忘了就在任
 | 7 | lightx2v 引擎镜像 | ~2min | ~8.6G |
 | 8 | acestep 引擎镜像 | ~2min | ~8.7G;文生音乐整卡单实例,全节点预载 |
 | 9 | vllm-omni 引擎镜像(**soft**) | ~3min | ~12.7G;有 tar 则装、缺则告警不阻塞 install(全模型语音/音频引擎) |
-| 10 | breeze-tts 引擎镜像(**soft**) | ~5min | ~26G,这批里最大;有 tar 则装、缺则告警不阻塞(音色设计引擎) |
+| 10 | breeze-tts 引擎镜像(**soft**) | ~2min | tar ~8.9G;有 tar 则装、缺则告警不阻塞(音色设计引擎) |
 | 11 | 起 worker + 注册/healthz 验证 | ~2min | 旧容器(如有)到这一步才移除,前面失败节点仍有原 worker |
 
 > 上表是**单台**参照。历史实测:2026-07-06 两台全新机各约 16 分钟(当时六镜像 52G);
 > 2026-08-20 十台 `-j 10` 并发同为约 15 分钟;**2026-09-01 五台 `-j 5` 只要 6-7 分钟**
 > ——四镜像后每台只 load 约 32G,且那批机器出厂已带 docker/toolkit(step 3/5 基本跳过)。
-> **2026-09-05 起加了 breeze-tts(~26G),每台 load 量回到约 58G**,单台耗时相应拉长,
-> 批量并发按 §0 的提示压到 `-j 2`。
+> **2026-09-05 起加了 breeze-tts(tar 8.9G),每台 load 量约 41G**,单台耗时略增,
+> 并发仍按常规 `-j 3`(§0 说明了为何要看 tar 而不是镜像体积)。
 > NFS 读带宽在 10 台并发内够用,15 台以上仍按 60 卡那次经验降到 `-j 3`。
 > 若机器出厂镜像已带 docker + toolkit,step 3/5 会被跳过(`setup-base` 可短到 47 秒),这是正常的,不是没装上 —— 用 `docker info | grep nvidia` 复核。
 
@@ -251,7 +251,7 @@ for ip in $NEW; do printf '%-14s ' "$ip"; tail -n1 /tmp/lx2v-bootstrap/$ip.log; 
 bash /root/lx2v-fleet.sh -f /root/lx2v-new.txt status     # 期望 OK=N,且每台 /nfs-models + /nfs-output OK
 ```
 
-**⑥ 入集群(fleet 批量 install)**——这是最重的一步,每台从 NFS load 五镜像约 58G(2026-09-05 加入 breeze-tts 前是四镜像 32G)
+**⑥ 入集群(fleet 批量 install)**——这是最重的一步,每台从 NFS load 五个 tar 约 41G(2026-09-05 加入 breeze-tts 前是四个约 32G)
 
 ```bash
 read -rsp 'GPUSTACK_TOKEN: ' TOKEN; echo
@@ -470,7 +470,7 @@ for n in $(seq 41 50); do printf 'gpu%-3s ' $n; ssh -n -o BatchMode=yes -o Stric
 | 安全组 | 用 §1.1 的临时监听法预验证,**5 台本来就在 `newapi` 组**,不用去控制台改 |
 | 摸底 | 全部 aarch64 / 4×A100 / **驱动 580.65.06** / 无 worker 残留 |
 | `setup-base` | **8-12 秒**(出厂盘已带 docker + nvidia-toolkit,step 3/5 基本跳过) |
-| `install --offline -j 5` | **每台 6-7 分钟**(四镜像约 32G;2026-09-05 加 breeze-tts 后约 58G,耗时相应拉长) |
+| `install --offline -j 5` | **每台 6-7 分钟**(四个 tar 约 32G;2026-09-05 加 breeze-tts 后约 41G,耗时略增) |
 | 验收 | 镜像=4 / worker Up / 238→10150 通 / `worker_id 104-108` / server 端 55 台全 READY |
 | 收尾 | 清单合并至 55 行、`~/.ssh/config` 加 gpu51-gpu55、删两个已下线镜像(每台释放 **29G**) |
 
@@ -508,7 +508,7 @@ bash /root/lx2v-node.sh upgrade-engine --engine vllm-omni    # vLLM-Omni 全模�
 bash /root/lx2v-node.sh upgrade-engine --engine breeze       # Breeze TTS 2 音色设计引擎
 ```
 
-各引擎镜像 tag 必须与 gpustack 内置后端注册表(`schemas/inference_backend.py` 的 image_name)完全一致——worker 按名匹配本地镜像。全 worker 批量:`bash /root/lx2v-fleet.sh -j 3 upgrade-engine --engine <名> --offline`(大 tar 降并发;**breeze 用 `-j 2`**,它的 tar 约 26G)。
+各引擎镜像 tag 必须与 gpustack 内置后端注册表(`schemas/inference_backend.py` 的 image_name)完全一致——worker 按名匹配本地镜像。全 worker 批量:`bash /root/lx2v-fleet.sh -j 3 upgrade-engine --engine <名> --offline`(大 tar 降并发。**看 tar 体积不是镜像体积**——tar 存压缩层约为镜像三分之一,breeze 镜像 25.9G 但 tar 只有 8.9G,用常规 `-j 3`)。
 
 **⚠️ 关键**:换镜像**不影响正在运行的实例**(它们锁旧镜像 ID)。生效方式:UI → Instance List → **逐个删除实例**让其自动重建(先删一个、等新的 Running 再删下一个,服务不断)。
 
@@ -519,7 +519,7 @@ bash /root/lx2v-node.sh upgrade-engine --engine breeze       # Breeze TTS 2 音�
 bash /root/lx2v-node.sh prepare-transfer
 ```
 
-做四件事:拉**五镜像**(gpustack / lightx2v / acestep / vllm-omni / breeze-tts)arm64 变体 → 按 digest 变化 save 到 NFS 五个 tar(未变的跳过;带写入进度,`.tmp`+`mv` 防半截)→ **x86 机器上自动把本地 gpustack tag 拉回 amd64**(否则 238 之后重建 server 容器会 exec format error——坑 §5.5)→ 把脚本自身同步到 `_transfer/`。vllm-omni 与 breeze-tts 都是 soft:拉不到只告警、不阻塞其余 tar(breeze 的 tar 约 26G,ACR 一抖不该让前面几个白同步)。已下线的 indextts2/bernini 不再同步,NFS 上那两个旧 tar 是历史遗留。
+做四件事:拉**五镜像**(gpustack / lightx2v / acestep / vllm-omni / breeze-tts)arm64 变体 → 按 digest 变化 save 到 NFS 五个 tar(未变的跳过;带写入进度,`.tmp`+`mv` 防半截)→ **x86 机器上自动把本地 gpustack tag 拉回 amd64**(否则 238 之后重建 server 容器会 exec format error——坑 §5.5)→ 把脚本自身同步到 `_transfer/`。vllm-omni 与 breeze-tts 都是 soft:拉不到只告警、不阻塞其余 tar。已下线的 indextts2/bernini 不再同步,NFS 上那两个旧 tar 是历史遗留。
 
 ### 2.4 一次完整现网升级(以 2026-07-20 gpustack + vllm-omni 为例)
 
