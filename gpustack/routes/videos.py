@@ -379,9 +379,26 @@ _MULTI_VIDEO_TASK_TYPES = {"mv2v", "ads2v"}
 # (InfiniteTalk s2v driving audio, ACE-Step, TTS references) contracts exactly
 # one file, and a comma-joined pair would reach those engines as one invalid
 # path. Same reasoning as the src_video scoping.
+#
+# Image edit ("i2i") gets the same treatment for the same reason: the engines
+# advertise per-model image-input budgets in vllm-omni's
+# diffusion/model_metadata.py — SenseNova-U1 9, Qwen-Image-Edit-Plus 4,
+# HunyuanImage-3 3, Boogu-Image 1 — and the default cap of five was capping the
+# API below what SenseNova can actually do. Nine is the highest any i2i engine
+# advertises, so this override lets each model reach its own ceiling; picking
+# WHICH model gets how many is a product decision and lives in the gateway
+# (new-api reads it per model from the playground config), not here.
+#
+# Deliberately scoped to "image" rather than raising _MAX_INPUT_IMAGES: that
+# constant is also the cap for "src_ref_images" (VACE R2V references), and
+# WanVACEPipeline advertises no max_multimodal_image_inputs at all — loosening
+# it would be an unfounded relaxation of a line we have no engine data for.
 _H3_REF2VA_TASK_TYPE = "r2va"
+_IMAGE_EDIT_TASK_TYPE = "i2i"
+_MAX_EDIT_INPUT_IMAGES = 9
 _TASK_INPUT_CAPS = {
     _H3_REF2VA_TASK_TYPE: {"image": 9, "video": 3, "audio": 3},
+    _IMAGE_EDIT_TASK_TYPE: {"image": _MAX_EDIT_INPUT_IMAGES},
 }
 # Total reference cap across all modalities (engine: "at most 12 total").
 _H3_REF2VA_MAX_TOTAL_REFS = 12

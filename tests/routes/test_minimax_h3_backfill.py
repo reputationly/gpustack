@@ -338,10 +338,27 @@ def test_multi_audio_and_video_are_scoped_to_r2va():
         assert _input_cap("video", task_type) == 1
 
 
+def test_image_edit_cap_matches_the_most_capable_i2i_engine():
+    """i2i is capped at the highest budget any image-edit engine advertises.
+
+    vllm-omni diffusion/model_metadata.py: SenseNova-U1 9, Qwen-Image-Edit-Plus
+    4, HunyuanImage-3 3, Boogu-Image 1. The facade is a VRAM backstop, not a
+    product policy — it opens the door to the widest engine and leaves "which
+    model gets how many" to the gateway, which reads it per model from the
+    playground config.
+    """
+    assert _input_cap("image", "i2i") == 9
+
+
 def test_default_image_cap_is_unchanged_for_other_tasks():
-    # Raising the r2va cap must not loosen Bernini / image-edit paths.
-    for task_type in ("i2i", "rv2v", "r2v"):
+    # Raising the r2va / i2i caps must not loosen Bernini or VACE paths.
+    for task_type in ("rv2v", "r2v"):
         assert _input_cap("image", task_type) == 5
+    # VACE R2V references share _MAX_INPUT_IMAGES with the old i2i default, and
+    # WanVACEPipeline advertises no image budget at all — nothing justifies
+    # moving this one, so it must stay behind when i2i moves.
+    for task_type in ("vace", "i2i", "r2va"):
+        assert _input_cap("src_ref_images", task_type) == 5
 
 
 def test_src_video_scoping_still_holds():
