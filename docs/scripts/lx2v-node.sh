@@ -809,6 +809,10 @@ cmd_prepare_transfer() {
     "先挂 NFS(fstab 两行 + mount -a,见 install 的 ② 或全记录 §4.2)再重试"
   mkdir -p "$TRANSFER_DIR"
 
+  # 必需镜像的同步失败先攒着,末尾统一 die —— 中途 die 会漏掉后面的步骤(见 vllm-omni
+  # 那步的注释)。空 = 全部成功。
+  SYNC_FAILED_REQUIRED=""
+
   # [2026-08-25] indextts2 / bernini 已下线,不再拉取与 save(各约 10G)。
   # NFS 上它们的旧 tar 未删除,如需临时恢复:
   #   docker pull --platform linux/arm64 "$INDEXTTS_IMAGE" && save_tar_if_changed "$INDEXTTS_IMAGE" "$INDEXTTS_TAR"
@@ -828,16 +832,28 @@ cmd_prepare_transfer() {
   step "同步 acestep tar(~8G,远端未变则跳过 pull+save)"
   sync_image_to_nfs "$ACESTEP_IMAGE" "$ACESTEP_TAR"
 
-  step "同步 vllm-omni tar(~11G;soft:拉不到只告警,不阻塞其余必需 tar)"
-  # vllm-omni 未注册后端(不被调度),soft:失败只告警,保证 gpustack/lightx2v/acestep
-  # 三个必需 tar 已经产出。set -e 下用 || 兜住整个 sync。
+  step "同步 vllm-omni tar(~11G;必需)"
+  # [2026-09-07] 从 soft 提为必需。原来的理由「vllm-omni 未注册后端(不被调度)」已经
+  # 过时:sensenova-u1.5 / qwen-image-edit / hunyuan-image-3 三个生图模型现在都跑在它
+  # 上面。而且**模型的多图输入能力是登记在引擎里的**(vllm-omni 的
+  # diffusion/model_metadata.py,2026-09-05 那笔 [Bugfix][SenseNova] 才加上 SenseNova
+  # 的 9 张;没有那条登记时 serving 层按 dataclass 默认值当成"最多 1 张",在 HTTP 边界
+  # 拒掉所有多图编辑)。tar 停在更早的版本 + upgrade 时 pull 被限流回退,那台节点就会
+  # 悄悄退回"只认 1 张",而验收 ⑦ 只查 gpustack-worker 的 label,发现不了。
+  #
+  # 记录失败而不是当场 die:中途 die 会让下面的 breeze-tts 与 amd64 tag 恢复整段不执行
+  # (这个坑下面那条注释记过一次)。所有步骤跑完后统一非 0 退出。
   sync_image_to_nfs "$VLLM_OMNI_IMAGE" "$VLLM_OMNI_TAR" \
-    || echo "    ⚠️ (soft) vllm-omni 同步失败,跳过其 tar(不影响其余镜像)"
+    || SYNC_FAILED_REQUIRED="${SYNC_FAILED_REQUIRED} vllm-omni"
 
   step "同步 breeze-tts tar(~8.9G;soft:拉不到只告警,不阻塞其余必需 tar)"
   # tar 存的是压缩层,约为镜像的三分之一:镜像 25.9G → tar 8.9G,与 lightx2v(8.1G)、
   # acestep(8.2G)同量级。soft 的理由不是体积而是它新接入、非必需,ACR 抖一下
   # 不该让前面几个 tar 白同步。
+  #
+  # 仍然是 soft(与上面的 vllm-omni 分道):它没有"能力登记在引擎里、装旧版会静默改变
+  # 接口行为"的那个问题。哪天它开始承接线上模型,照 vllm-omni 那样提为必需即可 ——
+  # 把下面的 echo 换成 SYNC_FAILED_REQUIRED 追加。
   sync_image_to_nfs "$BREEZE_IMAGE" "$BREEZE_TAR" \
     || echo "    ⚠️ (soft) breeze-tts 同步失败,跳过其 tar(不影响其余镜像)"
 
@@ -858,6 +874,14 @@ cmd_prepare_transfer() {
   echo "    提示:nvidia-repo/ 两件套如缺,在既有 GPU 节点执行:"
   echo "      mkdir -p ${NVIDIA_REPO_DIR} && cp /etc/apt/sources.list.d/nvidia-container-toolkit.list \\"
   echo "         /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg ${NVIDIA_REPO_DIR}/"
+
+  # 必须非 0 退出:回退路径的正确性全靠这些 tar 是新的。这里放行的话,后面各节点
+  # upgrade 时 pull 一被限流就静默 load 旧 tar,而且 ✅/FAIL=0 全绿 —— 2026-09-06
+  # 那 13 台就是这么来的(手册 §⑦)。
+  [ -z "$SYNC_FAILED_REQUIRED" ] || die "必需镜像 tar 同步失败:${SYNC_FAILED_REQUIRED# }" \
+    "其余 tar 与本机 tag 已处理完,只差这些" \
+    "别直接往下走 ⑤:各节点 pull 失败会回退到 NFS 上的旧 tar,静默装旧版且验收全绿" \
+    "网络恢复后重跑 prepare-transfer(未变的镜像会跳过 pull+save,很快)"
   finish
 }
 

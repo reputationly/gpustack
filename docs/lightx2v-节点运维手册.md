@@ -35,8 +35,10 @@ bash /root/lx2v-node.sh prepare-transfer
 ```
 
 > **集群批量**:238 上用 `lx2v-fleet.sh` 对所有 worker 并发跑 node 脚本子命令(自动排除 238 自身):
-> `bash /root/lx2v-fleet.sh upgrade-gpustack --offline` / `bash /root/lx2v-fleet.sh -j 3 upgrade-engine --engine vllm-omni --offline` / `bash /root/lx2v-fleet.sh status`。日志在 238 `/tmp/lx2v-fleet/<ip>.log`。
+> `bash /root/lx2v-fleet.sh -j 5 upgrade-gpustack` / `bash /root/lx2v-fleet.sh -j 3 upgrade-engine --engine vllm-omni --offline` / `bash /root/lx2v-fleet.sh status`。日志在 238 `/tmp/lx2v-fleet/<ip>.log`。
 > **定并发看 tar 体积,不是镜像体积**:tar 存的是压缩层,约为镜像的三分之一(breeze 镜像 25.9G → tar 8.9G,与 lightx2v 的 8.1G 同档),所以 breeze 用常规的 `-j 3` 即可。
+> ☠️ **走 ACR 在线拉时并发别超 5**,超了会 `too many requests` → 脚本静默回退旧 NFS tar,
+> 而 `FAIL=0` 照样全绿(坑 #29)。所以升级**必须**先 `prepare-transfer`、事后按 label 逐台点名(§2.5 ⑦)。
 >
 > **要一次接入多台全新节点?** 看 **§1.6 批量扩容** —— `lx2v-fleet.sh` 对全新节点用不了(它从 NFS 拉脚本,而新节点还没挂 NFS),必须先 scp + `setup-base` 把 NFS 挂上再让 fleet 接管。
 >
@@ -621,16 +623,56 @@ docker exec gpustack-server su postgres -c \
 # 不一致 = 迁移没跑成功。注意这条**不能**单独用来判断镜像换没换:
 # 两次构建之间若没有新迁移,head 本来就一样,对上了也说明不了什么——那是 ③.1 的活。
 
-# ④ 全 worker 升 gpustack
-bash /root/lx2v-fleet.sh -j 10 upgrade-gpustack --offline
+# ④ 全 worker 升 gpustack —— 并发别超 5(见下方 ⚠️ ACR 限流)
+bash /root/lx2v-fleet.sh -j 5 upgrade-gpustack
 
 # ⑤ 全 worker 换引擎镜像 —— 只列这次变了的,没变的别动(改这里)
-bash /root/lx2v-fleet.sh -j 10 upgrade-engine --engine lightx2v --offline
-bash /root/lx2v-fleet.sh -j 10 upgrade-engine --engine vllm-omni --offline
+bash /root/lx2v-fleet.sh -j 5 upgrade-engine --engine lightx2v
+bash /root/lx2v-fleet.sh -j 5 upgrade-engine --engine vllm-omni
 # 可选:acestep;indextts / bernini 已下线,只在明确需要时手动指定
 
 # ⑥ 巡检:worker 状态、五镜像 ID、NFS 挂载、每卡显存、实例容器
+#    (status 不拉镜像,并发可以放开)
 bash /root/lx2v-fleet.sh -j 10 status
+
+# ⑦ 收口验收 —— ✅ 和 FAIL=0 都不算数,只认镜像 label 逐台点名。
+#    这一步不是可选的:2026-09-06 那 13 台就是靠它才发现的。
+#    BAD 计数 + 末尾 false:这块常被整段粘进脚本,循环里只 echo 的话退出码恒为 0,
+#    它自己就成了本节警告的那种"全绿的假绿"。用 false 而不是 exit —— 手动粘到终端时
+#    exit 会把你踢出 ssh 会话;false 只是让这一块的 $? 非 0,CI/set -e 照样能捕获。
+EXPECT=<本次的不可变 tag,如 lx2v-20260905-1357-6e97b102>
+BAD=0
+for ip in $(awk 'NF{print $1}' /root/lx2v-nodes.txt | grep -vx 10.0.0.238); do
+  V=$(ssh -n -o BatchMode=yes -o ConnectTimeout=5 "root@$ip" \
+    'RI=$(docker inspect --format "{{.Image}}" gpustack-worker 2>/dev/null); \
+     docker image inspect --format "{{index .Config.Labels \"org.opencontainers.image.version\"}}" $RI 2>/dev/null' 2>/dev/null)
+  [ "$V" = "$EXPECT" ] || { echo "✗ $ip -> ${V:-<none>}"; BAD=$((BAD + 1)); }
+done
+[ "$BAD" -eq 0 ] && echo "✅ worker 镜像逐台一致" || { echo "❌ $BAD 台 worker 镜像不对"; false; }
+
+#    ⑦b 引擎镜像也要逐台点名 —— worker 对不代表引擎对。
+#    升过哪个引擎就核哪个(下面以 vllm-omni 为例;lightx2v/acestep 把镜像名换掉即可)。
+#    **vllm-omni 尤其不能省**:模型的多图输入能力登记在引擎里
+#    (diffusion/model_metadata.py),装旧版会让 SenseNova 多图编辑在 HTTP 边界
+#    被按"最多 1 张"拒掉,而上面那个 worker label 一切正常。
+ENGINE_REF=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/vllm-omni:arm64-a100-latest
+# 期望值取自 238 本机(prepare-transfer 刚 pull 过同一个 arm64 镜像)。
+# 空值守卫不能省:238 上没有这个镜像时 EXPECT_ENGINE="",而没装的节点回的也是 "",
+# 「空 == 空」会把全场判成一致 —— 又一个假绿。
+EXPECT_ENGINE=$(docker images --no-trunc --format '{{.ID}}' "$ENGINE_REF")
+[ -n "$EXPECT_ENGINE" ] || echo "⚠️ 238 本机没有 $ENGINE_REF,先跑 ② 或手填期望 ID,否则下面的比对无意义"
+BAD=0
+for ip in $(awk 'NF{print $1}' /root/lx2v-nodes.txt | grep -vx 10.0.0.238); do
+  V=$(ssh -n -o BatchMode=yes -o ConnectTimeout=5 "root@$ip" \
+    "docker images --no-trunc --format '{{.ID}}' $ENGINE_REF" 2>/dev/null)
+  [ "$V" = "$EXPECT_ENGINE" ] || { echo "✗ $ip -> ${V:-<none>}"; BAD=$((BAD + 1)); }
+done
+[ "$BAD" -eq 0 ] && echo "✅ vllm-omni 镜像逐台一致" || { echo "❌ $BAD 台 vllm-omni 不对"; false; }
+#    再核 server 侧:worker 全 READY、实例没掉
+docker exec gpustack-server su postgres -c \
+  "psql -d gpustack -tAc \"SELECT state, count(*) FROM workers GROUP BY state;\""
+docker exec gpustack-server su postgres -c \
+  "psql -d gpustack -tAc \"SELECT state, count(*) FROM model_instances GROUP BY state;\""
 ```
 
 > **⑤ 只改了 Python 代码时,不要加 `--offline`**(实测 2026-09-05,LightX2V 反相双跑上线)。
@@ -648,15 +690,33 @@ bash /root/lx2v-fleet.sh -j 10 status
 > 并发也不必压到 `-j 3`,实测 55 台并发 5 一次过、FAIL=0。
 > `--offline` 保留给它原本的两个场景:**全新节点** 与 **ACR 不通**;base 换代时也仍然要走 tar。
 >
-> **② 能不能跳,看这次升不升 server/worker**:
-> - **只升引擎**(不动 server/worker)→ ② 可以整步跳过,直接 ⑤ 不带 `--offline`。
-> - **联合升级**(③ server / ④ worker 也在内)→ **② 照跑**,worker 那条路仍然吃 tar,
->   跳了会让 ④ 拿不到镜像。此时 ⑤ 依然建议去掉 `--offline`,省的是 NFS 带宽,
->   与 ② 是否跑过无关。
+> **② 永远别跳,而且要看它的退出码。** 早先这里写的是「只升引擎可以跳过 ②」——
+> **那是错的**,2026-09-06 升 gpustack 时踩实了(见下条)。`prepare-transfer` 不只是给
+> `--offline` 用的,它还是**回退路径的正确性保证**:不加 `--offline` 时 tar 从主路径降为
+> 回退路径,并没有消失。唯一能跳的场合是你**刚跑过**、期间没有任何新包推上来。
 >
-> **⚠️ 加了 `--offline` 却没先跑 `prepare-transfer` = 静默装旧版。** NFS 上那个 tar 是上次
-> 出包留下的,`docker load` 会成功、日志全绿、FAIL=0,但装上去的是**旧镜像**。
-> `upgrade-engine` 的默认路径是先 pull、失败才回退 tar,**不加就不会踩这个坑**。
+> ⚠️ 「跑过 ②」不等于「tar 是新的」:soft 同步的镜像失败时只打一行 `⚠️ (soft)` 就过去了。
+> **vllm-omni 已于 2026-09-07 提为必需**(它跑着 sensenova-u1.5 / qwen-image-edit /
+> hunyuan-image-3,而且多图能力登记在引擎的 `model_metadata.py` 里,装旧版会让多图编辑
+> 在 HTTP 边界被按「最多 1 张」拒掉),失败会在 ② 末尾非 0 退出。breeze-tts 仍是 soft ——
+> 它的 `⚠️ (soft)` 要自己看见,别只看 ② 有没有报错。
+>
+> **⚠️ NFS tar 是旧的 = 静默装旧版,而且不加 `--offline` 一样会中招。**
+> `upgrade-*` 的默认路径是先 pull、失败才回退 tar。以前这里写「不加就不会踩这个坑」,
+> **是错的** —— pull 失败照样落到那个旧 tar 上,而且更隐蔽:你以为自己走的是在线路径。
+> `docker load` 会成功、退出码 0、`✅`、`FAIL=0`,装上去的却是旧镜像。
+>
+> **实录(2026-09-06)**:`-j 10 upgrade-gpustack`(不带 `--offline`),55 台里 **13 台**
+> 拿到的是上一版 `e32a7106` 而非目标 `6e97b102`,`FAIL=0` 全绿。节点日志里的真相:
+>
+> ```
+> error from registry: too many requests - sha256:59a1787461c3...
+>     pull 失败,回退 NFS tar ...
+> ```
+>
+> **个人版 ACR 有速率限制,`-j 10` 必触发。** 两条纠正:并发降到 **5**;② 无条件先跑,
+> 让回退路径落到的也是新 tar。修的时候只补落后的那些节点即可
+> (`printf '10.0.0.%s\n' <ip 尾号...> > /root/lx2v-fixN.txt` + `-j 3 -f`)。
 
 > **⑥ 的详细输出不在 stdout。** `lx2v-fleet.sh` 只往 stdout 打 `✅ <ip>`,每台的内容落在
 > `/tmp/lx2v-fleet/<ip>.log`。所以 `bash lx2v-fleet.sh status | grep <镜像>` **永远是空的**。
@@ -677,7 +737,7 @@ bash /root/lx2v-fleet.sh -j 10 status
 > done
 > ```
 
-**⑦ UI 重建实例**(改这里):Instance List 里把**用到了新引擎镜像的实例**逐个删除让其自动重建——**先删一个、等新的 Running 再删下一个**,服务不断。换了镜像但没重建实例 = 新代码根本没上线(实例锁旧镜像 ID)。
+**⑧ UI 重建实例**(改这里):Instance List 里把**用到了新引擎镜像的实例**逐个删除让其自动重建——**先删一个、等新的 Running 再删下一个**,服务不断。换了镜像但没重建实例 = 新代码根本没上线(实例锁旧镜像 ID)。
 
 **回滚 server**(①的锚派上用场时):
 
@@ -871,6 +931,7 @@ curl -s -X POST http://10.0.0.238/v1/videos -H "Authorization: Bearer $KEY" \
 | 26 | **`pkill -f` 把自己杀了** | `ssh node "pkill -f 'http.server 10150'"` 退出码正常,但目标进程还在 | `-f` 匹配整条命令行,ssh 远端执行的那条 `bash -c pkill -f http.server 10150` 自己也命中,先杀了自身所在的 shell。模式要锚定进程名开头:`pkill -f "^python3 -m http.server"` |
 | 27 | ☠️ **containerd 存储下 `docker image prune` 会删在用镜像** | `docker images -f dangling=true` 把带 tag 的 `lightx2v`/`gpustack`/`acestep` 也列为悬空 | 节点用的是 containerd 镜像存储(`docker info`: `overlayfs` + `io.containerd.snapshotter.v1`),该 filter 不可信。**只按 tag 精确 `docker rmi`,永不 prune**;判真悬空看 `docker images -a` 的 `REPOSITORY` 是否 `<none>`(见 §3) |
 | 28 | **新机预装的镜像是旧版本** | 新节点 `docker images` 数量对得上,但某个引擎跑出来行为/性能和现网不一致 | 新机器可能克隆自既有节点系统盘,带着一批旧 ID 镜像(0051-0055 的 vllm-omni 就是)。`install` 的 `docker load` 会覆盖,但**必须按 §1.6 ⑦ 逐台与基准节点比对镜像 ID** 才算数,别以"镜像已经在了"为准 |
+| 29 | ☠️ **ACR 限流 → 静默回退旧 tar,`FAIL=0` 是假绿** | `-j 10 upgrade-gpustack`,55 台全 `✅`、`OK=55 FAIL=0`,实际 13 台装的是上一版镜像 | 个人版 ACR 有速率限制,并发 10 必触发 `too many requests`;脚本按设计回退 NFS tar,而那个 tar 若没刷过就是旧包 —— **两个"正常"叠在一起产出一个错误结果,全程无报错**。三道防线缺一不可:**并发 ≤5**、升级前**无条件 `prepare-transfer`**、事后**按 label 逐台点名**(§2.5 ⑦)。真相只在节点本地日志 `/var/log/lx2v-node-<日期>.log` 里(`grep "回退 NFS tar"`),`/tmp/lx2v-fleet/<ip>.log` 会被下一条 fleet 命令覆盖 |
 
 ## 6. 脚本自身的升级
 
