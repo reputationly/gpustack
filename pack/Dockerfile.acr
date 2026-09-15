@@ -100,6 +100,11 @@ COPY gpustack/server/video_storage_janitor.py                                /tm
 COPY gpustack/server/video_task_sweeper.py                                   /tmp/lx2v-overlay/server/video_task_sweeper.py
 COPY gpustack/server/video_progress.py                                       /tmp/lx2v-overlay/server/video_progress.py
 COPY gpustack/utils/config.py                                                /tmp/lx2v-overlay/utils/config.py
+# --- 网关:不剥离 X-GPUStack-Model-Instance,让 new-api 能钉定实例 ---
+# 漏了这一行的后果正是本文件顶部注释警告的那种:WasmPlugin 的期望配置由
+# ensure_wasm_plugin 在服务端启动时推送,所以叠不上这个文件就等于网关仍按
+# 基础镜像的旧配置继续剥离那个头 —— 亲和静默失效,且两侧都不报错。
+COPY gpustack/gateway/__init__.py                                            /tmp/lx2v-overlay/gateway/__init__.py
 # --- M5: built gpustack-ui dist (placeholder when building locally) ---
 COPY pack/ui-dist/ /tmp/lx2v-ui/
 
