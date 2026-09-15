@@ -473,61 +473,13 @@ def transformer_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
     expected_spec = WasmPluginSpec(
         defaultConfig={
             "reqRules": [
-                # ``router_header_key`` (X-GPUStack-Model-Instance) is
-                # deliberately NOT stripped here, so an upstream caller can pin a
-                # request to one model instance.
-                #
-                # Why: vLLM's prefix cache is instance-local, and the model route
-                # carries one weighted destination per RUNNING instance
-                # (``calculate_model_destinations`` registers each instance as its
-                # own static service), so Envoy picks independently for every turn
-                # of a conversation. Turn k only reuses turn k-1's KV when it
-                # happens to land on the same instance. Measured on a 4-replica
-                # DeepSeek-V4-Flash route with a controlled 8-session x 5-turn
-                # replay: 34.1% prefix cache, per-turn hit fraction climbing
-                # 0/0/38/62/75% — the signature of random routing. Billing
-                # capacity is ``compute / (1 - hit_rate)``, so that is a direct
-                # revenue loss. Consistent-hash LB cannot fix it: ring hash
-                # selects among endpoints *within* one cluster, and here each
-                # instance is a separate cluster.
-                #
-                # Why stripping defeated it: ``model_pre_route_plugin`` reads this
-                # very header as ``clusterNameHeader``. Both plugins sit in phase
-                # AUTHN and Higress applies higher ``priority`` first — this
-                # transformer at 810 before pre-route at 90 — so the header was
-                # always gone before the router looked for it, and because
-                # pre-route is FAIL_OPEN the override degraded to plain load
-                # balancing with no log on either side.
-                #
-                # Threat model — the honest version. The wasm path does NOT
-                # validate this header (``get_instance_id_from_header`` is Python
-                # and only runs in the worker/tunnel proxy), so a caller that
-                # reaches this listener can name any instance service, including
-                # one belonging to a model it is not authorized for. That is
-                # acceptable here only because of two measured facts:
-                #
-                #   1. Every instance's inference port already answers
-                #      unauthenticated requests from the same network (verified:
-                #      4/4 instances return HTTP 200 for /v1/models and for a
-                #      real completion with no credentials). An on-network caller
-                #      does not need to forge anything — the gateway is not the
-                #      security perimeter for these workloads.
-                #   2. End users never reach this listener directly; they go
-                #      through new-api, which does not forward client-supplied
-                #      headers (its passthrough is opt-in per channel and now
-                #      hard-skips this header by name).
-                #
-                # RESTORE THE REMOVAL BELOW IF EITHER PREMISE BREAKS — i.e. if
-                # instance ports get network-isolated so the gateway becomes the
-                # only path in, or if this listener is ever exposed to untrusted
-                # clients. The safe-by-construction alternative is to authorize
-                # the resolved instance against the authenticated route inside
-                # the pre-route plugin; that needs a change to the wasm module,
-                # which is why it is not done here.
                 transform_header(
                     "remove",
                     HeaderRule(
                         key=GATEWAY_AUTH_TOKEN_HEADER,
+                    ),
+                    HeaderRule(
+                        key=router_header_key,
                     ),
                 ),
                 transform_header(
