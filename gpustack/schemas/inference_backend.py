@@ -513,6 +513,33 @@ def get_built_in_backend() -> List[InferenceBackend]:
             description="Breeze TTS 2 voice-design / voice-clone TTS engine (first-class built-in backend).",
         ),
         InferenceBackend(
+            backend_name=BackendEnum.YUE2.value,
+            is_built_in=True,
+            default_version="1.0.0",
+            version_configs=VersionConfigDict(
+                root={
+                    # YuE2 arm64/A100 engine image (reputationly/YuE, built by
+                    # its independent CI -> ACR). Same wiring as Breeze /
+                    # IndexTTS: floating tag, custom_framework="cuda" so
+                    # BackendFrameworkFilter accepts cuda A100 workers without
+                    # gpustack-runner.
+                    "1.0.0": VersionConfig(
+                        image_name=(
+                            "crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com"
+                            "/reputationly/yue2:arm64-a100-latest"
+                        ),
+                        custom_framework="cuda",
+                    ),
+                }
+            ),
+            # The engine only starts listening once the weights are loaded and a
+            # warmup song has gone through end to end (~25 s on A100), so a
+            # health check never passes on an instance that cannot generate.
+            health_check_path="/ready",
+            parameter_format=ParameterFormatEnum.SPACE,
+            description="YuE2 lyrics-to-song music engine with an editable ABC score (first-class built-in backend).",
+        ),
+        InferenceBackend(
             backend_name=BackendEnum.BERNINI.value,
             is_built_in=True,
             default_version="1.0.0",

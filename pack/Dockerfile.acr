@@ -63,6 +63,8 @@ COPY gpustack/worker/backends/bernini.py                                     /tm
 COPY gpustack/policies/candidate_selectors/bernini_resource_fit_selector.py  /tmp/lx2v-overlay/policies/candidate_selectors/bernini_resource_fit_selector.py
 COPY gpustack/worker/backends/breeze.py                                      /tmp/lx2v-overlay/worker/backends/breeze.py
 COPY gpustack/policies/candidate_selectors/breeze_resource_fit_selector.py   /tmp/lx2v-overlay/policies/candidate_selectors/breeze_resource_fit_selector.py
+COPY gpustack/worker/backends/yue2.py                                        /tmp/lx2v-overlay/worker/backends/yue2.py
+COPY gpustack/policies/candidate_selectors/yue2_resource_fit_selector.py     /tmp/lx2v-overlay/policies/candidate_selectors/yue2_resource_fit_selector.py
 COPY gpustack/assets/model-catalog.yaml                                      /tmp/lx2v-overlay/assets/model-catalog.yaml
 # Catalog icon lands under the installed UI static dir (copy_extra_static
 # equivalent); staged separately because it's outside the gpustack/ pkg tree.
@@ -140,6 +142,8 @@ RUN set -eux; \
         "${GP_DIR}/policies/candidate_selectors/bernini_resource_fit_selector.py" \
         "${GP_DIR}/worker/backends/breeze.py" \
         "${GP_DIR}/policies/candidate_selectors/breeze_resource_fit_selector.py" \
+        "${GP_DIR}/worker/backends/yue2.py" \
+        "${GP_DIR}/policies/candidate_selectors/yue2_resource_fit_selector.py" \
         "${GP_DIR}/schemas/inference_backend.py" \
         "${GP_DIR}/worker/backends/base.py" \
         "${GP_DIR}/scheduler/scheduler.py" \
@@ -164,6 +168,7 @@ RUN set -eux; \
     python3 -c "from gpustack.schemas.models import BackendEnum; assert BackendEnum.VLLM_OMNI; from gpustack.worker.backends.vllm_omni import VLLMOmniServer; from gpustack.policies.candidate_selectors.vllm_omni_resource_fit_selector import VLLMOmniResourceFitSelector; print('vllm-omni backend overlay OK')"; \
     python3 -c "from gpustack.schemas.models import BackendEnum, CategoryEnum; assert BackendEnum.BERNINI and CategoryEnum.VIDEO; from gpustack.worker.backends.bernini import BerniniServer; from gpustack.policies.candidate_selectors.bernini_resource_fit_selector import BerniniResourceFitSelector; print('bernini backend overlay OK')"; \
     python3 -c "from gpustack.schemas.models import BackendEnum, CategoryEnum; assert BackendEnum.BREEZE_TTS and CategoryEnum.TEXT_TO_SPEECH; from gpustack.worker.backends.breeze import BreezeTTSServer; from gpustack.policies.candidate_selectors.breeze_resource_fit_selector import BreezeTTSResourceFitSelector; print('breeze-tts backend overlay OK')"; \
+    python3 -c "from gpustack.schemas.models import BackendEnum, CategoryEnum; assert BackendEnum.YUE2 and CategoryEnum.MUSIC; from gpustack.worker.backends.yue2 import YuE2Server; from gpustack.policies.candidate_selectors.yue2_resource_fit_selector import YuE2ResourceFitSelector; print('yue2 backend overlay OK')"; \
     grep -q "IndexTTS-2" "${GP_DIR}/assets/model-catalog.yaml" && echo "catalog overlay OK"; \
     mkdir -p "${GP_DIR}/ui/static/catalog_icons"; \
     cp -v /tmp/lx2v-static/catalog_icons/index-tts.png "${GP_DIR}/ui/static/catalog_icons/"; \

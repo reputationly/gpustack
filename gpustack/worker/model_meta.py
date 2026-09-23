@@ -29,11 +29,13 @@ def get_meta_from_running_instance(
         BackendEnum.VLLM_OMNI,
         BackendEnum.BERNINI,
         BackendEnum.BREEZE_TTS,
+        BackendEnum.YUE2,
     ):
         # LightX2V exposes an async task API behind the launcher, IndexTTS an
         # async task API + /v1/audio/speech, ACE-Step an async task API
         # (/v1/tasks/music/), and vLLM-Omni an async task API
-        # (/v1/tasks/audio/) + /v1/audio/speech, and Breeze TTS the same pair —
+        # (/v1/tasks/audio/) + /v1/audio/speech, Breeze TTS the same pair, and
+        # YuE2 an async task API (/v1/tasks/music/) —
         # none serve /v1/models, so probing would only produce a spurious
         # warning per RUNNING transition.
         return {}

@@ -35,6 +35,9 @@ from gpustack.policies.candidate_selectors.lightx2v_resource_fit_selector import
 from gpustack.policies.candidate_selectors.breeze_resource_fit_selector import (
     BreezeTTSResourceFitSelector,
 )
+from gpustack.policies.candidate_selectors.yue2_resource_fit_selector import (
+    YuE2ResourceFitSelector,
+)
 from gpustack.policies.candidate_selectors.indextts_resource_fit_selector import (
     IndexTTSResourceFitSelector,
 )
@@ -496,6 +499,11 @@ async def find_candidate(  # noqa: C901
             candidates_selector = BreezeTTSResourceFitSelector(
                 config, model, model_instances
             )
+        elif model.backend == BackendEnum.YUE2:
+            # YuE2: whole-GPU exclusive, 1 instance/card (see selector).
+            candidates_selector = YuE2ResourceFitSelector(
+                config, model, model_instances
+            )
         elif model.backend == BackendEnum.ACESTEP:
             # ACE-Step: whole-GPU exclusive, 1 instance/card (same as IndexTTS).
             candidates_selector = ACEStepResourceFitSelector(
@@ -784,6 +792,7 @@ def _evaluate_builtin_backend_config(model: Model) -> Optional[bool]:
         BackendEnum.ACESTEP: CategoryEnum.MUSIC,
         BackendEnum.BERNINI: CategoryEnum.VIDEO,
         BackendEnum.BREEZE_TTS: CategoryEnum.TEXT_TO_SPEECH,
+        BackendEnum.YUE2: CategoryEnum.MUSIC,
     }
     if model.backend == BackendEnum.VLLM_OMNI:
         category = _vllm_omni_category(model)
