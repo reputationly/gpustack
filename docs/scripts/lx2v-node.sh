@@ -5,12 +5,16 @@
 #   ./lx2v-node.sh setup-base                        # 全新节点只配基础环境(docker/NFS/toolkit),不入集群
 #   ./lx2v-node.sh install --token <GPUSTACK_TOKEN> [--worker-ip <IP>] [--offline] [--clean-residue] [--force]
 #   ./lx2v-node.sh upgrade-gpustack [--offline]     # 换 gpustack:lx2v-dev 并原参数重启 worker
-#   ./lx2v-node.sh upgrade-engine   [--engine lightx2v|acestep|vllm-omni|breeze] [--offline]
+#   ./lx2v-node.sh mount-nfs                         # 只补 NFS 挂载(含 prod 模型 /root/Models,只读),不碰容器
+#   ./lx2v-node.sh rebuild-worker                    # 不换镜像,原参数重建 worker(用于新增挂载)
+#   ./lx2v-node.sh upgrade-engine   [--engine lightx2v|acestep|vllm-omni|breeze|yue2|vllm-backport] [--offline]
+#       vllm-backport(DeepSeek-V4-Flash 引擎)的 tag 必须与 GPUStack 模型配置一致,用
+#       VLLM_BACKPORT_IMAGE=<完整镜像:tag> 显式指定;默认 latest 拉了也用不上
 #                                                    # 换引擎镜像(默认 lightx2v;实例需重建才生效)
 #                                                    # indextts/bernini 已下线,不再默认分发,但 --engine 仍可手动指定
 #   ./lx2v-node.sh clean [--purge-data] [--kill-gpu-procs]   # 清理卸载残留(见下)
 #   ./lx2v-node.sh status                            # 节点健康速览
-#   ./lx2v-node.sh prepare-transfer                  # (238/有 ACR 外网的机器)拉五镜像(gpustack/lightx2v/acestep/vllm-omni/breeze-tts)存 NFS tar
+#   ./lx2v-node.sh prepare-transfer                  # (238/有 ACR 外网的机器)拉六镜像(gpustack/lightx2v/acestep/vllm-omni/breeze-tts/yue2)存 NFS tar
 #
 # 残留环境(装过 GPUStack 又卸载/被清理过的节点):
 #   install 自带残留检测——异 token 的旧 worker 自动移除重建,同 token(同集群)需加 --force;
@@ -56,10 +60,44 @@ BERNINI_IMAGE="${REGISTRY}/bernini:arm64-a100-latest"
 # Breeze TTS 2 音色设计引擎(独立 CI 出包,同 acestep 范式)。接替 MOSS-VoiceGen:
 # 纯文字描述造声线,无参考音频。已在 GPUStack 注册为内置后端 BreezeTTS,会被调度。
 BREEZE_IMAGE="${REGISTRY}/breeze-tts:arm64-a100-latest"
+# YuE2 文生音乐 / 翻唱引擎(独立 CI 出包,reputationly/YuE)。已在 GPUStack 注册为内置后端
+# YuE2,会被调度。叠在 lightx2v 的 cu130 基座上 —— 与 lightx2v / acestep 镜像的 33 层基座
+# 逐层相同,自身只多 ~146MB。所以装过 lightx2v 的节点在线拉它只下 app 层(实测 10s),
+# 反而是 NFS tar(docker save 整镜像,~8.8G)要把基座再读一遍 —— 见 install 里它的预载方式。
+YUE2_IMAGE="${REGISTRY}/yue2:arm64-a100-latest"
+# vLLM-backport:DeepSeek-V4-Flash(含 1M 上下文版)跑的引擎,sm80 专用构建。
+#
+# 它与本脚本里其他引擎的**归属不同**,别按同一套心智模型理解:
+#   · lightx2v / acestep / breeze 等是自带镜像的第一类后端,镜像声明在
+#     gpustack/schemas/inference_backend.py 的 version_configs.image_name 里;
+#   · vLLM 用的是 GPUStack **官方内置后端**(`InferenceBackend(VLLM, is_built_in=True)`,
+#     没有 version_configs),我们的 backport 镜像是在**模型自己的 YAML 里配 image_name**
+#     挂上去的 —— 走 base._resolve_image 的第 1 优先级(模型 image_name > 后端
+#     version_configs > gpustack-runner 自动推导)。
+# 所以本脚本对它**没有权威的版本来源**:改版本是改 GPUStack 里模型的 YAML,
+# 本脚本只负责把那个 tag 的镜像预分发到节点,省掉起实例时现场拉 11G。
+#
+# 由此产生一条硬约束:**tag 必须与模型 YAML 里的 image_name 逐字一致**。
+# 其余引擎用 `:arm64-a100-latest` 这种可变 tag,拉 latest 就等于拉到实例会用的那个;
+# 而 backport 的现网模型 YAML 钉的是带时间戳的不可变 tag(如
+# arm64-sm80-20260915-0047-85d0e70c)。此时拉 `:arm64-sm80-latest` **毫无用处** ——
+# 它只会在本地多出一个 latest 标签,gpustack 起实例时按 YAML 里的时间戳 tag 去找,
+# 本地没有就现场拉;更糟的是本地若有个旧的同名 tag,按 IfNotPresent 会直接用旧的
+# (2026-09-17 全队实测:20 台节点的本地 arm64-sm80-latest 都停在旧构建上)。
+# 所以分发时用 VLLM_BACKPORT_IMAGE 显式传 YAML 里那个 tag:
+#   VLLM_BACKPORT_IMAGE=.../vllm-backport:arm64-sm80-20260915-0047-85d0e70c \
+#     ./lx2v-node.sh upgrade-engine --engine vllm-backport
+# 默认值给 latest 只是为了不带参数时也能跑通,生产分发请显式指定。
+VLLM_BACKPORT_IMAGE="${VLLM_BACKPORT_IMAGE:-${REGISTRY}/vllm-backport:arm64-sm80-latest}"
 SERVER_URL="${SERVER_URL:-http://10.0.0.238}"
 NFS_SERVER="100.125.40.2"
 NFS_MODELS_EXPORT="/share-LLM"
 NFS_OUTPUT_EXPORT="/share-output"
+# prod(newapi)集群的模型 export,挂到与 prod 相同的 /root/Models:prod 的模型配置
+# (模型路径、--chat-template 等)在 dev 上可原样使用。只读,防止 dev 上的实验误改线上模型。
+NFS_PROD_MODELS_EXPORT="/MaaS_Models"
+PROD_MODELS_MP="/root/Models"
+PROD_MODELS_OPTS="ro,hard,nolock,noresvport,_netdev"
 TRANSFER_DIR="/nfs-models/_transfer"
 GPUSTACK_TAR="${TRANSFER_DIR}/gpustack-lx2v-dev-arm64.tar"
 ENGINE_TAR="${TRANSFER_DIR}/lightx2v-arm64-profiles.tar"
@@ -68,6 +106,10 @@ ACESTEP_TAR="${TRANSFER_DIR}/acestep-arm64-a100.tar"
 VLLM_OMNI_TAR="${TRANSFER_DIR}/vllm-omni-arm64-a100.tar"
 BERNINI_TAR="${TRANSFER_DIR}/bernini-arm64-a100.tar"
 BREEZE_TAR="${TRANSFER_DIR}/breeze-tts-arm64-a100.tar"
+YUE2_TAR="${TRANSFER_DIR}/yue2-arm64-a100.tar"
+# tar 名按 tag 派生,不用固定名:backport 是多版本并存的(现网钉时间戳 tag),
+# 固定名的 tar 会让"NFS 上这个 tar 是哪一版"无从判断,回退时必然踩错版本。
+VLLM_BACKPORT_TAR="${TRANSFER_DIR}/vllm-backport-${VLLM_BACKPORT_IMAGE##*:}.tar"
 NVIDIA_REPO_DIR="${TRANSFER_DIR}/nvidia-repo"
 WORKER_NAME="gpustack-worker"
 WORKER_PORT=10150
@@ -359,14 +401,62 @@ fetch_image() { # fetch_image <image> <tar>
     echo "    从 NFS load: $tar ($(du -h "$tar" | cut -f1))"
     docker load -i "$tar"
   else
-    # 有旧镜像时 pull 只拉增量层;失败自动回退 NFS tar
-    if ! docker pull "$image"; then
+    # 有旧镜像时 pull 只拉增量层;失败才回退 NFS tar。
+    #
+    # 坑#11:这里原先是裸 `docker pull`(不是 docker_pull_retry),ACR 一抖 **第一次失败
+    #   就回退**,而回退前又不校验 tar 新旧 —— 于是 upgrade-gpustack/upgrade-engine 会
+    #   报「完成」却装上 NFS 上的旧镜像。这正是 sync_image_to_nfs 那边花大力气防的静默
+    #   降级(坑#9),只是发生在节点这一端,而且更隐蔽:出 tar 那侧有指纹 marker 兜底,
+    #   装机这侧什么都不查。现在:① 先按 docker_pull_retry 退避重试 3 次;② 回退前拿
+    #   远端指纹和 <tar>.remote 比对,**能证明 tar 是旧的就直接失败**,不硬装。
+    if ! docker_pull_retry "$image"; then
+      [ -f "$tar" ] || die "pull 失败(已重试 3 次)且无 NFS tar 可用: $tar" \
+        "ACR 网络不通?在 238 跑 prepare-transfer 出 tar 后用 --offline 重试"
+      local fp marker
+      marker="${tar}.remote"
+      fp="$(remote_fingerprint "$image")"
+      if [ -n "$fp" ] && [ -n "$(cat "$marker" 2>/dev/null || true)" ] \
+         && [ "$(cat "$marker" 2>/dev/null)" != "$fp" ]; then
+        die "pull 失败,且 NFS tar 已确认是旧版本,拒绝静默降级: $tar" \
+          "远端指纹 ${fp:0:12} ≠ tar 指纹 $(cut -c1-12 "$marker" 2>/dev/null)" \
+          "在 238 跑 prepare-transfer 把 tar 更新到当前远端,再重跑本命令" \
+          "确实要装这个旧版本 → 显式用 --offline(语义上就是「用 NFS 上的那一版」)"
+      fi
+      if [ -z "$fp" ]; then
+        # pull 刚失败,查指纹大概率也查不到 —— 无法证明 tar 新旧。不阻塞恢复,
+        # 但必须让日志里这件事无法被忽略:fleet 汇总只看退出码,OK 会掩盖一切。
+        echo "    ⚠️⚠️ 无法校验 NFS tar 是否为当前版本(远端指纹查不到,网络不通?)"
+        echo "    ⚠️⚠️ 即将 load 的 tar 修改时间: $(date -r "$tar" '+%F %T' 2>/dev/null || echo 未知)"
+        echo "    ⚠️⚠️ 若它早于最近一次构建,本次升级实际是**降级**,请事后核对镜像 ID"
+      else
+        echo "    NFS tar 指纹与远端一致(${fp:0:12}),回退安全"
+      fi
       echo "    pull 失败,回退 NFS tar ..."
-      [ -f "$tar" ] || die "pull 失败且无 NFS tar 可用: $tar"
       docker load -i "$tar"
     fi
   fi
   echo "    当前镜像: $(docker images --format '{{.ID}}  {{.Repository}}:{{.Tag}}' | grep -F "${image#*/}" | head -1)"
+}
+
+# 升级成功后回收悬空镜像。放在验证之后:失败时旧镜像还在,能回退。
+#
+# 为什么必须做而不是只提示:docker 这套用的是 containerd snapshotter
+# (`docker info` → Storage Driver: overlayfs / driver-type io.containerd.snapshotter.v1),
+# 镜像落在 /var/lib/containerd 而非 /var/lib/docker,且**压缩 blob 与解开的层各存一份**
+# (content.v1.content 107G + snapshotter.v1.overlayfs 295G,实测于 0043)。一个
+# backport 版本约占 29~31G。2026-09-17 全队实测:每台已攒下 38~46 个悬空镜像,
+# 55 台清出 2.9TB(平均 54.6G/台),0043 当时只剩 486G。靠 runbook 里写句「确要清理」
+# 是不管用的 —— 这次就是攒到接近告警线才被发现。
+prune_dangling() {
+  local before after
+  before="$(df -BG --output=avail / 2>/dev/null | tail -1 | tr -d ' G')"
+  # 只删悬空镜像:有 tag 的、以及被任何容器(含已停止)引用的都不会被碰,
+  # 所以不会动 gpustack-worker 和正在跑的引擎实例。
+  docker image prune -f || echo "    ⚠️ prune 失败(不影响升级结果)"
+  after="$(df -BG --output=avail / 2>/dev/null | tail -1 | tr -d ' G')"
+  if [ -n "$before" ] && [ -n "$after" ]; then
+    echo "    根分区剩余 ${before}G → ${after}G(释放 $((after - before))G)"
+  fi
 }
 
 # 全新节点装机用:NFS tar 在就 load(内网快);不在则在线 pull——但 --offline
@@ -399,12 +489,17 @@ fetch_image_prefer_tar() { # fetch_image_prefer_tar <image> <tar> [soft]
 }
 
 # 单个 NFS 挂载点独立配置(半配置节点上只补缺的那个,互不牵连)
-ensure_mount() { # ensure_mount <export> <mountpoint>
-  local exp=$1 mp=$2
+ensure_mount() { # ensure_mount <export> <mountpoint> [mount options]
+  local exp=$1 mp=$2 opts=${3:-rw,hard,nolock,noresvport,_netdev}
+  # 非空的本地目录会被挂载静默遮住,里面的东西看起来像"丢了"
+  if [ -d "$mp" ] && ! mountpoint -q "$mp" && [ -n "$(ls -A "$mp" 2>/dev/null)" ]; then
+    die "${mp} 是非空的本地目录,挂载会把它遮住" \
+      "人工确认内容后: mv ${mp} ${mp}.bak,再重跑"
+  fi
   mkdir -p "$mp"
   if ! mountpoint -q "$mp"; then
     grep -qsE "[[:space:]]${mp}[[:space:]]" /etc/fstab || \
-      echo "${NFS_SERVER}:${exp} ${mp} nfs rw,hard,nolock,noresvport,_netdev 0 0" >> /etc/fstab
+      echo "${NFS_SERVER}:${exp} ${mp} nfs ${opts} 0 0" >> /etc/fstab
     mount "$mp" 2>/dev/null || mount -a
   fi
   mountpoint -q "$mp" || die "${mp} 挂载失败" \
@@ -427,11 +522,14 @@ ensure_symlink() { # ensure_symlink <link_path>
 ensure_nfs() {
   ensure_mount "$NFS_MODELS_EXPORT" /nfs-models
   ensure_mount "$NFS_OUTPUT_EXPORT" /nfs-output
+  ensure_mount "$NFS_PROD_MODELS_EXPORT" "$PROD_MODELS_MP" "$PROD_MODELS_OPTS"
   ensure_symlink /nfs-data
   ensure_symlink /data
   ls /nfs-models/wuhanjisuan894/models/ > /dev/null || die "NFS 内容不可读" \
     "挂上了但目录结构不对?确认挂的是 ${NFS_MODELS_EXPORT} 而非其他 export"
-  echo "    NFS OK(/nfs-models + /nfs-output + 软链)"
+  ls "$PROD_MODELS_MP" > /dev/null || die "${PROD_MODELS_MP} 不可读" \
+    "确认挂的是 ${NFS_PROD_MODELS_EXPORT}"
+  echo "    NFS OK(/nfs-models + /nfs-output + ${PROD_MODELS_MP}(只读) + 软链)"
 }
 
 current_worker_volume() {
@@ -452,7 +550,7 @@ build_default_envs() { # build_default_envs <token>
   WORKER_ENVS=(
     "GPUSTACK_RUNTIME_DEPLOY_MIRRORED_NAME=${WORKER_NAME}"
     "GPUSTACK_TOKEN=$1"
-    "GPUSTACK_EXTRA_MOUNTS=/nfs-models,/nfs-output,/nfs-data"
+    "GPUSTACK_EXTRA_MOUNTS=/nfs-models,/nfs-output,/nfs-data,${PROD_MODELS_MP}"
   )
 }
 collect_existing_envs() {
@@ -490,17 +588,45 @@ ensure_extra_mount() { # ensure_extra_mount <host_path>
   [ "$found" -eq 1 ] || WORKER_ENVS+=("GPUSTACK_EXTRA_MOUNTS=/nfs-models,/nfs-output,${want}")
 }
 
+# upgrade-gpustack 与 rebuild-worker 共用:读旧 worker 的 env / 卷 / server-url / IP,
+# 并补齐标准挂载。结果放在全局 WORKER_ENVS / WORKER_VOLUME / WORKER_SERVER_URL / WORKER_IP
+collect_worker_config() {
+  collect_existing_envs
+  ensure_env_present GPUSTACK_RUNTIME_DEPLOY_MIRRORED_NAME "$WORKER_NAME"
+  ensure_env_present GPUSTACK_EXTRA_MOUNTS "/nfs-models,/nfs-output,/nfs-data,${PROD_MODELS_MP}"
+  ensure_extra_mount /nfs-data   # 旧容器已带 EXTRA_MOUNTS 时补挂 /nfs-data(s2v/vace 依赖)
+  ensure_extra_mount "$PROD_MODELS_MP"
+  ensure_symlink /nfs-data       # 宿主软链兜底(个别节点当年 install 未建上)
+  WORKER_VOLUME="$(current_worker_volume)"
+  [ -n "$WORKER_VOLUME" ] || die "读不到数据卷名" \
+    "匿名卷也会有 64 位卷名;完全为空说明容器没挂 /var/lib/gpustack,重建会丢状态,停止" \
+    "人工核对: docker inspect ${WORKER_NAME} --format '{{json .Mounts}}'"
+  WORKER_SERVER_URL="$(old_cmd_value --server-url)"
+  [ -n "$WORKER_SERVER_URL" ] || WORKER_SERVER_URL="$SERVER_URL"
+  resolve_worker_ip   # 显式 --worker-ip > 旧容器参数 > 自动探测
+  echo "    volume=${WORKER_VOLUME}  worker-ip=${WORKER_IP}  server-url=${WORKER_SERVER_URL}"
+  echo "    继承 env: $(printf '%s\n' "${WORKER_ENVS[@]}" | cut -d= -f1 | tr '\n' ' ')"
+}
+
 run_worker() { # run_worker <worker_ip> <volume> <server_url>(env 取全局 WORKER_ENVS)
   local ip=$1 volume=$2 server_url=$3
   local env_flags=() e
   for e in "${WORKER_ENVS[@]}"; do env_flags+=(-e "$e"); done
+  # /root/.docker 只读挂进来:拉推理镜像的是 worker 容器里的 docker-py(不是宿主机
+  # docker CLI),它只认**自己文件系统**里的 ~/.docker/config.json。不挂的话,宿主机
+  # 哪怕 docker login 过,私有 registry 照样 403 "no X-Auth-Token or Authorization
+  # header"(2026-09-10 昇腾 SWR 就是这么翻的车)。挂上以后 worker 重建也自动继承登录态,
+  # 不必再跑 fleet-docker-login.sh 往容器里补。宿主机没这目录时 docker 会建个空的,等同现状。
+  mkdir -p /root/.docker
   docker run -d --name "$WORKER_NAME" \
     "${env_flags[@]}" \
     --restart=unless-stopped --privileged --network=host \
     --volume /var/run/docker.sock:/var/run/docker.sock \
+    --volume /root/.docker:/root/.docker:ro \
     --volume "${volume}:/var/lib/gpustack" \
     --volume /nfs-models:/nfs-models --volume /nfs-output:/nfs-output \
     --volume /nfs-data:/nfs-data \
+    --volume "${PROD_MODELS_MP}:${PROD_MODELS_MP}:ro" \
     --runtime nvidia \
     "$GPUSTACK_IMAGE" \
     --server-url "$server_url" --worker-ip "$ip"
@@ -603,7 +729,8 @@ cmd_install() {
     "同一集群的注册令牌可复用于多台 worker"
   # 12 -> 10:indextts2 / bernini 两个镜像预载步骤已下线(见下方注释)
   # 10 -> 11:新增 breeze-tts 预载
-  STEP_TOTAL=11
+  # 11 -> 12:新增 yue2 预载
+  STEP_TOTAL=12
 
   step "预检:GPU 驱动 / 架构"
   nvidia-smi -L || die "nvidia-smi 不可用" "先安装 GPU 驱动(A100 节点镜像通常自带,重装过系统的机器需补装)"
@@ -650,6 +777,17 @@ cmd_install() {
   # soft 的理由是它新接入:缺镜像的节点在实例创建时由 runtime 现拉(慢但可用),
   # 不该因此卡住整个 install。
   fetch_image_prefer_tar "$BREEZE_IMAGE" "$BREEZE_TAR" soft
+
+  step "镜像:yue2 引擎(soft 预载;在线优先、NFS tar 兜底,与其他引擎相反)"
+  # 已注册后端 YuE2,会被调度落任意空闲卡,故全节点预载。顺序反过来的原因:它与上面刚装的
+  # lightx2v 共用 33 层基座,在线拉只下 ~146MB app 层(gpu44 实测 10s);tar 优先则要从
+  # NFS 整读 ~8.8G,fleet 并发时还会互抢 NFS。只有 --offline 或拉不到时才读 tar。
+  # 放在 if 条件里:拉取失败不触发 set -e / ERR trap,保持 soft。
+  if [ "$OFFLINE" -eq 0 ] && docker_pull_retry "$YUE2_IMAGE"; then
+    echo "    当前镜像: $(docker images --format '{{.ID}}  {{.Repository}}:{{.Tag}}' | grep -F "${YUE2_IMAGE#*/}" | head -1)"
+  else
+    fetch_image_prefer_tar "$YUE2_IMAGE" "$YUE2_TAR" soft
+  fi
 
   step "起 worker 并验证注册"
   docker rm -f "$WORKER_NAME" 2>/dev/null || true
@@ -706,32 +844,60 @@ cmd_clean() {
 
 cmd_upgrade_gpustack() {
   parse_flags "$@"
-  STEP_TOTAL=4
+  STEP_TOTAL=5
   docker inspect "$WORKER_NAME" > /dev/null 2>&1 || die "本机没有 ${WORKER_NAME} 容器(全新节点请用 install)"
 
   step "读取现有 worker 配置(GPUSTACK_* env / 卷 / server-url / IP 全部原样保留)"
-  local volume old_server_url
-  collect_existing_envs
-  ensure_env_present GPUSTACK_RUNTIME_DEPLOY_MIRRORED_NAME "$WORKER_NAME"
-  ensure_env_present GPUSTACK_EXTRA_MOUNTS "/nfs-models,/nfs-output,/nfs-data"
-  ensure_extra_mount /nfs-data   # 旧容器已带 EXTRA_MOUNTS 时补挂 /nfs-data(s2v/vace 依赖)
-  ensure_symlink /nfs-data       # 宿主软链兜底(个别节点当年 install 未建上)
-  volume="$(current_worker_volume)"
-  [ -n "$volume" ] || die "读不到数据卷名" \
-    "匿名卷也会有 64 位卷名;完全为空说明容器没挂 /var/lib/gpustack,重建会丢状态,停止" \
-    "人工核对: docker inspect ${WORKER_NAME} --format '{{json .Mounts}}'"
-  old_server_url="$(old_cmd_value --server-url)"
-  [ -n "$old_server_url" ] || old_server_url="$SERVER_URL"
-  resolve_worker_ip   # 显式 --worker-ip > 旧容器参数 > 自动探测
-  echo "    volume=${volume}  worker-ip=${WORKER_IP}  server-url=${old_server_url}"
-  echo "    继承 env: $(printf '%s\n' "${WORKER_ENVS[@]}" | cut -d= -f1 | tr '\n' ' ')"
+  ensure_mount "$NFS_PROD_MODELS_EXPORT" "$PROD_MODELS_MP" "$PROD_MODELS_OPTS"
+  collect_worker_config
 
   step "拉取/加载新 gpustack 镜像"
   fetch_image "$GPUSTACK_IMAGE" "$GPUSTACK_TAR"
 
   step "重建 worker 容器"
   docker stop "$WORKER_NAME" && docker rm "$WORKER_NAME"
-  run_worker "$WORKER_IP" "$volume" "$old_server_url"
+  run_worker "$WORKER_IP" "$WORKER_VOLUME" "$WORKER_SERVER_URL"
+
+  step "验证注册"
+  verify_worker
+
+  step "回收悬空镜像"
+  prune_dangling
+  finish
+}
+
+# mount-nfs:只补 NFS 挂载(含 fstab)与软链,不碰任何容器。已挂的跳过,可反复跑。
+cmd_mount_nfs() {
+  STEP_TOTAL=1
+  step "挂载 NFS + 软链"
+  ensure_nfs
+  finish
+}
+
+# rebuild-worker:只为改挂载而原样重建 worker,**不拉镜像**。upgrade-gpustack 会先拉
+# 最新 gpustack:lx2v-dev —— tag 若在上次全队升级后动过,"加个挂载"就会顺手把全队升了版本。
+cmd_rebuild_worker() {
+  parse_flags "$@"
+  STEP_TOTAL=4
+  docker inspect "$WORKER_NAME" > /dev/null 2>&1 || die "本机没有 ${WORKER_NAME} 容器(全新节点请用 install)"
+
+  step "宿主机 NFS 挂载(worker 挂 ${PROD_MODELS_MP} 之前它必须已是挂载点)"
+  ensure_nfs
+
+  step "读取现有 worker 配置(镜像 / GPUSTACK_* env / 卷 / server-url / IP 全部原样保留)"
+  local image_id
+  image_id="$(docker inspect "$WORKER_NAME" --format '{{.Image}}')"
+  # tag 仍指向在跑的镜像就用 tag(docker ps 可读);已被后来的 pull 挪走则钉镜像 ID
+  if [ "$(docker image inspect "$GPUSTACK_IMAGE" --format '{{.Id}}' 2>/dev/null || true)" != "$image_id" ]; then
+    echo "    ⚠️ 本地 ${GPUSTACK_IMAGE##*/} 已不是 worker 在跑的镜像,按镜像 ID 重建以保持版本不变"
+    GPUSTACK_IMAGE="$image_id"
+  fi
+  echo "    image=${GPUSTACK_IMAGE}"
+  collect_worker_config
+
+  step "重建 worker 容器"
+  docker stop "$WORKER_NAME" && docker rm "$WORKER_NAME"
+  run_worker "$WORKER_IP" "$WORKER_VOLUME" "$WORKER_SERVER_URL"
 
   step "验证注册"
   verify_worker
@@ -749,13 +915,22 @@ cmd_upgrade_engine() {
     vllm-omni) img="$VLLM_OMNI_IMAGE"; tar="$VLLM_OMNI_TAR" ;;
     bernini)   img="$BERNINI_IMAGE";   tar="$BERNINI_TAR" ;;
     breeze)    img="$BREEZE_IMAGE";    tar="$BREEZE_TAR" ;;
-    *) die "未知引擎: $ENGINE_SEL" "--engine 只支持 lightx2v | indextts | acestep | vllm-omni | bernini | breeze" ;;
+    yue2)      img="$YUE2_IMAGE";      tar="$YUE2_TAR" ;;
+    vllm-backport) img="$VLLM_BACKPORT_IMAGE"; tar="$VLLM_BACKPORT_TAR" ;;
+    *) die "未知引擎: $ENGINE_SEL" \
+         "--engine 只支持 lightx2v | indextts | acestep | vllm-omni | bernini | breeze | yue2 | vllm-backport" ;;
   esac
-  STEP_TOTAL=2
+  STEP_TOTAL=3
   step "当前引擎镜像(${ENGINE_SEL})"
   local old_id
   old_id="$(docker images --format '{{.ID}}' "$img" | head -1 || true)"
-  echo "    old=${old_id:-<无>}"
+  echo "    old=${old_id:-<无>}  目标 tag: ${img##*/}"
+  # backport 的 tag 必须和 GPUStack 模型配置里的一致,否则拉了也用不上(见文件头注释)
+  if [ "$ENGINE_SEL" = "vllm-backport" ] && [ "${img##*:}" = "arm64-sm80-latest" ]; then
+    echo "    ⚠️ 用的是可变 tag arm64-sm80-latest。backport 的版本权威来源是**模型 YAML 里的"
+    echo "       image_name**(官方 vLLM 后端没有 version_configs),若那里钉的是时间戳 tag,"
+    echo "       本次拉取对起实例毫无帮助 —— 用 VLLM_BACKPORT_IMAGE=<完整镜像:tag> 显式指定"
+  fi
 
   step "拉取/加载新引擎镜像"
   fetch_image "$img" "$tar"
@@ -768,6 +943,9 @@ cmd_upgrade_engine() {
     echo "    ⚠️ 正在运行的实例仍用旧镜像;到 UI 逐个删除实例让其自动重建即可生效"
     echo "       (先删一个、等 Running 再删下一个,保持服务不断)"
   fi
+
+  step "回收悬空镜像"
+  prune_dangling
   finish
 }
 
@@ -779,10 +957,14 @@ cmd_status() {
   echo "--- 本机 healthz:"
   curl -sf --max-time 3 "http://127.0.0.1:${WORKER_PORT}/healthz" && echo "  OK" || echo "  不通"
   echo "--- 镜像:"
-  docker images --format '  {{.ID}}  {{.Repository}}:{{.Tag}}' | grep -E "gpustack|lightx2v|indextts|acestep|vllm-omni|bernini|breeze-tts" || true
+  docker images --format '  {{.ID}}  {{.Repository}}:{{.Tag}}' | grep -E "gpustack|lightx2v|indextts|acestep|vllm-omni|vllm-backport|bernini|breeze-tts|yue2" || true
   echo "--- NFS:"
   mountpoint -q /nfs-models && echo "  /nfs-models OK" || echo "  /nfs-models 未挂载"
   mountpoint -q /nfs-output && echo "  /nfs-output OK" || echo "  /nfs-output 未挂载"
+  mountpoint -q "$PROD_MODELS_MP" && echo "  ${PROD_MODELS_MP} OK(prod 模型,只读)" || echo "  ${PROD_MODELS_MP} 未挂载"
+  docker inspect "$WORKER_NAME" --format '{{range .Mounts}}{{println .Destination}}{{end}}' 2>/dev/null \
+    | grep -qx "$PROD_MODELS_MP" && echo "  worker 已挂 ${PROD_MODELS_MP}" \
+    || echo "  worker 未挂 ${PROD_MODELS_MP}(需 rebuild-worker)"
   echo "--- GPU:"
   nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader 2>/dev/null | sed 's/^/  GPU /' || echo "  nvidia-smi 不可用"
   echo "--- 引擎实例容器:"
@@ -798,11 +980,11 @@ cmd_status() {
   finish
 }
 
-cmd_prepare_transfer() {
+cmd_prepare_transfer() { # 步数须与下面 step 调用数一致,否则进度显示成 [step 6/5]
   parse_flags "$@"
   # 7 -> 4:indextts2/bernini 已下线,且"统一 pull"那步并入各镜像的 sync
-  # 4 -> 5:新增 breeze-tts
-  STEP_TOTAL=5
+  # 4 -> 5:新增 breeze-tts;5 -> 6:新增 vllm-backport;6 -> 7:新增 yue2
+  STEP_TOTAL=7
   # tar 必须落在共享 NFS 上;未挂载时 mkdir -p 会静默建本地目录,
   # 大 tar(引擎/indextts 各 ~10G)写进根盘且其他节点拿不到
   mountpoint -q /nfs-models || die "/nfs-models 未挂载,拒绝把 tar 写到本地盘" \
@@ -857,6 +1039,27 @@ cmd_prepare_transfer() {
   sync_image_to_nfs "$BREEZE_IMAGE" "$BREEZE_TAR" \
     || echo "    ⚠️ (soft) breeze-tts 同步失败,跳过其 tar(不影响其余镜像)"
 
+  step "同步 yue2 tar(~8.8G;soft:拉不到只告警,不阻塞其余必需 tar)"
+  # tar 是 docker save 的整镜像,含与 lightx2v/acestep 相同的 33 层基座,独有部分只有 ~146MB。
+  # 仍然出 tar:它是 --offline 节点唯一的来源;在线节点 install/upgrade-engine 都会先在线拉。
+  sync_image_to_nfs "$YUE2_IMAGE" "$YUE2_TAR" \
+    || echo "    ⚠️ (soft) yue2 同步失败,跳过其 tar(不影响其余镜像)"
+
+  step "同步 vllm-backport tar(~11G;soft:仅在显式指定 tag 时出包)"
+  # 与其他引擎不同,它默认**不出 tar**:tar 名按 tag 派生(见变量定义处),不显式给
+  # VLLM_BACKPORT_IMAGE 就会拿 latest 去出一个 vllm-backport-arm64-sm80-latest.tar,
+  # 而现网模型配置钉的是时间戳 tag,那个 tar 谁也用不上,白占 11G NFS。
+  # 要分发时:
+  #   VLLM_BACKPORT_IMAGE=.../vllm-backport:arm64-sm80-20260915-0047-85d0e70c \
+  #     ./lx2v-node.sh prepare-transfer
+  if [ "${VLLM_BACKPORT_IMAGE##*:}" = "arm64-sm80-latest" ]; then
+    echo "    跳过:未显式指定 tag(默认 latest 出的 tar 与现网钉的时间戳 tag 不匹配)"
+    echo "    需要时: VLLM_BACKPORT_IMAGE=<完整镜像:tag> $0 prepare-transfer"
+  else
+    sync_image_to_nfs "$VLLM_BACKPORT_IMAGE" "$VLLM_BACKPORT_TAR" \
+      || echo "    ⚠️ (soft) vllm-backport 同步失败,跳过其 tar(不影响其余镜像)"
+  fi
+
   # 放在所有 tar 同步之后:这一步只修本机 tag,与出 tar 无关。
   # 早先它跟在 gpustack sync 后面,ACR 一抖就在 step 1/4 整段中止,后三个 tar 全没出。
   if [ "$(uname -m)" = "x86_64" ] && docker image inspect "$GPUSTACK_IMAGE" >/dev/null 2>&1; then
@@ -897,6 +1100,8 @@ case "$CMD" in
   install)          cmd_install "$@" ;;
   setup-base)       cmd_setup_base "$@" ;;
   upgrade-gpustack) cmd_upgrade_gpustack "$@" ;;
+  mount-nfs)        cmd_mount_nfs "$@" ;;
+  rebuild-worker)   cmd_rebuild_worker "$@" ;;
   upgrade-engine)   cmd_upgrade_engine "$@" ;;
   clean)            cmd_clean "$@" ;;
   status)           cmd_status "$@" ;;

@@ -22,6 +22,7 @@ bash /root/lx2v-node.sh upgrade-engine                       # lightx2v(默认)
 bash /root/lx2v-node.sh upgrade-engine --engine acestep      # ACE-Step 文生音乐引擎
 bash /root/lx2v-node.sh upgrade-engine --engine vllm-omni    # vLLM-Omni 全模型语音/音频引擎
 bash /root/lx2v-node.sh upgrade-engine --engine breeze       # Breeze TTS 2 音色设计引擎(接替 MOSS-VoiceGen)
+bash /root/lx2v-node.sh upgrade-engine --engine yue2         # YuE2 文生音乐/翻唱引擎(在线只拉 ~146MB 增量)
 # 下面两个引擎已于 2026-08-25 下线(不再默认预载/分发),分支保留,需要时才手动指定:
 bash /root/lx2v-node.sh upgrade-engine --engine indextts     # IndexTTS-2(能力已由 vLLM-Omni 承接)
 bash /root/lx2v-node.sh upgrade-engine --engine bernini      # Bernini(仍停留在 cu128 base)
@@ -30,13 +31,14 @@ bash /root/lx2v-node.sh upgrade-engine --engine bernini      # Bernini(仍停留
 bash /root/lx2v-node.sh status
 bash /root/lx2v-node.sh clean [--purge-data] [--kill-gpu-procs]
 
-# (238 上)出了新包之后,更新 NFS 上的 tar(五镜像)和脚本副本:
+# (238 上)出了新包之后,更新 NFS 上的 tar(六镜像)和脚本副本:
 bash /root/lx2v-node.sh prepare-transfer
 ```
 
 > **集群批量**:238 上用 `lx2v-fleet.sh` 对所有 worker 并发跑 node 脚本子命令(自动排除 238 自身):
 > `bash /root/lx2v-fleet.sh -j 5 upgrade-gpustack` / `bash /root/lx2v-fleet.sh -j 3 upgrade-engine --engine vllm-omni --offline` / `bash /root/lx2v-fleet.sh status`。日志在 238 `/tmp/lx2v-fleet/<ip>.log`。
 > **定并发看 tar 体积,不是镜像体积**:tar 存的是压缩层,约为镜像的三分之一(breeze 镜像 25.9G → tar 8.9G,与 lightx2v 的 8.1G 同档),所以 breeze 用常规的 `-j 3` 即可。
+> **在线升级看的是增量层**:yue2 与 lightx2v / acestep 共用 cu130 基座(33 层逐层相同),装过 lightx2v 的节点在线拉 yue2 只下 ~146MB(实测 10s),默认并发即可;只有 `--offline` 读整份 tar(8.8G,含一份基座)才按大 tar 算。
 > ☠️ **走 ACR 在线拉时并发别超 5**,超了会 `too many requests` → 脚本静默回退旧 NFS tar,
 > 而 `FAIL=0` 照样全绿(坑 #29)。所以升级**必须**先 `prepare-transfer`、事后按 label 逐台点名(§2.5 ⑦)。
 >
@@ -48,7 +50,7 @@ bash /root/lx2v-node.sh prepare-transfer
 - 全程日志:`/var/log/lx2v-node-<日期>.log`;每步打印 `[step i/N] 时间` 和耗时,长任务(load/pull/save)有进度输出——**长时间无输出再怀疑卡住,先看当前 step 是什么**(toolkit 在线下载 5-8 分钟、引擎 tar load 4-5 分钟都是正常的);
 - 任何失败都会打印**原因分析和操作建议**,先照建议做,再看日志。
 
-**当前镜像清单**(**五镜像**,tag 均须与 gpustack 内置后端注册表 `schemas/inference_backend.py` 的 image_name 一致,勿改名):
+**当前镜像清单**(**六镜像**,tag 均须与 gpustack 内置后端注册表 `schemas/inference_backend.py` 的 image_name 一致,勿改名):
 
 | 镜像 | tag | 用途 |
 |---|---|---|
@@ -57,6 +59,7 @@ bash /root/lx2v-node.sh prepare-transfer
 | acestep | `acestep:arm64-a100-latest` | ACE-Step 文生音乐引擎 |
 | vllm-omni | `vllm-omni:arm64-a100-latest` | vLLM-Omni 全模型语音/音频引擎(TTS/AudioX/SoulX/MOSS 等) |
 | breeze-tts | `breeze-tts:arm64-a100-latest` | Breeze TTS 2 音色设计引擎(2026-09-05 接入,接替 MOSS-VoiceGen)。镜像 25.9G / tar 8.9G,批量分发同 lightx2v 用 `-j 3` |
+| yue2 | `yue2:arm64-a100-latest` | YuE2 文生音乐 / 翻唱 / 改谱重渲染引擎(2026-09-23 接入,后端 YuE2,模型路径 `/nfs-models/YuE2`)。镜像 23.9G 但与 lightx2v/acestep 共用基座,独有仅 ~146MB;tar 8.8G(含一份基座)。install / upgrade-engine 在线优先,`--offline` 才读 tar |
 
 > **2026-08-25 下线两个镜像**:`indextts2`(能力由 vLLM-Omni 承接,indextts-2 模型现跑在 vLLMOmni 后端上)、
 > `bernini`(停留在 cu128 base,其 `requires-python >=3.11,<3.12` 与 cu130 base 的 3.12 冲突)。
@@ -155,7 +158,7 @@ token 是**集群级注册令牌,所有 worker 复用同一个**;忘了就在任
 - `--clean-residue`:残留扫描发现孤儿引擎容器时一并硬杀;
 - `--force`:检测到**同 token** 的现有 worker 时才需要(见 1.5)。
 
-### 1.4 十一个步骤与耗时参照(2026-08-25 下线 indextts2/bernini 由 12 减为 10;2026-09-05 加 breeze-tts 回到 11)
+### 1.4 十二个步骤与耗时参照(2026-08-25 下线 indextts2/bernini 由 12 减为 10;2026-09-05 加 breeze-tts 回到 11;2026-09-23 加 yue2 到 12)
 
 | step | 内容 | 参考耗时 | 说明 |
 |---|---|---|---|
@@ -169,12 +172,14 @@ token 是**集群级注册令牌,所有 worker 复用同一个**;忘了就在任
 | 8 | acestep 引擎镜像 | ~2min | ~8.7G;文生音乐整卡单实例,全节点预载 |
 | 9 | vllm-omni 引擎镜像(**soft**) | ~3min | ~12.7G;有 tar 则装、缺则告警不阻塞 install(全模型语音/音频引擎) |
 | 10 | breeze-tts 引擎镜像(**soft**) | ~2min | tar ~8.9G;有 tar 则装、缺则告警不阻塞(音色设计引擎) |
-| 11 | 起 worker + 注册/healthz 验证 | ~2min | 旧容器(如有)到这一步才移除,前面失败节点仍有原 worker |
+| 11 | yue2 引擎镜像(**soft**,**在线优先**) | 在线 ~10s / 离线 ~2min | 与其他引擎相反:先在线拉(与 step 7 的 lightx2v 共用基座,只下 ~146MB),拉不到或 `--offline` 才 load tar ~8.8G;都没有则告警不阻塞(文生音乐/翻唱引擎) |
+| 12 | 起 worker + 注册/healthz 验证 | ~2min | 旧容器(如有)到这一步才移除,前面失败节点仍有原 worker |
 
 > 上表是**单台**参照。历史实测:2026-07-06 两台全新机各约 16 分钟(当时六镜像 52G);
 > 2026-08-20 十台 `-j 10` 并发同为约 15 分钟;**2026-09-01 五台 `-j 5` 只要 6-7 分钟**
 > ——四镜像后每台只 load 约 32G,且那批机器出厂已带 docker/toolkit(step 3/5 基本跳过)。
-> **2026-09-05 起加了 breeze-tts(tar 8.9G),每台 load 量约 41G**,单台耗时略增,
+> **2026-09-05 起加了 breeze-tts(tar 8.9G),每台 load 量约 41G**,单台耗时略增;
+> **2026-09-23 加 yue2 后,`--offline` 每台约 50G**(多一个 8.8G tar),在线装只多 ~146MB。
 > 并发仍按常规 `-j 3`(§0 说明了为何要看 tar 而不是镜像体积)。
 > NFS 读带宽在 10 台并发内够用,15 台以上仍按 60 卡那次经验降到 `-j 3`。
 > 若机器出厂镜像已带 docker + toolkit,step 3/5 会被跳过(`setup-base` 可短到 47 秒),这是正常的,不是没装上 —— 用 `docker info | grep nvidia` 复核。
@@ -253,7 +258,7 @@ for ip in $NEW; do printf '%-14s ' "$ip"; tail -n1 /tmp/lx2v-bootstrap/$ip.log; 
 bash /root/lx2v-fleet.sh -f /root/lx2v-new.txt status     # 期望 OK=N,且每台 /nfs-models + /nfs-output OK
 ```
 
-**⑥ 入集群(fleet 批量 install)**——这是最重的一步,每台从 NFS load 五个 tar 约 41G(2026-09-05 加入 breeze-tts 前是四个约 32G)
+**⑥ 入集群(fleet 批量 install)**——这是最重的一步,每台从 NFS load 六个 tar 约 50G(2026-09-05 加入 breeze-tts 前是四个约 32G,2026-09-23 加入 yue2 前是五个约 41G)
 
 ```bash
 read -rsp 'GPUSTACK_TOKEN: ' TOKEN; echo
@@ -445,7 +450,7 @@ for n in $(seq 41 50); do printf 'gpu%-3s ' $n; ssh -n -o BatchMode=yes -o Stric
 |---|---|
 | `http://10.0.0.238` | `SERVER_URL` |
 | `crpi-…cn-shanghai.personal.cr.aliyuncs.com/reputationly` | `REGISTRY` |
-| 五个在用镜像 tag(§0 清单) | `GPUSTACK_IMAGE` / `ENGINE_IMAGE` / `ACESTEP_IMAGE` / `VLLM_OMNI_IMAGE` / `BREEZE_IMAGE`(已下线的 `INDEXTTS_IMAGE` / `BERNINI_IMAGE` 变量仍在,只供 `upgrade-engine` 手动指定) |
+| 六个在用镜像 tag(§0 清单) | `GPUSTACK_IMAGE` / `ENGINE_IMAGE` / `ACESTEP_IMAGE` / `VLLM_OMNI_IMAGE` / `BREEZE_IMAGE` / `YUE2_IMAGE`(已下线的 `INDEXTTS_IMAGE` / `BERNINI_IMAGE` 变量仍在,只供 `upgrade-engine` 手动指定) |
 | `100.125.40.2` + `/share-LLM`、`/share-output` | `NFS_SERVER` / `NFS_MODELS_EXPORT` / `NFS_OUTPUT_EXPORT` |
 | `/nfs-models/_transfer/*.tar`、`nvidia-repo/` | `TRANSFER_DIR` + 各 `*_TAR`、`NVIDIA_REPO_DIR` |
 | `gpustack-worker`、`10150` | `WORKER_NAME` / `WORKER_PORT` |
@@ -500,7 +505,7 @@ bash /root/lx2v-node.sh upgrade-gpustack --offline  # 或从 NFS tar load(需先
 
 ### 2.2 升级引擎镜像(upgrade-engine)
 
-**何时用**:某个引擎仓出了新包之后(LightX2V profiles/launcher、index-tts、acestep、vllm-omni、breeze-tts)。
+**何时用**:某个引擎仓出了新包之后(LightX2V profiles/launcher、index-tts、acestep、vllm-omni、breeze-tts、yue2)。
 
 ```bash
 bash /root/lx2v-node.sh upgrade-engine                       # lightx2v(默认),打印 旧ID -> 新ID
@@ -508,6 +513,7 @@ bash /root/lx2v-node.sh upgrade-engine --engine indextts     # IndexTTS-2 语音
 bash /root/lx2v-node.sh upgrade-engine --engine acestep      # ACE-Step 文生音乐引擎
 bash /root/lx2v-node.sh upgrade-engine --engine vllm-omni    # vLLM-Omni 全模型语音/音频引擎
 bash /root/lx2v-node.sh upgrade-engine --engine breeze       # Breeze TTS 2 音色设计引擎
+bash /root/lx2v-node.sh upgrade-engine --engine yue2         # YuE2 文生音乐/翻唱引擎
 ```
 
 各引擎镜像 tag 必须与 gpustack 内置后端注册表(`schemas/inference_backend.py` 的 image_name)完全一致——worker 按名匹配本地镜像。全 worker 批量:`bash /root/lx2v-fleet.sh -j 3 upgrade-engine --engine <名> --offline`(大 tar 降并发。**看 tar 体积不是镜像体积**——tar 存压缩层约为镜像三分之一,breeze 镜像 25.9G 但 tar 只有 8.9G,用常规 `-j 3`)。
@@ -521,7 +527,7 @@ bash /root/lx2v-node.sh upgrade-engine --engine breeze       # Breeze TTS 2 音�
 bash /root/lx2v-node.sh prepare-transfer
 ```
 
-做四件事:拉**五镜像**(gpustack / lightx2v / acestep / vllm-omni / breeze-tts)arm64 变体 → 按 digest 变化 save 到 NFS 五个 tar(未变的跳过;带写入进度,`.tmp`+`mv` 防半截)→ **x86 机器上自动把本地 gpustack tag 拉回 amd64**(否则 238 之后重建 server 容器会 exec format error——坑 §5.5)→ 把脚本自身同步到 `_transfer/`。vllm-omni 与 breeze-tts 都是 soft:拉不到只告警、不阻塞其余 tar。已下线的 indextts2/bernini 不再同步,NFS 上那两个旧 tar 是历史遗留。
+做四件事:拉**六镜像**(gpustack / lightx2v / acestep / vllm-omni / breeze-tts / yue2)arm64 变体 → 按 digest 变化 save 到 NFS 六个 tar(未变的跳过;带写入进度,`.tmp`+`mv` 防半截)→ **x86 机器上自动把本地 gpustack tag 拉回 amd64**(否则 238 之后重建 server 容器会 exec format error——坑 §5.5)→ 把脚本自身同步到 `_transfer/`。breeze-tts 与 yue2 都是 soft:拉不到只告警、不阻塞其余 tar(yue2 的 tar 只给 `--offline` 节点用,在线节点直接拉增量)。已下线的 indextts2/bernini 不再同步,NFS 上那两个旧 tar 是历史遗留。
 
 ### 2.4 一次完整现网升级(以 2026-07-20 gpustack + vllm-omni 为例)
 
@@ -544,7 +550,7 @@ curl -s -o /dev/null -w '%{http_code}\n' http://localhost/   # 200
 bash /root/lx2v-fleet.sh upgrade-gpustack --offline
 
 # ④ 全 worker 换 vllm-omni 引擎(fleet;lightx2v/indextts/acestep 没变不用动)
-bash /root/lx2v-fleet.sh -j 3 upgrade-engine --engine vllm-omni --offline
+bash /root/lx2v-fleet.sh -j 10 upgrade-engine --engine vllm-omni --offline
 ```
 
 **⑤ UI 重建实例**:vLLMOmni 系(audiox/soulx/indextts-2/qwen3-tts/moss-*)逐个删实例重建到新引擎镜像;ACE-Step(ACEStep 后端,镜像没变)不用动。**server 必须先于 worker**(版本校验软 + DB/API 方向 server ≥ worker)。
@@ -576,7 +582,7 @@ digest,所以浮动 tag **不会指错、只会指旧**。防「指旧」靠 ③
 ```bash
 # ① 打回滚锚 —— 必须是**第一步**!
 #    lx2v-dev 是浮动 tag,任何 pull 之后旧镜像就没有名字了、回滚就无从谈起。
-#    注意 prepare-transfer 自己就会 pull(它拉 arm64 五镜像,x86 上还会再拉一次
+#    注意 prepare-transfer 自己就会 pull(它拉 arm64 六镜像,x86 上还会再拉一次
 #    amd64 把本地 tag 恢复回来,见 lx2v-node.sh 的 cmd_prepare_transfer),
 #    所以这一步必须排在 prepare-transfer **前面**,不是仅仅排在 ③ 的 pull 前面。
 docker tag crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:lx2v-dev \
@@ -585,7 +591,7 @@ docker images gpustack-rollback      # 确认锚已建再往下走
 #    ⚠️ 锚名带日期,**同一天升第二次会把锚覆盖到刚升上去的那版**,
 #    等于把「升级前」的退路弄丢。同日重跑请改个后缀,例如 pre-$(date +%Y%m%d)-2。
 
-# ② 刷 NFS tar(拉五镜像,digest 没变的自动跳过)
+# ② 刷 NFS tar(拉六镜像,digest 没变的自动跳过)
 bash /root/lx2v-node.sh prepare-transfer
 
 # ③ 升 server —— 必须先于 worker(版本校验软 + DB/API 方向 server ≥ worker)
@@ -631,7 +637,7 @@ bash /root/lx2v-fleet.sh -j 5 upgrade-engine --engine lightx2v
 bash /root/lx2v-fleet.sh -j 5 upgrade-engine --engine vllm-omni
 # 可选:acestep;indextts / bernini 已下线,只在明确需要时手动指定
 
-# ⑥ 巡检:worker 状态、五镜像 ID、NFS 挂载、每卡显存、实例容器
+# ⑥ 巡检:worker 状态、六镜像 ID、NFS 挂载、每卡显存、实例容器
 #    (status 不拉镜像,并发可以放开)
 bash /root/lx2v-fleet.sh -j 10 status
 
@@ -698,8 +704,8 @@ docker exec gpustack-server su postgres -c \
 > ⚠️ 「跑过 ②」不等于「tar 是新的」:soft 同步的镜像失败时只打一行 `⚠️ (soft)` 就过去了。
 > **vllm-omni 已于 2026-09-07 提为必需**(它跑着 sensenova-u1.5 / qwen-image-edit /
 > hunyuan-image-3,而且多图能力登记在引擎的 `model_metadata.py` 里,装旧版会让多图编辑
-> 在 HTTP 边界被按「最多 1 张」拒掉),失败会在 ② 末尾非 0 退出。breeze-tts 仍是 soft ——
-> 它的 `⚠️ (soft)` 要自己看见,别只看 ② 有没有报错。
+> 在 HTTP 边界被按「最多 1 张」拒掉),失败会在 ② 末尾非 0 退出。breeze-tts 与 yue2 仍是 soft ——
+> 它们的 `⚠️ (soft)` 要自己看见,别只看 ② 有没有报错。
 >
 > **⚠️ NFS tar 是旧的 = 静默装旧版,而且不加 `--offline` 一样会中招。**
 > `upgrade-*` 的默认路径是先 pull、失败才回退 tar。以前这里写「不加就不会踩这个坑」,
@@ -786,7 +792,7 @@ docker run -d --name gpustack-server --restart unless-stopped -p 80:80 \
 ```bash
 bash /root/lx2v-node.sh status
 ```
-一屏看:worker 容器状态/healthz、镜像 ID(五镜像 gpustack/lightx2v/acestep/vllm-omni/breeze-tts,与 §0 清单比对;老节点上可能还列出已下线的 indextts2/bernini)、NFS 挂载、每卡显存、引擎实例容器(按 runtime label 精确识别,含 -init/-unhealthy-restart)。
+一屏看:worker 容器状态/healthz、镜像 ID(六镜像 gpustack/lightx2v/acestep/vllm-omni/breeze-tts/yue2,与 §0 清单比对;老节点上可能还列出已下线的 indextts2/bernini)、NFS 挂载、每卡显存、引擎实例容器(按 runtime label 精确识别,含 -init/-unhealthy-restart)。
 
 ```bash
 bash /root/lx2v-node.sh clean                     # 删 worker + 硬杀全部引擎实例容器(kill+sleep+rm -f)
