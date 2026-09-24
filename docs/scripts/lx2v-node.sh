@@ -61,9 +61,10 @@ BERNINI_IMAGE="${REGISTRY}/bernini:arm64-a100-latest"
 # 纯文字描述造声线,无参考音频。已在 GPUStack 注册为内置后端 BreezeTTS,会被调度。
 BREEZE_IMAGE="${REGISTRY}/breeze-tts:arm64-a100-latest"
 # YuE2 文生音乐 / 翻唱引擎(独立 CI 出包,reputationly/YuE)。已在 GPUStack 注册为内置后端
-# YuE2,会被调度。叠在 lightx2v 的 cu130 基座上 —— 与 lightx2v / acestep 镜像的 33 层基座
-# 逐层相同,自身只多 ~146MB。所以装过 lightx2v 的节点在线拉它只下 app 层(实测 10s),
-# 反而是 NFS tar(docker save 整镜像,~8.8G)要把基座再读一遍 —— 见 install 里它的预载方式。
+# YuE2,会被调度。2026-09-24 起(YuE2-Turbo,AR 跑 vLLM)叠在 vllm-omni 基座上 —— 与 vllm-omni
+# 镜像的 52 层逐层相同,自身只多 4 层 ~160MB。所以装过 vllm-omni 的节点在线拉它只下 app 层
+# (gpu41 实测 11s),反而是 NFS tar(docker save 整镜像,≈vllm-omni tar + 160MB)要把基座
+# 再读一遍 —— 见 install 里它的预载方式。
 YUE2_IMAGE="${REGISTRY}/yue2:arm64-a100-latest"
 # vLLM-backport:DeepSeek-V4-Flash(含 1M 上下文版)跑的引擎,sm80 专用构建。
 #
@@ -780,8 +781,9 @@ cmd_install() {
 
   step "镜像:yue2 引擎(soft 预载;在线优先、NFS tar 兜底,与其他引擎相反)"
   # 已注册后端 YuE2,会被调度落任意空闲卡,故全节点预载。顺序反过来的原因:它与上面刚装的
-  # lightx2v 共用 33 层基座,在线拉只下 ~146MB app 层(gpu44 实测 10s);tar 优先则要从
-  # NFS 整读 ~8.8G,fleet 并发时还会互抢 NFS。只有 --offline 或拉不到时才读 tar。
+  # vllm-omni(step 9)共用 52 层基座,在线拉只下 ~160MB app 层(gpu41 实测 11s);tar 优先
+  # 则要从 NFS 整读一份基座(~12.9G),fleet 并发时还会互抢 NFS。vllm-omni 若没装上(soft),
+  # 在线拉会下整份基座,仍比读 tar 不差。只有 --offline 或拉不到时才读 tar。
   # 放在 if 条件里:拉取失败不触发 set -e / ERR trap,保持 soft。
   if [ "$OFFLINE" -eq 0 ] && docker_pull_retry "$YUE2_IMAGE"; then
     echo "    当前镜像: $(docker images --format '{{.ID}}  {{.Repository}}:{{.Tag}}' | grep -F "${YUE2_IMAGE#*/}" | head -1)"
@@ -1039,8 +1041,8 @@ cmd_prepare_transfer() { # 步数须与下面 step 调用数一致,否则进度�
   sync_image_to_nfs "$BREEZE_IMAGE" "$BREEZE_TAR" \
     || echo "    ⚠️ (soft) breeze-tts 同步失败,跳过其 tar(不影响其余镜像)"
 
-  step "同步 yue2 tar(~8.8G;soft:拉不到只告警,不阻塞其余必需 tar)"
-  # tar 是 docker save 的整镜像,含与 lightx2v/acestep 相同的 33 层基座,独有部分只有 ~146MB。
+  step "同步 yue2 tar(~12.9G;soft:拉不到只告警,不阻塞其余必需 tar)"
+  # tar 是 docker save 的整镜像,含与 vllm-omni 相同的 52 层基座,独有部分只有 ~160MB。
   # 仍然出 tar:它是 --offline 节点唯一的来源;在线节点 install/upgrade-engine 都会先在线拉。
   sync_image_to_nfs "$YUE2_IMAGE" "$YUE2_TAR" \
     || echo "    ⚠️ (soft) yue2 同步失败,跳过其 tar(不影响其余镜像)"
