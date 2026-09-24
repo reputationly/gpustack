@@ -782,7 +782,7 @@ cmd_install() {
   step "镜像:yue2 引擎(soft 预载;在线优先、NFS tar 兜底,与其他引擎相反)"
   # 已注册后端 YuE2,会被调度落任意空闲卡,故全节点预载。顺序反过来的原因:它与上面刚装的
   # vllm-omni(step 9)共用 52 层基座,在线拉只下 ~160MB app 层(gpu41 实测 11s);tar 优先
-  # 则要从 NFS 整读一份基座(~12.9G),fleet 并发时还会互抢 NFS。vllm-omni 若没装上(soft),
+  # 则要从 NFS 整读一份基座(~11.5G),fleet 并发时还会互抢 NFS。vllm-omni 若没装上(soft),
   # 在线拉会下整份基座,仍比读 tar 不差。只有 --offline 或拉不到时才读 tar。
   # 放在 if 条件里:拉取失败不触发 set -e / ERR trap,保持 soft。
   if [ "$OFFLINE" -eq 0 ] && docker_pull_retry "$YUE2_IMAGE"; then
@@ -1041,7 +1041,7 @@ cmd_prepare_transfer() { # 步数须与下面 step 调用数一致,否则进度�
   sync_image_to_nfs "$BREEZE_IMAGE" "$BREEZE_TAR" \
     || echo "    ⚠️ (soft) breeze-tts 同步失败,跳过其 tar(不影响其余镜像)"
 
-  step "同步 yue2 tar(~12.9G;soft:拉不到只告警,不阻塞其余必需 tar)"
+  step "同步 yue2 tar(~11.5G;soft:拉不到只告警,不阻塞其余必需 tar)"
   # tar 是 docker save 的整镜像,含与 vllm-omni 相同的 52 层基座,独有部分只有 ~160MB。
   # 仍然出 tar:它是 --offline 节点唯一的来源;在线节点 install/upgrade-engine 都会先在线拉。
   sync_image_to_nfs "$YUE2_IMAGE" "$YUE2_TAR" \

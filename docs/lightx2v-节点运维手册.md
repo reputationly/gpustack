@@ -38,7 +38,7 @@ bash /root/lx2v-node.sh prepare-transfer
 > **集群批量**:238 上用 `lx2v-fleet.sh` 对所有 worker 并发跑 node 脚本子命令(自动排除 238 自身):
 > `bash /root/lx2v-fleet.sh -j 5 upgrade-gpustack` / `bash /root/lx2v-fleet.sh -j 3 upgrade-engine --engine vllm-omni --offline` / `bash /root/lx2v-fleet.sh status`。日志在 238 `/tmp/lx2v-fleet/<ip>.log`。
 > **定并发看 tar 体积,不是镜像体积**:tar 存的是压缩层,约为镜像的三分之一(breeze 镜像 25.9G → tar 8.9G,与 lightx2v 的 8.1G 同档),所以 breeze 用常规的 `-j 3` 即可。
-> **在线升级看的是增量层**:yue2 自 2026-09-24(YuE2-Turbo)起与 vllm-omni 共用基座(52 层逐层相同),装过 vllm-omni 的节点在线拉 yue2 只下 ~160MB(实测 11s),默认并发即可;只有 `--offline` 读整份 tar(~12.9G,含一份基座)才按大 tar 算。
+> **在线升级看的是增量层**:yue2 自 2026-09-24(YuE2-Turbo)起与 vllm-omni 共用基座(52 层逐层相同),装过 vllm-omni 的节点在线拉 yue2 只下 ~160MB(实测 11s),默认并发即可;只有 `--offline` 读整份 tar(~11.5G,含一份基座)才按大 tar 算。
 > ☠️ **走 ACR 在线拉时并发别超 5**,超了会 `too many requests` → 脚本静默回退旧 NFS tar,
 > 而 `FAIL=0` 照样全绿(坑 #29)。所以升级**必须**先 `prepare-transfer`、事后按 label 逐台点名(§2.5 ⑦)。
 >
@@ -59,7 +59,7 @@ bash /root/lx2v-node.sh prepare-transfer
 | acestep | `acestep:arm64-a100-latest` | ACE-Step 文生音乐引擎 |
 | vllm-omni | `vllm-omni:arm64-a100-latest` | vLLM-Omni 全模型语音/音频引擎(TTS/AudioX/SoulX/MOSS 等) |
 | breeze-tts | `breeze-tts:arm64-a100-latest` | Breeze TTS 2 音色设计引擎(2026-09-05 接入,接替 MOSS-VoiceGen)。镜像 25.9G / tar 8.9G,批量分发同 lightx2v 用 `-j 3` |
-| yue2 | `yue2:arm64-a100-latest` | YuE2 文生音乐 / 翻唱 / 改谱重渲染引擎(2026-09-23 接入,后端 YuE2,模型路径 `/nfs-models/YuE2`)。2026-09-24 起为 YuE2-Turbo(AR 跑 vLLM,4 首并发),叠在 vllm-omni 基座上,独有仅 ~160MB;tar ~12.9G(含一份基座)。实例重建首启约 4 分钟(编译缓存落 `/nfs-models/YuE2/vllm-cache`,模型目录需可写挂载,之后约 137s)。install / upgrade-engine 在线优先,`--offline` 才读 tar |
+| yue2 | `yue2:arm64-a100-latest` | YuE2 文生音乐 / 翻唱 / 改谱重渲染引擎(2026-09-23 接入,后端 YuE2,模型路径 `/nfs-models/YuE2`)。2026-09-24 起为 YuE2-Turbo(AR 跑 vLLM,4 首并发),叠在 vllm-omni 基座上,独有仅 ~160MB;tar ~11.5G(含一份基座)。实例重建首启约 4 分钟(编译缓存落 `/nfs-models/YuE2/vllm-cache`,模型目录需可写挂载,之后约 137s)。install / upgrade-engine 在线优先,`--offline` 才读 tar |
 
 > **2026-08-25 下线两个镜像**:`indextts2`(能力由 vLLM-Omni 承接,indextts-2 模型现跑在 vLLMOmni 后端上)、
 > `bernini`(停留在 cu128 base,其 `requires-python >=3.11,<3.12` 与 cu130 base 的 3.12 冲突)。
@@ -172,14 +172,14 @@ token 是**集群级注册令牌,所有 worker 复用同一个**;忘了就在任
 | 8 | acestep 引擎镜像 | ~2min | ~8.7G;文生音乐整卡单实例,全节点预载 |
 | 9 | vllm-omni 引擎镜像(**soft**) | ~3min | ~12.7G;有 tar 则装、缺则告警不阻塞 install(全模型语音/音频引擎) |
 | 10 | breeze-tts 引擎镜像(**soft**) | ~2min | tar ~8.9G;有 tar 则装、缺则告警不阻塞(音色设计引擎) |
-| 11 | yue2 引擎镜像(**soft**,**在线优先**) | 在线 ~10s / 离线 ~2min | 与其他引擎相反:先在线拉(与 step 9 的 vllm-omni 共用基座,只下 ~160MB),拉不到或 `--offline` 才 load tar ~12.9G;都没有则告警不阻塞(文生音乐/翻唱引擎) |
+| 11 | yue2 引擎镜像(**soft**,**在线优先**) | 在线 ~10s / 离线 ~2min | 与其他引擎相反:先在线拉(与 step 9 的 vllm-omni 共用基座,只下 ~160MB),拉不到或 `--offline` 才 load tar ~11.5G;都没有则告警不阻塞(文生音乐/翻唱引擎) |
 | 12 | 起 worker + 注册/healthz 验证 | ~2min | 旧容器(如有)到这一步才移除,前面失败节点仍有原 worker |
 
 > 上表是**单台**参照。历史实测:2026-07-06 两台全新机各约 16 分钟(当时六镜像 52G);
 > 2026-08-20 十台 `-j 10` 并发同为约 15 分钟;**2026-09-01 五台 `-j 5` 只要 6-7 分钟**
 > ——四镜像后每台只 load 约 32G,且那批机器出厂已带 docker/toolkit(step 3/5 基本跳过)。
 > **2026-09-05 起加了 breeze-tts(tar 8.9G),每台 load 量约 41G**,单台耗时略增;
-> **2026-09-23 加 yue2 后,`--offline` 每台约 54G**(多一个 ~12.9G tar,09-24 换 Turbo 后从 8.8G 变大),在线装只多 ~160MB。
+> **2026-09-23 加 yue2 后,`--offline` 每台约 53G**(多一个 ~11.5G tar,09-24 换 Turbo 后从 8.1G 变大),在线装只多 ~160MB。
 > 并发仍按常规 `-j 3`(§0 说明了为何要看 tar 而不是镜像体积)。
 > NFS 读带宽在 10 台并发内够用,15 台以上仍按 60 卡那次经验降到 `-j 3`。
 > 若机器出厂镜像已带 docker + toolkit,step 3/5 会被跳过(`setup-base` 可短到 47 秒),这是正常的,不是没装上 —— 用 `docker info | grep nvidia` 复核。
