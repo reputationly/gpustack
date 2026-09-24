@@ -12,8 +12,8 @@
 #   bash lx2v-fleet.sh upgrade-engine --engine indextts --offline
 #   bash lx2v-fleet.sh -j 3 upgrade-engine --engine bernini --offline    # 批量分发 bernini 引擎镜像
 #   bash lx2v-fleet.sh -j 3 upgrade-engine --engine breeze --offline     # Breeze TTS 2(tar 8.9G,同 lightx2v 档)
-#   bash lx2v-fleet.sh upgrade-engine --engine yue2                  # YuE2(在线只拉 ~146MB app 层,默认并发即可)
-#   bash lx2v-fleet.sh -j 3 upgrade-engine --engine yue2 --offline   # 离线走 tar(8.8G,含整份基座,同 lightx2v 档)
+#   bash lx2v-fleet.sh upgrade-engine --engine yue2                  # YuE2(在线只拉 ~160MB app 层,默认并发即可)
+#   bash lx2v-fleet.sh -j 3 upgrade-engine --engine yue2 --offline   # 离线走 tar(~11.5G,含整份 vllm-omni 基座)
 #   bash lx2v-fleet.sh status                                    # 全体巡检
 #   bash lx2v-fleet.sh mount-nfs                                 # 全体补挂 NFS(含 prod 模型 /root/Models,只读)
 #   bash lx2v-fleet.sh -j 3 rebuild-worker                       # 不换镜像重建 worker,让实例也能看到新挂载
@@ -24,8 +24,8 @@
 #   -j N        并发数(默认 5)。engine --offline 建议 3,避免多台同时从 NFS load 10G tar 抢带宽。
 #               注意看的是 **tar** 体积不是镜像体积:tar 存压缩层,约为镜像的三分之一
 #               (breeze 镜像 25.9G → tar 8.9G),别拿镜像大小去定并发。
-#               另一面:在线升级只拉**增量层**。yue2 与 lightx2v/acestep 共用基座,装过 lightx2v
-#               的节点在线拉 yue2 只下 ~146MB,不必降并发;只有 --offline 读整份 tar 才按大 tar 算。
+#               另一面:在线升级只拉**增量层**。yue2 与 vllm-omni 共用基座(09-24 换 Turbo 起),装过
+#               vllm-omni 的节点在线拉 yue2 只下 ~160MB,不必降并发;只有 --offline 读整份 tar 才按大 tar 算。
 #   -f FILE     节点清单路径(默认 /root/lx2v-nodes.txt)。
 #   --seq       串行执行。
 #   --          显式结束选项解析,其后全部透传给 lx2v-node.sh。
