@@ -8,13 +8,12 @@ class YuE2ResourceFitSelector(LightX2VResourceFitSelector):
     """
     Whole-GPU, single-card candidate selector for the YuE2 built-in engine.
 
-    YuE2 has no multi-GPU path: its three generative stages run serially on one
-    device (the pipeline even moves the backbone to CPU for the VAE decode), so
-    a replica is always one card. Peak VRAM is flat at 8.0-8.9 GiB on A100
-    whatever the song length (measured from a 1-minute to a 4-minute song), well
-    under the 22 GiB per-process cap the engine sets for itself; the card is
-    still booked whole so that cap can never collide with a co-scheduled
-    instance.
+    YuE2 has no multi-GPU path: one instance runs its stages on one device, so
+    a replica is always one card. The engine (YuE2-Turbo) keeps the backbone,
+    the VAE and a vLLM worker resident and batches up to 4 songs: 22.5 GB idle
+    and a 30.8 GiB peak at 4-way on A100-40G (with the cover transcriber
+    loaded). That leaves no room for a co-scheduled instance, so the card is
+    booked whole.
     """
 
     _ENGINE_LABEL = "YuE2"

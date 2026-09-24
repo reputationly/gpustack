@@ -532,9 +532,10 @@ def get_built_in_backend() -> List[InferenceBackend]:
                     ),
                 }
             ),
-            # The engine only starts listening once the weights are loaded and a
-            # warmup song has gone through end to end (~25 s on A100), so a
-            # health check never passes on an instance that cannot generate.
+            # /ready stays 503 until the weights, the vLLM worker and a warmup
+            # song are through (~2.3 min on A100 once the vLLM compile cache is
+            # in the model dir, ~4 min on the very first start), so a health
+            # check never passes on an instance that cannot generate.
             health_check_path="/ready",
             parameter_format=ParameterFormatEnum.SPACE,
             description="YuE2 lyrics-to-song music engine with an editable ABC score (first-class built-in backend).",

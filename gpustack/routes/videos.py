@@ -507,11 +507,13 @@ _DEFAULT_VIDEO_LATENCY = 90
 _DEFAULT_AUDIO_LATENCY = 20
 # ACE-Step turbo/xl-turbo generate a 30s clip in ~10s warm; longer clips scale
 # but stay well under a minute. 30s is a conservative per-instance fallback.
-# NOT sufficient for YuE2: it writes the whole song the lyrics call for (short
-# lyrics are still arranged to ~2.5 min) at RTF ~0.45 on A100, i.e. 40-105s of
-# wall clock per task (a cover adds 5-30s of transcription). A YuE2 deployment must set a per-model override via
-# lightx2v_model_latency_seconds (~75), otherwise _check_admission's queue
-# estimate is off by 2-3x.
+# Mis-sized for YuE2 in the other direction: its engine (YuE2-Turbo) runs up
+# to 4 songs at once per instance, while _check_admission assumes one task at
+# a time. Saturated, a 4-song wave takes 40-47s on A100 (~11s of card time per
+# song; a lone 40-80s song takes 11-25s). Set lightx2v_model_latency_seconds
+# to ~15 for it and lightx2v_model_queue_wait_seconds to ~240, or the music
+# kind's 90s ceiling starts 429ing at the 7th queued task although the
+# engine's own queue holds 12.
 _DEFAULT_MUSIC_LATENCY = 30
 # Diffusion audio (AudioX ~10-30s for 250 steps / 10s clip; SoulX ~10-50s per
 # song). 30s is a conservative per-instance fallback that absorbs both.
