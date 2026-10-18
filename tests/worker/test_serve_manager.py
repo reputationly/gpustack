@@ -761,6 +761,111 @@ def test_starting_instance_does_not_inherit_follower_error():
     assert "10.0.0.2" in result["state_message"]
 
 
+def test_scheduled_update_skips_restart_while_provisioning():
+    """A port publish during start re-emits SCHEDULED and must not kill the process."""
+    manager, _ = _build_serve_manager(worker_id=1)
+    mi = new_model_instance(
+        9,
+        "deepseek-v4-1-flash",
+        1,
+        worker_id=1,
+        state=ModelInstanceStateEnum.SCHEDULED,
+    )
+    mi.source = SourceEnum.LOCAL_PATH
+    mi.local_path = "/models/deepseek-v4-1-flash"
+    event = Event(type=EventType.UPDATED, data=mi.model_dump(mode="json"))
+
+    with (
+        patch.object(manager, "_is_provisioning", return_value=True),
+        patch.object(manager, "_restart_model_instance") as restart,
+    ):
+        manager._dispatch_model_instance_event(event)
+
+    restart.assert_not_called()
+
+
+def test_scheduled_update_restarts_when_not_provisioning():
+    manager, _ = _build_serve_manager(worker_id=1)
+    mi = new_model_instance(
+        9,
+        "deepseek-v4-1-flash",
+        1,
+        worker_id=1,
+        state=ModelInstanceStateEnum.SCHEDULED,
+    )
+    mi.source = SourceEnum.LOCAL_PATH
+    mi.local_path = "/models/deepseek-v4-1-flash"
+    event = Event(type=EventType.UPDATED, data=mi.model_dump(mode="json"))
+
+    with (
+        patch.object(manager, "_is_provisioning", return_value=False),
+        patch.object(manager, "_restart_model_instance") as restart,
+    ):
+        manager._dispatch_model_instance_event(event)
+
+    restart.assert_called_once()
+
+
+def test_port_publish_does_not_restart_the_start_in_progress():
+    """The port write is still SCHEDULED and is delivered before the child exists.
+
+    Deliver that event from inside the write, the way the watch does, and
+    require a single start rather than a restart loop.
+    """
+    manager, _ = _build_serve_manager(worker_id=1)
+    mi = new_model_instance(
+        9,
+        "deepseek-v4-1-flash",
+        1,
+        worker_id=1,
+        state=ModelInstanceStateEnum.SCHEDULED,
+    )
+    mi.source = SourceEnum.LOCAL_PATH
+    mi.local_path = "/models/deepseek-v4-1-flash"
+    mi.worker_ip = "10.0.0.218"
+    mi.port = 40035
+    mi.ports = [40035, 40031, 40018, 40033, 40003]
+    event = Event(type=EventType.UPDATED, data=mi.model_dump(mode="json"))
+    updates = []
+    port_events = {"n": 0}
+    process = MagicMock()
+    process.pid = 4321
+
+    def update(_instance_id, **kwargs):
+        updates.append(kwargs)
+        if "state" not in kwargs:
+            port_events["n"] += 1
+            if port_events["n"] > 1:
+                raise AssertionError("scheduled port publish restarted the start")
+            manager._dispatch_model_instance_event(event)
+
+    with (
+        patch("gpustack.worker.serve_manager.delete_workload"),
+        patch(
+            "gpustack.worker.serve_manager.get_backend", return_value=BackendEnum.VLLM
+        ),
+        patch(
+            "gpustack.worker.serve_manager.is_built_in_backend",
+            return_value=False,
+        ),
+        patch(
+            "gpustack.worker.serve_manager.multiprocessing.Process",
+            return_value=process,
+        ),
+        patch.object(manager, "_cleanup_old_logs"),
+        patch.object(manager, "_get_model", return_value=MagicMock()),
+        patch.object(manager, "_start_container_log_persistence"),
+        patch.object(manager, "_update_model_instance", side_effect=update),
+    ):
+        manager._dispatch_model_instance_event(event)
+
+    assert port_events["n"] == 1
+    assert process.start.call_count == 1
+    assert updates[-1]["state"] == ModelInstanceStateEnum.INITIALIZING
+    assert updates[-1]["ports"] == [40035, 40031, 40018, 40033, 40003]
+    assert updates[-1]["pid"] == 4321
+
+
 def test_follower_relaunches_when_main_process_group_changes():
     manager, _clientset = _build_serve_manager(worker_id=2)
     mi = _starting_follower(main_pid=99, launch_pid=50)

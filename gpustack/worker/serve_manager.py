@@ -180,6 +180,9 @@ class ServeManager:
         self._clientset_getter = clientset_getter
 
         self._provisioning_processes = {}
+        # Set for the whole _start_model_instance call, including the port
+        # publish that happens before the child process is registered.
+        self._start_guard: Set[int] = set()
         self._log_persistence_threads = {}
         self._log_persistence_stop_events = {}
         self._error_model_instances = {}
@@ -906,11 +909,21 @@ class ServeManager:
                 return
 
             # Restart if scheduled and this is the assigned worker.
+            # Publishing ports during start also emits SCHEDULED, and that
+            # write happens before the child is registered. Restarting there
+            # kills the start and loops.
             if is_main_worker and mi.state == ModelInstanceStateEnum.SCHEDULED:
-                self._restart_model_instance(mi)
-                logger.trace(
-                    f"UPDATED event: restarted scheduled model instance {mi.name}."
-                )
+                if mi.id in self._start_guard or self._is_provisioning(mi):
+                    logger.trace(
+                        f"UPDATED event: {mi.name} is already provisioning, "
+                        "skip scheduled restart."
+                    )
+                else:
+                    self._restart_model_instance(mi)
+                    logger.trace(
+                        f"UPDATED event: restarted scheduled model instance "
+                        f"{mi.name}."
+                    )
 
             # Start on subordinate worker if not started yet, or restart if failed.
             # Also replace a still-running container when the main provisioning
@@ -1365,10 +1378,20 @@ class ServeManager:
             mi: The model instance to start.
 
         """
-        if self._is_provisioning(mi):
+        if mi.id in self._start_guard or self._is_provisioning(mi):
             logger.warning(f"Model instance {mi.name} is provisioning. Skipping start.")
             return
 
+        # Cover the port publish below. That update still carries SCHEDULED
+        # and the watch can deliver it before the child process exists.
+        self._start_guard.add(mi.id)
+        try:
+            self._start_model_instance_body(mi)
+        finally:
+            self._start_guard.discard(mi.id)
+
+    def _start_model_instance_body(self, mi: ModelInstance):  # noqa: C901
+        """Run the start after the re-entry guard is held."""
         # Clean up old log files before starting
         self._cleanup_old_logs(mi.id, mi.restart_count or 0)
 
