@@ -75,6 +75,15 @@ from gpustack.worker.inference_backend_manager import InferenceBackendManager
 
 logger = logging.getLogger(__name__)
 
+# Instance states where a missing follower container means "not launched yet",
+# not "the server died". Marking ERROR here aborts the other nodes.
+_FOLLOWER_STARTUP_STATES = {
+    ModelInstanceStateEnum.SCHEDULED,
+    ModelInstanceStateEnum.INITIALIZING,
+    ModelInstanceStateEnum.DOWNLOADING,
+    ModelInstanceStateEnum.STARTING,
+}
+
 # Inference health check error message
 _INFERENCE_HEALTH_CHECK_FAILED_MESSAGE = "Inference health check failed."
 
@@ -405,6 +414,16 @@ class ServeManager:
                 )
                 continue
 
+            # A follower that has not created its container yet is still
+            # starting. Treating that as a crash marks the whole instance
+            # ERROR and the other nodes exit while waiting for STARTING.
+            if (
+                not workload
+                and not is_main_worker
+                and self._follower_startup_pending(model_instance)
+            ):
+                continue
+
             # Update model instance state to ERROR if the workload is not existed, unhealthy, inactive or failed.
             if not workload or workload.state in [
                 WorkloadStatusStateEnum.UNKNOWN,  # Rare, but possible, for example, leaving pause container.
@@ -504,14 +523,6 @@ class ServeManager:
                         continue
                 # Get patch dict for subordinate worker.
                 else:
-                    # For initialize later mode, the state is set to RUNNING directly,
-                    # which means the subordinate worker doesn't need to wait for the main worker to be healthy.
-                    if (
-                        model_instance.distributed_servers.mode
-                        == DistributedServerCoordinateModeEnum.INITIALIZE_LATER
-                    ):
-                        continue
-                    # Otherwise, update subordinate worker state to RUNNING.
                     sw_pos = next(
                         (
                             i
@@ -522,7 +533,10 @@ class ServeManager:
                         ),
                     )
                     sw = model_instance.distributed_servers.subordinate_workers[sw_pos]
-                    if sw.state == ModelInstanceStateEnum.RUNNING:
+                    if (
+                        sw.state == ModelInstanceStateEnum.RUNNING
+                        and not sw.state_message
+                    ):
                         continue
                     sw.state = ModelInstanceStateEnum.RUNNING
                     sw.state_message = ""
@@ -531,6 +545,36 @@ class ServeManager:
                     }
                 # Update model instance.
                 self._update_model_instance(model_instance.id, **patch_dict)
+
+    def _follower_startup_pending(self, mi: ModelInstance) -> bool:
+        """Whether a missing follower container is still part of startup."""
+        servers = mi.distributed_servers
+        return bool(
+            servers
+            and servers.mode == DistributedServerCoordinateModeEnum.INITIALIZE_LATER
+            and mi.state in _FOLLOWER_STARTUP_STATES
+        )
+
+    def _follower_launch_is_stale(self, mi: ModelInstance) -> bool:
+        """Whether this follower container joined an older main process group.
+
+        ``mi.pid`` is the main provisioning process. Followers record the pid
+        they launched against. A still-running container from an earlier pid
+        will not join the new TCP store.
+        """
+        if not self._follower_startup_pending(mi) or not mi.pid:
+            return False
+        sw = next(
+            (
+                item
+                for item in mi.distributed_servers.subordinate_workers or []
+                if item.worker_id == self._worker_id
+            ),
+            None,
+        )
+        if sw is None:
+            return False
+        return sw.main_launch_pid != mi.pid
 
     @staticmethod
     def _get_main_worker_distributed_state(
@@ -564,6 +608,11 @@ class ServeManager:
                 all_running = False
 
         if error_sw:
+            # One follower failing while the cluster is still starting used to
+            # flip the instance to ERROR, which made every other follower's
+            # "wait for STARTING" watch exit before it created a container.
+            if model_instance.state in _FOLLOWER_STARTUP_STATES:
+                return {"should_update": False}
             return {
                 "should_update": model_instance.state != ModelInstanceStateEnum.ERROR,
                 "state": ModelInstanceStateEnum.ERROR,
@@ -864,27 +913,33 @@ class ServeManager:
                 )
 
             # Start on subordinate worker if not started yet, or restart if failed.
+            # Also replace a still-running container when the main provisioning
+            # pid changed: that container joined the previous process group.
             if not is_main_worker:
                 deployment_metadata = mi.get_deployment_metadata(self._worker_id)
                 workload_name = (
                     deployment_metadata.name if deployment_metadata else mi.name
                 )
                 workload = get_workload(workload_name)
+                failed = workload is not None and workload.state in [
+                    WorkloadStatusStateEnum.UNKNOWN,
+                    WorkloadStatusStateEnum.UNHEALTHY,
+                    WorkloadStatusStateEnum.INACTIVE,
+                    WorkloadStatusStateEnum.FAILED,
+                ]
+                stale = workload is not None and self._follower_launch_is_stale(mi)
                 if not workload:
                     self._start_model_instance(mi)
                     logger.trace(
                         f"UPDATED event: started model instance {mi.name} on subordinate worker."
                     )
-                elif workload.state in [
-                    WorkloadStatusStateEnum.UNKNOWN,
-                    WorkloadStatusStateEnum.UNHEALTHY,
-                    WorkloadStatusStateEnum.INACTIVE,
-                    WorkloadStatusStateEnum.FAILED,
-                ]:
+                elif failed or stale:
                     self._stop_model_instance(mi, clear_restart_backoff=False)
                     self._start_model_instance(mi)
-                    logger.trace(
-                        f"UPDATED event: restarted failed model instance {mi.name} on subordinate worker."
+                    logger.info(
+                        f"Restarting subordinate workload {workload_name} for "
+                        f"{mi.name}: "
+                        f"{'main process group changed' if stale else 'workload failed'}."
                     )
 
             return
@@ -1344,6 +1399,16 @@ class ServeManager:
                 f"{'' if not is_main_worker else f' on ports {mi.ports if mi.ports else [mi.port]}'}"
             )
 
+            # Publish the reserved list before the child watches for STARTING.
+            # That snapshot is what vLLM command building reads, and a stale
+            # HTTP-only list makes multi-node MP index ports[1] and crash.
+            if is_main_worker and mi.port:
+                self._update_model_instance(
+                    mi.id,
+                    port=mi.port,
+                    ports=list(mi.ports or [mi.port]),
+                )
+
             fallback_registry = (
                 registration.determine_default_registry(
                     self._config.system_default_container_registry
@@ -1385,14 +1450,9 @@ class ServeManager:
             # Get patch dict for subordinate worker.
             else:
                 sw.state = ModelInstanceStateEnum.INITIALIZING
-                # For initialize later mode, the state is set to RUNNING directly,
-                # which means the subordinate worker doesn't need to wait for the main worker to be healthy.
-                if (
-                    mi.distributed_servers.mode
-                    == DistributedServerCoordinateModeEnum.INITIALIZE_LATER
-                ):
-                    sw.state = ModelInstanceStateEnum.RUNNING
+                sw.state_message = ""
                 sw.pid = process.pid
+                sw.main_launch_pid = mi.pid
                 patch_dict = {
                     f"distributed_servers.subordinate_workers.{sw_pos}": sw,
                 }
@@ -1425,6 +1485,56 @@ class ServeManager:
             self._update_model_instance(mi.id, **patch_dict)
             logger.error(f"Failed to start model instance {mi.name}: {e}")
 
+    def _required_port_count(
+        self,
+        mi: ModelInstance,
+        model: Model,
+        backend: BackendEnum,
+    ) -> int:
+        """Full ``mi.ports`` length this instance needs.
+
+        Layout when distributed (see ``_assign_ports``): HTTP, then the vLLM
+        cross ports, then the connecting port. A single worker only needs the
+        HTTP port.
+        """
+        if not (mi.distributed_servers and mi.distributed_servers.subordinate_workers):
+            return 1
+        if backend != BackendEnum.VLLM:
+            return 2
+
+        executor_backend = resolve_executor_backend(
+            model.backend_parameters, model.backend_version
+        )
+        if executor_backend == "mp":
+            # HTTP + DP RPC + PyTorch master + VLLM_PORT + connecting.
+            return 5
+        dps = find_int_parameter(
+            model.backend_parameters,
+            ["data-parallel-size", "dp"],
+        )
+        if dps and dps > 1:
+            return 3
+        return 2
+
+    def _ports_already_reserved(
+        self,
+        mi: ModelInstance,
+        model: Model,
+        backend: BackendEnum,
+    ) -> bool:
+        """Whether ``_assign_ports`` can leave the existing list alone.
+
+        Subordinates never allocate: they must use the list the main worker
+        published. The main worker reallocates when that list is shorter than
+        the executor layout, which is what happens if ``port`` was saved
+        before the deployment became multi-node MP.
+        """
+        if not mi.port:
+            return False
+        if mi.worker_id != self._worker_id:
+            return True
+        return len(mi.ports or []) >= self._required_port_count(mi, model, backend)
+
     def _assign_ports(
         self,
         mi: ModelInstance,
@@ -1444,13 +1554,11 @@ class ServeManager:
             model: The model associated with the instance.
             backend: The backend type (e.g., vLLM, SGLang).
         """
-        if mi.port:
-            # Port already assigned, skip.
+        if self._ports_already_reserved(mi, model, backend):
             return
 
         with _port_lock:
-            if mi.port:
-                # Port already assigned, skip.
+            if self._ports_already_reserved(mi, model, backend):
                 return
 
             if self._assigned_ports:
@@ -1458,12 +1566,17 @@ class ServeManager:
             else:
                 unavailable_ports = set()
 
-            # Main serving port
-            mi.port = network.get_free_port(
-                port_range=self._config.service_port_range,
-                unavailable_ports=unavailable_ports,
-                host=mi.worker_ip,
-            )
+            if mi.port:
+                # HTTP port is already published. Drop a short tail and
+                # reserve the distributed slots below; keeping ports[1] from
+                # an older layout would point DP RPC at the connecting port.
+                unavailable_ports.update(p for p in (mi.ports or []) if p is not None)
+            else:
+                mi.port = network.get_free_port(
+                    port_range=self._config.service_port_range,
+                    unavailable_ports=unavailable_ports,
+                    host=mi.worker_ip,
+                )
             mi.ports = [mi.port]
             unavailable_ports.add(mi.port)
 

@@ -12,6 +12,7 @@ from gpustack.schemas.models import (
     SourceEnum,
 )
 from gpustack.server.bus import Event, EventType
+from gpustack.worker.backends.base import InferenceServer
 from gpustack.worker.serve_manager import ServeManager
 from gpustack_runtime.deployer import WorkloadStatusStateEnum
 from tests.utils.model import new_model, new_model_instance
@@ -604,3 +605,195 @@ def test_persist_container_logs_window_anchor_ignores_repeated_line(
     # Window [A,B,A,B] matches only at the end; single-line 'B' would match
     # index 1 and duplicate A,B.
     assert Path(log_path).read_text(encoding="utf-8") == "A\nB\nA\nB\nC\n"
+
+
+def _mp_vllm_model():
+    model = new_model(
+        1,
+        "deepseek-v4-1-flash",
+        1,
+        huggingface_repo_id="deepseek-ai/DeepSeek-V4-Flash",
+    )
+    model.backend = BackendEnum.VLLM
+    model.backend_parameters = ["--distributed-executor-backend", "mp"]
+    model.backend_version = "0.11.0"
+    return model
+
+
+def _distributed_instance():
+    mi = new_model_instance(7, "deepseek-v4-1-flash-g9f6f", 1, worker_id=1)
+    mi.worker_ip = "10.0.0.1"
+    mi.distributed_servers = DistributedServers(
+        mode=DistributedServerCoordinateModeEnum.INITIALIZE_LATER,
+        subordinate_workers=[
+            ModelInstanceSubordinateWorker(
+                worker_id=2,
+                worker_ip="10.0.0.2",
+                gpu_indexes=[0],
+            )
+        ],
+    )
+    return mi
+
+
+def _port_issuer(start: int):
+    issued = iter(range(start, start + 32))
+    return lambda *args, **kwargs: next(issued)
+
+
+def test_assign_ports_tops_up_mp_slots_when_only_http_port_is_set():
+    """A saved HTTP port must not skip the DP RPC and master ports MP needs."""
+    manager, _clientset = _build_serve_manager()
+    manager._config.service_port_range = "40000-40063"
+    mi = _distributed_instance()
+    mi.port = 40000
+    mi.ports = [40000]
+
+    with patch(
+        "gpustack.worker.serve_manager.network.get_free_port",
+        side_effect=_port_issuer(40010),
+    ):
+        manager._assign_ports(mi, _mp_vllm_model(), BackendEnum.VLLM)
+
+    # connecting port is allocated first, then the three cross ports.
+    assert mi.port == 40000
+    assert mi.ports == [40000, 40011, 40012, 40013, 40010]
+
+
+def test_assign_ports_keeps_a_complete_mp_list():
+    manager, _clientset = _build_serve_manager()
+    manager._config.service_port_range = "40000-40063"
+    mi = _distributed_instance()
+    mi.port = 40000
+    mi.ports = [40000, 40001, 40002, 40003, 40004]
+
+    with patch(
+        "gpustack.worker.serve_manager.network.get_free_port",
+    ) as get_free_port:
+        manager._assign_ports(mi, _mp_vllm_model(), BackendEnum.VLLM)
+
+    get_free_port.assert_not_called()
+    assert mi.ports == [40000, 40001, 40002, 40003, 40004]
+
+
+def test_assign_ports_subordinate_does_not_invent_ports():
+    manager, _clientset = _build_serve_manager(worker_id=2)
+    manager._config.service_port_range = "40000-40063"
+    mi = _distributed_instance()
+    mi.port = 40000
+    mi.ports = [40000]
+
+    with patch(
+        "gpustack.worker.serve_manager.network.get_free_port",
+    ) as get_free_port:
+        manager._assign_ports(mi, _mp_vllm_model(), BackendEnum.VLLM)
+
+    get_free_port.assert_not_called()
+    assert mi.ports == [40000]
+
+
+def test_starting_snapshot_keeps_reserved_ports():
+    """The STARTING watch payload must not drop ports reserved in-process."""
+
+    class _Server(InferenceServer):
+        def start(self):
+            return None
+
+    server = object.__new__(_Server)
+    current = _distributed_instance()
+    current.source = SourceEnum.LOCAL_PATH
+    current.local_path = "/models/deepseek-v4-1-flash"
+    current.port = 40000
+    current.ports = [40000, 40001, 40002, 40003, 40004]
+    current.resolved_path = "/models/deepseek-v4-1-flash"
+    current.state = ModelInstanceStateEnum.INITIALIZING
+    server._model_instance = current
+
+    payload = current.model_dump()
+    payload["ports"] = [40000]
+    payload["port"] = 40000
+    payload["state"] = ModelInstanceStateEnum.STARTING
+    payload["resolved_path"] = "/models/deepseek-v4-1-flash"
+    payload["draft_model_resolved_path"] = None
+
+    assert server._stop_when_starting(Event(type=EventType.UPDATED, data=payload))
+    assert server._model_instance.ports == [40000, 40001, 40002, 40003, 40004]
+    assert server._model_path == "/models/deepseek-v4-1-flash"
+
+
+def _starting_follower(main_pid=99, launch_pid=50):
+    mi = _distributed_instance()
+    mi.state = ModelInstanceStateEnum.STARTING
+    mi.pid = main_pid
+    mi.source = SourceEnum.LOCAL_PATH
+    mi.local_path = "/models/deepseek-v4-1-flash"
+    sw = mi.distributed_servers.subordinate_workers[0]
+    sw.state = ModelInstanceStateEnum.RUNNING
+    sw.state_message = "Inference server exited or unhealthy."
+    sw.main_launch_pid = launch_pid
+    return mi
+
+
+def test_sync_does_not_fail_a_follower_that_has_not_launched_yet():
+    manager, clientset = _build_serve_manager(worker_id=2)
+    mi = _starting_follower()
+    clientset.model_instances.list.return_value = SimpleNamespace(items=[mi])
+
+    with (
+        patch("gpustack.worker.serve_manager.get_workload", return_value=None),
+        patch.object(manager, "_is_provisioning", return_value=False),
+        patch.object(manager, "_update_model_instance") as update,
+    ):
+        manager.sync_model_instances_state()
+
+    update.assert_not_called()
+
+
+def test_starting_instance_does_not_inherit_follower_error():
+    mi = _starting_follower()
+    mi.distributed_servers.subordinate_workers[0].state = ModelInstanceStateEnum.ERROR
+    result = ServeManager._get_main_worker_distributed_state(mi)
+    assert result == {"should_update": False}
+
+    mi.state = ModelInstanceStateEnum.RUNNING
+    result = ServeManager._get_main_worker_distributed_state(mi)
+    assert result["state"] == ModelInstanceStateEnum.ERROR
+    assert "10.0.0.2" in result["state_message"]
+
+
+def test_follower_relaunches_when_main_process_group_changes():
+    manager, _clientset = _build_serve_manager(worker_id=2)
+    mi = _starting_follower(main_pid=99, launch_pid=50)
+    event = Event(type=EventType.UPDATED, data=mi.model_dump(mode="json"))
+
+    with (
+        patch(
+            "gpustack.worker.serve_manager.get_workload",
+            return_value=SimpleNamespace(state=WorkloadStatusStateEnum.RUNNING),
+        ),
+        patch.object(manager, "_stop_model_instance") as stop,
+        patch.object(manager, "_start_model_instance") as start,
+    ):
+        manager._dispatch_model_instance_event(event)
+
+    stop.assert_called_once()
+    start.assert_called_once()
+
+
+def test_follower_keeps_container_for_the_current_main_pid():
+    manager, _clientset = _build_serve_manager(worker_id=2)
+    mi = _starting_follower(main_pid=99, launch_pid=99)
+    event = Event(type=EventType.UPDATED, data=mi.model_dump(mode="json"))
+
+    with (
+        patch(
+            "gpustack.worker.serve_manager.get_workload",
+            return_value=SimpleNamespace(state=WorkloadStatusStateEnum.RUNNING),
+        ),
+        patch.object(manager, "_stop_model_instance") as stop,
+        patch.object(manager, "_start_model_instance") as start,
+    ):
+        manager._dispatch_model_instance_event(event)
+
+    stop.assert_not_called()
+    start.assert_not_called()

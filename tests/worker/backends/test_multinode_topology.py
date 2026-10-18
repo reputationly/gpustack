@@ -238,6 +238,51 @@ def test_follower_skips_headless_under_hybrid_lb():
     assert "--headless" not in _follower_mp_arguments(["--data-parallel-hybrid-lb"])
 
 
+def _mp_arguments_for_ports(ports):
+    """Drive _build_mp_multinode_arguments with an explicit ports list."""
+    server = object.__new__(VLLMServer)
+    server._model = MagicMock(backend_parameters=[])
+    server._model_instance = MagicMock(worker_ip="10.0.0.1", ports=ports)
+    topology = MultinodeTopology(
+        shape="dp_only",
+        tp=1,
+        pp=1,
+        dp=16,
+        dpl=8,
+        nnodes=2,
+        node_rank=1,
+        start_rank=8,
+        is_follower=True,
+    )
+    ctx = _VLLMArgsContext(
+        port=8000,
+        is_distributed=True,
+        executor_backend="mp",
+        topology=topology,
+        is_omni=False,
+        is_audio=False,
+        entrypoint=None,
+        deployment_metadata=None,
+    )
+    return server._build_mp_multinode_arguments(ctx)
+
+
+@pytest.mark.parametrize("ports", [[], [8000], [8000, 8001]])
+def test_mp_multinode_requires_reserved_ports(ports):
+    """A short ports list must fail with an actionable message, not IndexError.
+
+    Regression: rebuilding the instance from a stale STARTING snapshot dropped
+    the ports ServeManager reserved, so ``ports[1]`` raised a bare IndexError.
+    """
+    with pytest.raises(RuntimeError, match="missing reserved ports"):
+        _mp_arguments_for_ports(ports)
+
+
+def test_mp_multinode_uses_the_reserved_dp_rpc_port():
+    args = _mp_arguments_for_ports([8000, 8001, 8002])
+    assert args[args.index("--data-parallel-rpc-port") + 1] == "8001"
+
+
 # ---------------------------------------------------------------------------
 # shape == "dp_only" — homogeneous clusters
 # ---------------------------------------------------------------------------

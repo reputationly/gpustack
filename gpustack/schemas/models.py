@@ -448,6 +448,10 @@ class ModelInstanceSubordinateWorker(BaseModel):
     download_progress: Optional[float] = None
     # - For model instance serving preparation
     pid: Optional[int] = None
+    # Main provisioning pid this follower last launched against. A new value
+    # means the main process group was recreated and the follower container
+    # must be replaced to join it.
+    main_launch_pid: Optional[int] = None
     ports: Optional[List[int]] = Field(sa_column=Column(JSON), default=[])
     arguments: Optional[List[str]] = Field(sa_column=Column(JSON), default=[])
     state: ModelInstanceStateEnum = ModelInstanceStateEnum.PENDING

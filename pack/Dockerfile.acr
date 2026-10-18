@@ -38,6 +38,10 @@ COPY gpustack/schemas/inference_backend.py                                   /tm
 # base.py 与 inference_backend.py 成对:容器 /dev/shm 上限的默认值只在 schema 里定
 # 一份,base.py 负责读它。只叠其中一个,另一个仍是基础镜像的旧版本,默认值就分叉了。
 COPY gpustack/worker/backends/base.py                                        /tmp/lx2v-overlay/worker/backends/base.py
+# vllm.py carries the multi-node port guard (ports[1]/ports[2]). It was
+# identical to the v2.2.3 base until this change, so it was not on the COPY
+# list; leaving it off would ship the base file and the IndexError stays.
+COPY gpustack/worker/backends/vllm.py                                        /tmp/lx2v-overlay/worker/backends/vllm.py
 COPY gpustack/worker/backends/lightx2v.py                                    /tmp/lx2v-overlay/worker/backends/lightx2v.py
 COPY gpustack/worker/serve_manager.py                                        /tmp/lx2v-overlay/worker/serve_manager.py
 COPY gpustack/worker/model_meta.py                                           /tmp/lx2v-overlay/worker/model_meta.py
@@ -146,6 +150,8 @@ RUN set -eux; \
         "${GP_DIR}/policies/candidate_selectors/yue2_resource_fit_selector.py" \
         "${GP_DIR}/schemas/inference_backend.py" \
         "${GP_DIR}/worker/backends/base.py" \
+        "${GP_DIR}/worker/backends/vllm.py" \
+        "${GP_DIR}/worker/serve_manager.py" \
         "${GP_DIR}/scheduler/scheduler.py" \
         "${GP_DIR}/scheduler/evaluator.py" \
         "${GP_DIR}/worker/model_meta.py" \

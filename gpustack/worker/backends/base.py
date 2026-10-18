@@ -238,7 +238,16 @@ class InferenceServer(ABC):
                 self._draft_model_path = str(
                     Path(event.data["draft_model_resolved_path"]).absolute()
                 )
+            reserved_port = self._model_instance.port
+            reserved_ports = list(self._model_instance.ports or [])
             self._model_instance = ModelInstance.model_validate(event.data)
+            # The object passed into this process already has the ports
+            # ServeManager just reserved. The STARTING payload can still be
+            # the previous HTTP-only list.
+            if len(reserved_ports) > len(self._model_instance.ports or []):
+                self._model_instance.ports = reserved_ports
+                if reserved_port and not self._model_instance.port:
+                    self._model_instance.port = reserved_port
             return True
 
         return False

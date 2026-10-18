@@ -734,9 +734,13 @@ class VLLMServer(InferenceServer):
             if dpb is None:
                 arguments.extend(["--data-parallel-backend", "ray"])
             # ports[1] is reserved for DP RPC, see gpustack/worker/serve_manager.py.
-            arguments.extend(
-                ["--data-parallel-rpc-port", str(self._model_instance.ports[1])]
-            )
+            ports = self._model_instance.ports or []
+            if len(ports) < 2:
+                raise RuntimeError(
+                    "vLLM Ray distributed start is missing the DP RPC port. "
+                    f"Expected ports[1], got {ports}."
+                )
+            arguments.extend(["--data-parallel-rpc-port", str(ports[1])])
         return arguments
 
     def _build_mp_multinode_arguments(
@@ -781,8 +785,15 @@ class VLLMServer(InferenceServer):
         # endpoint (ZMQ) and ports[2] for the PyTorch master endpoint
         # (TCPStore). The two channels use different protocols and can't
         # share one port, so each shape consumes the subset it needs.
-        dp_rpc_port = str(self._model_instance.ports[1])
-        master_port = str(self._model_instance.ports[2])
+        ports = self._model_instance.ports or []
+        if len(ports) < 3:
+            raise RuntimeError(
+                "vLLM multi-node MP start is missing reserved ports. "
+                "Expected HTTP, DP RPC and master ports, "
+                f"got {ports}."
+            )
+        dp_rpc_port = str(ports[1])
+        master_port = str(ports[2])
         if topology.shape == "dp_only":
             extend_args_no_exist(
                 arguments,
