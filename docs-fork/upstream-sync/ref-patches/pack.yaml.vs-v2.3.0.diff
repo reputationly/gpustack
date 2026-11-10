@@ -1,0 +1,25 @@
+diff --git a/.github/workflows/pack.yaml b/.github/workflows/pack.yaml
+index e00cf2e8..d37f62f6 100644
+--- a/.github/workflows/pack.yaml
++++ b/.github/workflows/pack.yaml
+@@ -11,6 +11,12 @@ defaults:
+   run:
+     shell: bash
+ 
++# Fork note: this is the UPSTREAM full-pack workflow. It needs registry
++# secrets this fork doesn't set (fails "Password required") and is NOT the
++# fork's release path -- we ship via pack-acr-overlay.yml. The triggers stay
++# identical to upstream (tests/hack/test_docs_packaging.py asserts on them);
++# the `if:` on the `metadata` job skips every automatic run outside the
++# upstream repository. Manual workflow_dispatch still works.
+ on:
+   workflow_dispatch: {}
+   repository_dispatch:
+@@ -52,6 +58,7 @@ env:
+ 
+ jobs:
+   metadata:
++    if: ${{ github.repository == 'gpustack/gpustack' || github.event_name == 'workflow_dispatch' }}
+     runs-on: ubuntu-22.04
+     outputs:
+       tags: ${{ steps.metadata.outputs.tags }}

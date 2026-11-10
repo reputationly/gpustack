@@ -1,0 +1,207 @@
+diff --git a/src/pages/playground/video/task-inputs.test.ts b/src/pages/playground/video/task-inputs.test.ts
+index ea54b5dc..c24e9c5a 100644
+--- a/src/pages/playground/video/task-inputs.test.ts
++++ b/src/pages/playground/video/task-inputs.test.ts
+@@ -1,4 +1,5 @@
+-import { describe, expect, it } from 'vitest';
++import assert from 'node:assert/strict';
++import { describe, it } from 'node:test';
+ import {
+   inferVideoTaskType,
+   R2VA_MAX_TOTAL_REFS,
+@@ -6,6 +7,14 @@ import {
+   VideoTaskType
+ } from './task-inputs';
+ 
++// Subset match: every key in `want` must be deeply equal in `got`.
++const assertMatches = (got: unknown, want: Record<string, unknown>) => {
++  assert.ok(got && typeof got === 'object');
++  for (const [key, value] of Object.entries(want)) {
++    assert.deepEqual((got as Record<string, unknown>)[key], value);
++  }
++};
++
+ // The validator only ever counts files, never reads them.
+ const files = (spec: Record<string, number>): Record<string, File[]> =>
+   Object.fromEntries(
+@@ -18,47 +27,46 @@ const files = (spec: Record<string, number>): Record<string, File[]> =>
+ describe('inferVideoTaskType', () => {
+   describe('explicit meta.task_type', () => {
+     it('wins over the model name when recognized', () => {
+-      expect(
+-        inferVideoTaskType('minimax-h3-fl2va', { task_type: 'l2va' })
+-      ).toBe('l2va');
+-      expect(
+-        inferVideoTaskType('some-bernini-deploy', { task_type: 'r2v' })
+-      ).toBe('r2v');
++      assert.equal(
++        inferVideoTaskType('minimax-h3-fl2va', { task_type: 'l2va' }),
++        'l2va'
++      );
++      assert.equal(
++        inferVideoTaskType('some-bernini-deploy', { task_type: 'r2v' }),
++        'r2v'
++      );
+     });
+ 
+     it('is case-insensitive', () => {
+-      expect(inferVideoTaskType('anything', { task_type: 'R2VA' })).toBe(
+-        'r2va'
+-      );
++      assert.equal(inferVideoTaskType('anything', { task_type: 'R2VA' }), 'r2va');
+     });
+ 
+     // meta is unvalidated free-form JSON and this very key carries an unrelated
+     // vocabulary elsewhere (meta_registry writes "CustomVoice" for Qwen3-TTS),
+     // so an unrecognized value must degrade to name inference rather than leak
+     // through as a task_type the facade would reject.
+-    it.each([
++    for (const [pinned, name, want] of [
+       ['CustomVoice', 'minimax-h3-ref2va', 'r2va'],
+       ['t2va', 'minimax-h3-fl2va', 't2v'],
+       ['ref2va', 'minimax-h3-ref2va', 'r2va'],
+       ['typo', 'wan-i2v', 'i2v'],
+       ['', 'seedvr2', 'sr']
+-    ])(
+-      'ignores unrecognized %p and infers from the name',
+-      (pinned, name, want) => {
+-        expect(inferVideoTaskType(name, { task_type: pinned })).toBe(want);
+-      }
+-    );
++    ]) {
++      it(`ignores unrecognized '${pinned}' and infers from the name`, () => {
++        assert.equal(inferVideoTaskType(name, { task_type: pinned }), want);
++      });
++    }
+ 
+     it('treats missing meta as absent', () => {
+-      expect(inferVideoTaskType('wan-i2v')).toBe('i2v');
+-      expect(inferVideoTaskType('wan-i2v', {})).toBe('i2v');
++      assert.equal(inferVideoTaskType('wan-i2v'), 'i2v');
++      assert.equal(inferVideoTaskType('wan-i2v', {}), 'i2v');
+     });
+   });
+ 
+   // Token order must stay identical to new-api's inferTaskType, or the two
+   // disagree on the same deploy.
+   describe('name inference', () => {
+-    it.each<[string, VideoTaskType]>([
++    const cases: [string, VideoTaskType][] = [
+       ['infinitetalk-480p', 's2v'],
+       ['some-s2v-model', 's2v'],
+       ['seedvr2-3b', 'sr'],
+@@ -78,35 +86,38 @@ describe('inferVideoTaskType', () => {
+       ['wan2.2-t2v-a14b', 't2v'],
+       ['something-unknown', 't2v'],
+       ['', 't2v']
+-    ])('%p -> %p', (name, want) => {
+-      expect(inferVideoTaskType(name)).toBe(want);
+-    });
++    ];
++    for (const [name, want] of cases) {
++      it(`'${name}' -> '${want}'`, () => {
++        assert.equal(inferVideoTaskType(name), want);
++      });
++    }
+ 
+     // The fl2va PARTITION serves t2va + fl2va, and fl2va itself covers
+     // i2v/l2va/flf2v. The name cannot say which, so t2v (zero-input, always
+     // submittable) is the only safe default — the playstyle selector is what
+     // reaches the other three.
+     it('falls back to t2v for the H3 fl2va partition', () => {
+-      expect(inferVideoTaskType('minimax-h3-fl2va')).toBe('t2v');
++      assert.equal(inferVideoTaskType('minimax-h3-fl2va'), 't2v');
+     });
+ 
+     // Bernini serves six playstyles from one model; same reasoning.
+     it('falls back to t2v for Bernini', () => {
+-      expect(inferVideoTaskType('bernini-video-1')).toBe('t2v');
++      assert.equal(inferVideoTaskType('bernini-video-1'), 't2v');
+     });
+   });
+ });
+ 
+ describe('validateVideoInputs', () => {
+   const ok = (taskType: VideoTaskType, spec: Record<string, number> = {}) =>
+-    expect(validateVideoInputs(taskType, files(spec))).toBeNull();
++    assert.equal(validateVideoInputs(taskType, files(spec)), null);
+ 
+   const fails = (
+     taskType: VideoTaskType,
+     spec: Record<string, number>,
+     id: string
+   ) =>
+-    expect(validateVideoInputs(taskType, files(spec))).toMatchObject({
++    assertMatches(validateVideoInputs(taskType, files(spec)), {
+       id: `playground.video.input.${id}`
+     });
+ 
+@@ -116,7 +127,7 @@ describe('validateVideoInputs', () => {
+ 
+   describe('required fields', () => {
+     it('names the missing field by its label key', () => {
+-      expect(validateVideoInputs('i2v', {})).toEqual({
++      assert.deepEqual(validateVideoInputs('i2v', {}), {
+         id: 'playground.video.input.required',
+         labelIdValues: { field: 'playground.video.input.image' }
+       });
+@@ -127,10 +138,10 @@ describe('validateVideoInputs', () => {
+     });
+ 
+     it('reports the FIRST missing field of several', () => {
+-      expect(validateVideoInputs('s2v', files({ image: 1 }))).toMatchObject({
++      assertMatches(validateVideoInputs('s2v', files({ image: 1 })), {
+         labelIdValues: { field: 'playground.video.input.audio' }
+       });
+-      expect(validateVideoInputs('s2v', files({}))).toMatchObject({
++      assertMatches(validateVideoInputs('s2v', files({})), {
+         labelIdValues: { field: 'playground.video.input.portrait' }
+       });
+     });
+@@ -156,19 +167,21 @@ describe('validateVideoInputs', () => {
+   });
+ 
+   describe('mv2v / ads2v', () => {
+-    it.each<VideoTaskType>(['mv2v', 'ads2v'])('%s needs exactly two', (t) => {
+-      // Zero videos trips the required-field rule first, which is the clearer
+-      // message; one or three trips the count rule.
+-      fails(t, {}, 'required');
+-      fails(t, { src_video: 1 }, 'needTwoVideos');
+-      fails(t, { src_video: 3 }, 'needTwoVideos');
+-      ok(t, { src_video: 2 });
+-    });
++    for (const t of ['mv2v', 'ads2v'] as VideoTaskType[]) {
++      it(`${t} needs exactly two`, () => {
++        // Zero videos trips the required-field rule first, which is the clearer
++        // message; one or three trips the count rule.
++        fails(t, {}, 'required');
++        fails(t, { src_video: 1 }, 'needTwoVideos');
++        fails(t, { src_video: 3 }, 'needTwoVideos');
++        ok(t, { src_video: 2 });
++      });
++    }
+ 
+     it('carries the task type into the message', () => {
+-      expect(
+-        validateVideoInputs('ads2v', files({ src_video: 1 }))
+-      ).toMatchObject({ values: { type: 'ads2v' } });
++      assertMatches(validateVideoInputs('ads2v', files({ src_video: 1 })), {
++        values: { type: 'ads2v' }
++      });
+     });
+   });
+ 
+@@ -191,9 +204,10 @@ describe('validateVideoInputs', () => {
+     // field can be within its cap while the request is still over.
+     it('rejects more than the cross-modal total', () => {
+       fails('r2va', { image: 9, video: 3, audio: 3 }, 'r2vaTooManyRefs');
+-      expect(
+-        validateVideoInputs('r2va', files({ image: 9, video: 3, audio: 3 }))
+-      ).toMatchObject({ values: { max: R2VA_MAX_TOTAL_REFS, total: 15 } });
++      assertMatches(
++        validateVideoInputs('r2va', files({ image: 9, video: 3, audio: 3 })),
++        { values: { max: R2VA_MAX_TOTAL_REFS, total: 15 } }
++      );
+     });
+ 
+     it('accepts exactly the total', () => {

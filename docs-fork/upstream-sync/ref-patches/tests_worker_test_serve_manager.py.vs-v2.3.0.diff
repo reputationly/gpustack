@@ -1,0 +1,143 @@
+diff --git a/tests/worker/test_serve_manager.py b/tests/worker/test_serve_manager.py
+index c1f2f15b..f5973ef7 100644
+--- a/tests/worker/test_serve_manager.py
++++ b/tests/worker/test_serve_manager.py
+@@ -3894,3 +3894,138 @@ def test_sglang_diffusion_explicit_path_precedes_version_handling(backend_versio
+         assert is_ready(BackendEnum.SGLANG, mi, "/ready", model) is False
+ 
+     get.assert_called_once_with("http://10.0.0.1:8000/ready", timeout=1)
++
++
++# --- fork: INITIALIZE_LATER follower lifecycle -------------------------------
++
++
++def _fork_distributed_instance():
++    mi = new_model_instance(7, "deepseek-v4-1-flash-g9f6f", 1, worker_id=1)
++    mi.worker_ip = "10.0.0.1"
++    mi.distributed_servers = DistributedServers(
++        mode=DistributedServerCoordinateModeEnum.INITIALIZE_LATER,
++        subordinate_workers=[
++            ModelInstanceSubordinateWorker(
++                worker_id=2,
++                worker_ip="10.0.0.2",
++                gpu_indexes=[0],
++            )
++        ],
++    )
++    return mi
++
++
++def _starting_follower(main_pid=99, launch_pid=50):
++    mi = _fork_distributed_instance()
++    mi.state = ModelInstanceStateEnum.STARTING
++    mi.pid = main_pid
++    mi.source = SourceEnum.LOCAL_PATH
++    mi.local_path = "/models/deepseek-v4-1-flash"
++    sw = mi.distributed_servers.subordinate_workers[0]
++    sw.state = ModelInstanceStateEnum.RUNNING
++    sw.state_message = "Inference server exited or unhealthy."
++    sw.main_launch_pid = launch_pid
++    return mi
++
++
++def test_sync_does_not_fail_a_follower_that_has_not_launched_yet():
++    manager, clientset = _build_serve_manager(worker_id=2)
++    mi = _starting_follower()
++    clientset.model_instances.list.return_value = SimpleNamespace(items=[mi])
++
++    with (
++        patch("gpustack.worker.serve_manager.get_workload", return_value=None),
++        patch.object(manager, "_is_provisioning", return_value=False),
++        patch.object(manager, "_update_model_instance") as update,
++    ):
++        manager.sync_model_instances_state()
++
++    update.assert_not_called()
++
++
++def test_follower_relaunches_when_main_process_group_changes():
++    manager, _clientset = _build_serve_manager(worker_id=2)
++    mi = _starting_follower(main_pid=99, launch_pid=50)
++    event = Event(type=EventType.UPDATED, data=mi.model_dump(mode="json"))
++
++    with (
++        patch(
++            "gpustack.worker.serve_manager.get_workload",
++            return_value=SimpleNamespace(state=WorkloadStatusStateEnum.RUNNING),
++        ),
++        patch.object(manager, "_stop_model_instance") as stop,
++        patch.object(manager, "_start_model_instance") as start,
++    ):
++        manager._dispatch_model_instance_event(event)
++
++    stop.assert_called_once()
++    start.assert_called_once()
++
++
++def test_follower_keeps_container_for_the_current_main_pid():
++    manager, _clientset = _build_serve_manager(worker_id=2)
++    mi = _starting_follower(main_pid=99, launch_pid=99)
++    event = Event(type=EventType.UPDATED, data=mi.model_dump(mode="json"))
++
++    with (
++        patch(
++            "gpustack.worker.serve_manager.get_workload",
++            return_value=SimpleNamespace(state=WorkloadStatusStateEnum.RUNNING),
++        ),
++        patch.object(manager, "_stop_model_instance") as stop,
++        patch.object(manager, "_start_model_instance") as start,
++    ):
++        manager._dispatch_model_instance_event(event)
++
++    stop.assert_not_called()
++    start.assert_not_called()
++
++
++def test_stale_follower_is_replaced_even_when_auto_restart_is_disabled():
++    manager, _clientset = _build_serve_manager(worker_id=2)
++    mi = _starting_follower(main_pid=99, launch_pid=50)
++    event = Event(type=EventType.UPDATED, data=mi.model_dump(mode="json"))
++
++    with (
++        patch(
++            "gpustack.worker.serve_manager.get_workload",
++            return_value=SimpleNamespace(state=WorkloadStatusStateEnum.RUNNING),
++        ),
++        patch.object(manager, "_auto_restart_enabled", return_value=False),
++        patch.object(manager, "_stop_model_instance") as stop,
++        patch.object(manager, "_start_model_instance") as start,
++    ):
++        manager._dispatch_model_instance_event(event)
++
++    stop.assert_called_once()
++    start.assert_called_once()
++
++
++def test_starting_snapshot_keeps_reserved_ports():
++    """The STARTING watch payload must not drop ports reserved in-process."""
++    from gpustack.worker.backends.base import InferenceServer
++
++    class _Server(InferenceServer):
++        def start(self):
++            return None
++
++    server = object.__new__(_Server)
++    current = _fork_distributed_instance()
++    current.source = SourceEnum.LOCAL_PATH
++    current.local_path = "/models/deepseek-v4-1-flash"
++    current.port = 40000
++    current.ports = [40000, 40001, 40002, 40003, 40004]
++    current.resolved_path = "/models/deepseek-v4-1-flash"
++    current.state = ModelInstanceStateEnum.INITIALIZING
++    server._model_instance = current
++
++    payload = current.model_dump()
++    payload["ports"] = [40000]
++    payload["port"] = 40000
++    payload["state"] = ModelInstanceStateEnum.STARTING
++    payload["resolved_path"] = "/models/deepseek-v4-1-flash"
++    payload["draft_model_resolved_path"] = None
++
++    assert server._stop_when_starting(Event(type=EventType.UPDATED, data=payload))
++    assert server._model_instance.ports == [40000, 40001, 40002, 40003, 40004]
++    assert server._model_path == "/models/deepseek-v4-1-flash"

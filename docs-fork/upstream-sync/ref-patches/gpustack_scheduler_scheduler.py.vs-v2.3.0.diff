@@ -1,0 +1,178 @@
+diff --git a/gpustack/scheduler/scheduler.py b/gpustack/scheduler/scheduler.py
+index 718c6dbc..c04434f6 100644
+--- a/gpustack/scheduler/scheduler.py
++++ b/gpustack/scheduler/scheduler.py
+@@ -45,6 +45,27 @@ from gpustack.policies.candidate_selectors.instance_type_whole_card_selector imp
+ from gpustack.policies.candidate_selectors.custom_backend_resource_fit_selector import (
+     CustomBackendResourceFitSelector,
+ )
++from gpustack.policies.candidate_selectors.lightx2v_resource_fit_selector import (
++    LightX2VResourceFitSelector,
++)
++from gpustack.policies.candidate_selectors.breeze_resource_fit_selector import (
++    BreezeTTSResourceFitSelector,
++)
++from gpustack.policies.candidate_selectors.yue2_resource_fit_selector import (
++    YuE2ResourceFitSelector,
++)
++from gpustack.policies.candidate_selectors.indextts_resource_fit_selector import (
++    IndexTTSResourceFitSelector,
++)
++from gpustack.policies.candidate_selectors.acestep_resource_fit_selector import (
++    ACEStepResourceFitSelector,
++)
++from gpustack.policies.candidate_selectors.vllm_omni_resource_fit_selector import (
++    VLLMOmniResourceFitSelector,
++)
++from gpustack.policies.candidate_selectors.bernini_resource_fit_selector import (
++    BerniniResourceFitSelector,
++)
+ from gpustack.policies.utils import ListMessageBuilder, should_skip_gpu_count_check
+ from gpustack.policies.worker_filters.backend_framework_filter import (
+     BackendFrameworkFilter,
+@@ -724,6 +745,34 @@ def build_candidate_selector(
+         return SGLangResourceFitSelector(
+             config, model, model_instances, resource_view=resource_view
+         )
++    if model.backend == BackendEnum.LIGHTX2V:
++        return LightX2VResourceFitSelector(
++            config, model, model_instances, resource_view=resource_view
++        )
++    if model.backend == BackendEnum.BERNINI:
++        return BerniniResourceFitSelector(
++            config, model, model_instances, resource_view=resource_view
++        )
++    if model.backend == BackendEnum.INDEXTTS:
++        return IndexTTSResourceFitSelector(
++            config, model, model_instances, resource_view=resource_view
++        )
++    if model.backend == BackendEnum.BREEZE_TTS:
++        return BreezeTTSResourceFitSelector(
++            config, model, model_instances, resource_view=resource_view
++        )
++    if model.backend == BackendEnum.YUE2:
++        return YuE2ResourceFitSelector(
++            config, model, model_instances, resource_view=resource_view
++        )
++    if model.backend == BackendEnum.ACESTEP:
++        return ACEStepResourceFitSelector(
++            config, model, model_instances, resource_view=resource_view
++        )
++    if model.backend == BackendEnum.VLLM_OMNI:
++        return VLLMOmniResourceFitSelector(
++            config, model, model_instances, resource_view=resource_view
++        )
+     return CustomBackendResourceFitSelector(
+         config, model, model_instances, resource_view=resource_view
+     )
+@@ -1214,6 +1263,95 @@ async def prioritize_workers_with_model_files(
+     return sorted_workers
+ 
+ 
++# vLLM-Omni is the one built-in engine that is NOT single-modality: the same
++# backend serves TTS (VoxCPM2/CosyVoice3/Qwen3-TTS/MOSS-*), diffusion audiogen
++# (AudioX/SoulX-Singer), images, and — since MiniMax-H3 — video. So "one backend
++# maps to one category" does not hold for it, and the flat mapping below cannot
++# express it. These hints refine the vLLM-Omni default by model source.
++#
++# Matching is on the model source key (repo id / model-scope id / local path)
++# plus the display name, lowercased.
++#
++# This category IS load-bearing, so a wrong guess is not free. routes/videos.py
++# admits the H3-only task types (l2va / r2va) only on a model it can positively
++# identify as an H3 video deployment, and is_video_model() — i.e. this category —
++# is one of the two things it accepts as that evidence. A vLLM-Omni model
++# mis-filed as VIDEO therefore becomes eligible for video task types it cannot
++# serve; one mis-filed as TEXT_TO_SPEECH is merely denied the escape hatch (the
++# weight-path token check still admits it). Prefer under- to over-matching here,
++# and do not add a hint on a token that a speech checkpoint could also carry.
++#
++# Explicitly-declared categories always win: set_model_categories() returns
++# early when model.categories is already populated, so an operator who sets
++# categories=[video] on the model is never overridden by any of this.
++_VLLM_OMNI_CATEGORY_HINTS: List[Tuple[str, CategoryEnum]] = [
++    # MiniMax-H3 omni video (FL2VA / Ref2VA partitions). Production deployments
++    # are local paths like /nfs-data/models/MiniMax-H3-FL2VA-INT8.
++    ("minimax-h3", CategoryEnum.VIDEO),
++    ("minimax_h3", CategoryEnum.VIDEO),
++    # LTX-2.5 / LTX-2.3 text-to-video (also the ltx2-v2a dubbing deployment,
++    # which is video too, so the bare token is safe here).
++    ("ltx", CategoryEnum.VIDEO),
++    # Diffusion image models served through vLLM-Omni. Each token is specific to
++    # one model family; none of them can appear in a speech checkpoint's path.
++    ("ideogram", CategoryEnum.IMAGE),
++    ("krea", CategoryEnum.IMAGE),
++    ("sensenova", CategoryEnum.IMAGE),
++    # MiniMax-Music3. Matched on "music3" rather than a bare "music": the token
++    # has to stay narrow, and "minimax-music3" does not contain "minimax-h3",
++    # so it cannot be captured by the video rule above whatever the order.
++    ("music3", CategoryEnum.MUSIC),
++]
++
++# Fallback when no hint matches. Keeps every pre-H3 vLLM-Omni deployment (the
++# TTS fleet) classified exactly as before — this change must not re-file models
++# that are working today.
++_VLLM_OMNI_DEFAULT_CATEGORY = CategoryEnum.TEXT_TO_SPEECH
++
++
++def _vllm_omni_category(model: Model) -> CategoryEnum:
++    """Refine the vLLM-Omni category by model source; see _VLLM_OMNI_CATEGORY_HINTS."""
++    haystack = " ".join(
++        value for value in (model.name, model.model_source_key) if value
++    ).lower()
++    for token, category in _VLLM_OMNI_CATEGORY_HINTS:
++        if token in haystack:
++            return category
++    return _VLLM_OMNI_DEFAULT_CATEGORY
++
++
++def _evaluate_builtin_backend_config(model: Model) -> Optional[bool]:
++    """
++    First-class built-in engines (LightX2V, IndexTTS, ACE-Step, vLLM-Omni) have
++    fixed profiles and non-standard architectures. Loading a HF pretrained config
++    would error and mis-tag them as LLM, so skip detection entirely and declare
++    their category explicitly (LightX2V/Bernini=video, IndexTTS=text_to_speech,
++    ACE-Step=music). Returns the "categories/gpus_per_replica updated" flag, or
++    None when the model is not a built-in engine (caller falls through to
++    detection).
++
++    vLLM-Omni is multi-modality and does not get a fixed entry here — see
++    _vllm_omni_category.
++    """
++    builtin_categories = {
++        BackendEnum.LIGHTX2V: CategoryEnum.VIDEO,
++        BackendEnum.INDEXTTS: CategoryEnum.TEXT_TO_SPEECH,
++        BackendEnum.ACESTEP: CategoryEnum.MUSIC,
++        BackendEnum.BERNINI: CategoryEnum.VIDEO,
++        BackendEnum.BREEZE_TTS: CategoryEnum.TEXT_TO_SPEECH,
++        BackendEnum.YUE2: CategoryEnum.MUSIC,
++    }
++    if model.backend == BackendEnum.VLLM_OMNI:
++        category = _vllm_omni_category(model)
++    else:
++        category = builtin_categories.get(model.backend)
++    if category is None:
++        return None
++    categories_modified = set_model_categories(model, category)
++    gpus_per_replica_modified = set_model_gpus_per_replica(model)
++    return categories_modified or gpus_per_replica_modified
++
++
+ async def evaluate_pretrained_config(
+     model: Model,
+     workers: Optional[List[Worker]] = None,
+@@ -1228,6 +1366,14 @@ async def evaluate_pretrained_config(
+     Returns:
+         True if the model's categories are updated, False otherwise.
+     """
++    # 0) First-class built-in engines (LightX2V=video, IndexTTS=text_to_speech)
++    # have fixed profiles and non-standard architectures — skip HF pretrained-
++    # config detection (would error and mis-tag as LLM) and declare category
++    # explicitly. See _evaluate_builtin_backend_config.
++    builtin_modified = _evaluate_builtin_backend_config(model)
++    if builtin_modified is not None:
++        return builtin_modified
++
+     # 1) try to evaluate as diffusion model
+     try:
+         is_image_category = await evaluate_diffusion_model(model, workers=workers)

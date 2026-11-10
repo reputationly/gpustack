@@ -1,0 +1,24 @@
+diff --git a/gpustack/routes/benchmarks.py b/gpustack/routes/benchmarks.py
+index 6ac513d0..e3993b08 100644
+--- a/gpustack/routes/benchmarks.py
++++ b/gpustack/routes/benchmarks.py
+@@ -37,7 +37,9 @@ from gpustack.schemas.models import (
+     is_audio_model,
+     is_embedding_model,
+     is_image_model,
++    is_music_model,
+     is_reranker_model,
++    is_video_model,
+     role_effective_model,
+     servable_instances,
+ )
+@@ -1059,7 +1061,9 @@ async def validate_and_mutate_benchmark_in(  # noqa: C901
+ 
+     if (
+         is_image_model(model)
++        or is_video_model(model)
+         or is_audio_model(model)
++        or is_music_model(model)
+         or is_embedding_model(model)
+         or is_reranker_model(model)
+     ):

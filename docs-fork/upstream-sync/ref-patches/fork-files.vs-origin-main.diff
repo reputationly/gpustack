@@ -1,0 +1,117 @@
+diff --git a/gpustack/policies/candidate_selectors/lightx2v_resource_fit_selector.py b/gpustack/policies/candidate_selectors/lightx2v_resource_fit_selector.py
+index 2e626fa9..541f8233 100644
+--- a/gpustack/policies/candidate_selectors/lightx2v_resource_fit_selector.py
++++ b/gpustack/policies/candidate_selectors/lightx2v_resource_fit_selector.py
+@@ -1,13 +1,13 @@
+ import logging
+-from typing import List
++from typing import List, Optional
+ 
+ from gpustack.policies.base import ModelInstanceScheduleCandidate
+ from gpustack.policies.candidate_selectors.custom_backend_resource_fit_selector import (
+     CustomBackendResourceFitSelector,
+ )
+ from gpustack.policies.event_recorder.recorder import EventLevelEnum
++from gpustack.policies.resource_view import ResourceView
+ from gpustack.policies.utils import (
+-    get_worker_allocatable_resource,
+     ListMessageBuilder,
+     group_workers_by_gpu_type,
+ )
+@@ -36,7 +36,7 @@ class LightX2VResourceFitSelector(CustomBackendResourceFitSelector):
+     Unlike the VRAM-search selectors (vLLM/SGLang/Custom), LightX2V runs on
+     homogeneous, dedicated nodes with a profile whose GPU count is fixed at
+     deploy time (z_image = 1 card, wan int8 = 4 cards; see
+-    docs/lightx2v-backend-design.md §3/§5). So placement is purely count-based:
++    docs-fork/lightx2v-backend-design.md §3/§5). So placement is purely count-based:
+ 
+     - reserve exactly ``gpus_per_replica`` GPUs on a single worker;
+     - book each chosen GPU's whole free VRAM, so replicas spread one-per-GPU
+@@ -52,8 +52,24 @@ class LightX2VResourceFitSelector(CustomBackendResourceFitSelector):
+     # IndexTTS) override it so ops sees the right engine name.
+     _ENGINE_LABEL = "LightX2V"
+ 
+-    def __init__(self, cfg: Config, model: Model, model_instances: List[ModelInstance]):
+-        super().__init__(cfg, model, model_instances)
++    def __init__(
++        self,
++        cfg: Config,
++        model: Model,
++        model_instances: List[ModelInstance],
++        cpu_only: bool = False,
++        ram_claim: Optional[int] = None,
++        *,
++        resource_view: ResourceView,
++    ):
++        super().__init__(
++            cfg,
++            model,
++            model_instances,
++            cpu_only=cpu_only,
++            ram_claim=ram_claim,
++            resource_view=resource_view,
++        )
+         self._gpus_per_replica = self._resolve_gpus_per_replica(model)
+ 
+     @staticmethod
+@@ -131,9 +147,7 @@ class LightX2VResourceFitSelector(CustomBackendResourceFitSelector):
+                 if not worker.status or not worker.status.gpu_devices:
+                     continue
+ 
+-                allocatable = get_worker_allocatable_resource(
+-                    self._model_instances, worker, gpu_type
+-                )
++                allocatable = self.get_worker_allocatable_resource(worker, gpu_type)
+                 if allocatable.ram < self._ram_claim:
+                     continue
+ 
+@@ -201,9 +215,7 @@ class LightX2VResourceFitSelector(CustomBackendResourceFitSelector):
+                 if not worker or not worker.status or not worker.status.gpu_devices:
+                     continue
+ 
+-                allocatable = get_worker_allocatable_resource(
+-                    self._model_instances, worker, gpu_type
+-                )
++                allocatable = self.get_worker_allocatable_resource(worker, gpu_type)
+                 if allocatable.ram < self._ram_claim:
+                     continue
+ 
+diff --git a/tests/routes/test_least_pending_tie_break.py b/tests/routes/test_least_pending_tie_break.py
+index c3d2daa3..7c04c996 100644
+--- a/tests/routes/test_least_pending_tie_break.py
++++ b/tests/routes/test_least_pending_tie_break.py
+@@ -52,7 +52,7 @@ async def session(tmp_path):
+     cfg.set_main_option("script_location", MIGRATIONS)
+     cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
+     alembic_command.stamp(cfg, PREVIOUS_REVISION)
+-    alembic_command.upgrade(cfg, "head")
++    alembic_command.upgrade(cfg, "b8d4f6a2c1e9")
+ 
+     engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+     async with AsyncSession(engine, expire_on_commit=False) as s:
+diff --git a/tests/routes/test_runtime_config_persistence.py b/tests/routes/test_runtime_config_persistence.py
+index 57ea35a0..90236cd9 100644
+--- a/tests/routes/test_runtime_config_persistence.py
++++ b/tests/routes/test_runtime_config_persistence.py
+@@ -58,7 +58,7 @@ def _build_table_via_migration(db_path) -> None:
+     # create_foreign_key, which SQLite cannot do. Everything from
+     # PREVIOUS_REVISION on is this fork's, and does replay.
+     alembic_command.stamp(cfg, PREVIOUS_REVISION)
+-    alembic_command.upgrade(cfg, "head")
++    alembic_command.upgrade(cfg, "b8d4f6a2c1e9")
+ 
+ 
+ @pytest_asyncio.fixture
+diff --git a/tests/routes/test_video_queue_position.py b/tests/routes/test_video_queue_position.py
+index afeb5a4e..c0e3dc3e 100644
+--- a/tests/routes/test_video_queue_position.py
++++ b/tests/routes/test_video_queue_position.py
+@@ -58,7 +58,7 @@ async def session(tmp_path, config):
+     cfg.set_main_option("script_location", MIGRATIONS)
+     cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
+     alembic_command.stamp(cfg, PREVIOUS_REVISION)
+-    alembic_command.upgrade(cfg, "head")
++    alembic_command.upgrade(cfg, "b8d4f6a2c1e9")
+ 
+     # _queue_info reads the latency table off the global config.
+     config.lightx2v_model_latency_seconds = {MODEL_NAME: LATENCY}

@@ -1,0 +1,144 @@
+diff --git a/gpustack/worker/serve_manager.py b/gpustack/worker/serve_manager.py
+index c7e3bbf9..df163e84 100644
+--- a/gpustack/worker/serve_manager.py
++++ b/gpustack/worker/serve_manager.py
+@@ -108,6 +108,15 @@ from gpustack.worker.inference_backend_manager import InferenceBackendManager
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Instance states where a missing follower container means "not launched yet",
++# not "the server died". Marking ERROR here aborts the other nodes.
++_FOLLOWER_STARTUP_STATES = {
++    ModelInstanceStateEnum.SCHEDULED,
++    ModelInstanceStateEnum.INITIALIZING,
++    ModelInstanceStateEnum.DOWNLOADING,
++    ModelInstanceStateEnum.STARTING,
++}
++
+ # Inference health check error message
+ _INFERENCE_HEALTH_CHECK_FAILED_MESSAGE = "Inference health check failed."
+ 
+@@ -684,6 +693,16 @@ class ServeManager(ContainerLogPersister):
+                 )
+                 workload = get_workload(workload_name)
+ 
++            # fork: the instance turns STARTING before this follower receives the
++            # event and creates its container. Until it has launched against the
++            # current main process group, a missing container is not a failure.
++            if (
++                not workload
++                and not is_main_worker
++                and self._follower_launch_is_stale(model_instance)
++            ):
++                continue
++
+             if workload and workload.state in [
+                 WorkloadStatusStateEnum.PENDING,
+                 WorkloadStatusStateEnum.INITIALIZING,
+@@ -937,6 +956,36 @@ class ServeManager(ContainerLogPersister):
+                     self._error_model_instances.pop(model_instance.id, None)
+                     self._pending_model_instance_errors.pop(model_instance.id, None)
+ 
++    def _follower_startup_pending(self, mi: ModelInstance) -> bool:
++        """Whether a missing follower container is still part of startup."""
++        servers = mi.distributed_servers
++        return bool(
++            servers
++            and servers.mode == DistributedServerCoordinateModeEnum.INITIALIZE_LATER
++            and mi.state in _FOLLOWER_STARTUP_STATES
++        )
++
++    def _follower_launch_is_stale(self, mi: ModelInstance) -> bool:
++        """Whether this follower container joined an older main process group.
++
++        ``mi.pid`` is the main provisioning process. Followers record the pid
++        they launched against. A still-running container from an earlier pid
++        will not join the new TCP store.
++        """
++        if not self._follower_startup_pending(mi) or not mi.pid:
++            return False
++        sw = next(
++            (
++                item
++                for item in mi.distributed_servers.subordinate_workers or []
++                if item.worker_id == self._worker_id
++            ),
++            None,
++        )
++        if sw is None:
++            return False
++        return sw.main_launch_pid != mi.pid
++
+     @staticmethod
+     def _get_main_worker_distributed_state(
+         model_instance: ModelInstance,
+@@ -1480,11 +1529,19 @@ class ServeManager(ContainerLogPersister):
+         deployment_metadata = mi.get_deployment_metadata(self._worker_id)
+         workload_name = deployment_metadata.name if deployment_metadata else mi.name
+         workload = get_workload(workload_name)
+-        if workload and workload.state not in (
+-            WorkloadStatusStateEnum.UNKNOWN,
+-            WorkloadStatusStateEnum.UNHEALTHY,
+-            WorkloadStatusStateEnum.INACTIVE,
+-            WorkloadStatusStateEnum.FAILED,
++        # fork: a container that joined a previous main process group never
++        # joins the new one (the TCP store waits for the missing rank forever).
++        stale = workload is not None and self._follower_launch_is_stale(mi)
++        if (
++            workload
++            and not stale
++            and workload.state
++            not in (
++                WorkloadStatusStateEnum.UNKNOWN,
++                WorkloadStatusStateEnum.UNHEALTHY,
++                WorkloadStatusStateEnum.INACTIVE,
++                WorkloadStatusStateEnum.FAILED,
++            )
+         ):
+             return
+ 
+@@ -1500,8 +1557,12 @@ class ServeManager(ContainerLogPersister):
+         )
+         # The parent can still be STARTING after this follower fails. Its
+         # local state distinguishes first launch from recovery on later events.
+-        if not initial_start and not self._auto_restart_enabled(
+-            mi, use_cache=not bool(mi.group_id)
++        # fork: a stale follower is replaced regardless of the recovery policy;
++        # it is part of the main's (re)start, not a recovery of its own.
++        if (
++            not stale
++            and not initial_start
++            and not self._auto_restart_enabled(mi, use_cache=not bool(mi.group_id))
+         ):
+             logger.debug(
+                 "Skipping recovery of model instance %s on worker %s: "
+@@ -1514,9 +1575,15 @@ class ServeManager(ContainerLogPersister):
+         if workload:
+             self._stop_model_instance(mi, clear_restart_backoff=False)
+         self._start_model_instance(mi)
+-        logger.trace(
+-            f"UPDATED event: started model instance {mi.name} on subordinate worker."
+-        )
++        if stale:
++            logger.info(
++                f"Restarted subordinate workload {workload_name} for {mi.name}: "
++                "main process group changed."
++            )
++        else:
++            logger.trace(
++                f"UPDATED event: started model instance {mi.name} on subordinate worker."
++            )
+ 
+     def _get_numbered_log_path(self, mi: ModelInstance) -> str:
+         """Get log file path with restart count.
+@@ -2061,7 +2128,10 @@ class ServeManager(ContainerLogPersister):
+                     == DistributedServerCoordinateModeEnum.INITIALIZE_LATER
+                 ):
+                     sw.state = ModelInstanceStateEnum.RUNNING
++                sw.state_message = ""
+                 sw.pid = process.pid
++                # fork: remember which main process group this follower joined.
++                sw.main_launch_pid = mi.pid
+                 patch_dict = {
+                     f"distributed_servers.subordinate_workers.{sw_pos}": sw,
+                 }

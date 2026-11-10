@@ -1,0 +1,38 @@
+diff --git a/src/config/settings.ts b/src/config/settings.ts
+index c00c51b3..e38efcca 100644
+--- a/src/config/settings.ts
++++ b/src/config/settings.ts
+@@ -45,6 +45,7 @@ export const PaginationKey = {
+   APIKeys: 'APIKeys',
+   Credentials: 'Credentials',
+   Instances: 'Instances',
++  VideoTasks: 'VideoTasks',
+   InstanceTypes: 'InstanceTypes',
+   CacheServices: 'CacheServices'
+ };
+diff --git a/src/locales/ja-JP/menu.ts b/src/locales/ja-JP/menu.ts
+index bf0b1733..f6e952e2 100644
+--- a/src/locales/ja-JP/menu.ts
++++ b/src/locales/ja-JP/menu.ts
+@@ -34,6 +34,8 @@ export default {
+   'menu.settings': '設定',
+   'menu.resources.workers': 'Worker',
+   'menu.resources.gpus': 'GPUs',
++  'menu.resources.videoTasks': '生成タスク',
++  'menu.resources.storageSettings': '動画ストレージ',
+   'menu.models.modelfiles': 'モデルファイル',
+   'menu.accessControl': 'アクセス制御',
+   'menu.accessControl.apikeys': 'API キー',
+diff --git a/src/locales/ru-RU/menu.ts b/src/locales/ru-RU/menu.ts
+index ffeaa868..5b4796d1 100644
+--- a/src/locales/ru-RU/menu.ts
++++ b/src/locales/ru-RU/menu.ts
+@@ -33,6 +33,8 @@ export default {
+   'menu.404': 'Ошибка 404',
+   'menu.resources.workers': 'Worker',
+   'menu.resources.gpus': 'GPUs',
++  'menu.resources.videoTasks': 'Задачи генерации',
++  'menu.resources.storageSettings': 'Хранилище видео',
+   'menu.models.modelfiles': 'Файлы моделей',
+   'menu.accessControl': 'Управление доступом',
+   'menu.accessControl.apikeys': 'API-ключи',

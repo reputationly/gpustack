@@ -1,0 +1,198 @@
+diff --git a/gpustack/server/server.py b/gpustack/server/server.py
+index caeb81dd..2f3b75f9 100644
+--- a/gpustack/server/server.py
++++ b/gpustack/server/server.py
+@@ -48,7 +48,7 @@ from gpustack.security import (
+ from gpustack.server.app import create_app
+ from gpustack.server.passwords import set_password
+ from gpustack.server.services import provision_bootstrap_admin_orgs
+-from gpustack.config.config import Config
++from gpustack.config.config import Config, set_global_config
+ from gpustack.schemas.config import GatewayModeEnum
+ from gpustack.config import registration
+ from gpustack.server.pd_mode_catalog import load_pd_modes
+@@ -101,6 +101,8 @@ from gpustack.schemas.metered_usage import MeteredUsage, MeteredUsageArchive
+ from gpustack.schemas.resource_events import ResourceEvent, ResourceEventArchive
+ from gpustack.server.worker_instance_cleaner import WorkerInstanceCleaner
+ from gpustack.server.worker_syncer import WorkerSyncer
++from gpustack.server.video_task_sweeper import VideoTaskSweeper
++from gpustack.server.video_storage_janitor import VideoStorageJanitor
+ from gpustack.server.scaling_scheduler import ScalingScheduler
+ from gpustack.utils.platform import is_inside_kubernetes
+ from gpustack.utils.process import add_signal_handlers_in_loop
+@@ -286,6 +288,11 @@ class Server:
+ 
+         self._run_migrations()
+         await self._prepare_data()
++        await self._apply_persisted_config()
++
++        # Fail-fast NFS check (runs on every server — the /videos facade serves
++        # everywhere and reads pre-materialized inputs off the shared mount).
++        self._probe_lightx2v_nfs()
+ 
+         self._validate_configured_model_catalog()
+         # Validate the PD-mode catalog here rather than on first lookup: a
+@@ -423,6 +430,81 @@ class Server:
+             raise RuntimeError(f"Database migration failed: {e}") from e
+         logger.info("Database migration completed.")
+ 
++    async def _apply_persisted_config(self):
++        """Replay the config overrides stored by ``PUT /v2/config``.
++
++        **Persisted overrides win over the startup configuration** (CLI args,
++        ``--config-file`` YAML, env). That ordering is the entire point: a value
++        an operator changed in the UI has to still be there after the next image
++        upgrade. Startup arguments are the *initial* configuration, not a
++        standing instruction — before this table existed, every upgrade silently
++        reverted the admission tuning and nobody found out until a model started
++        getting 429s at the wrong depth.
++
++        The cost of that ordering is that editing a startup argument stops
++        taking effect once the same field has an override row, which is
++        invisible unless we say so. Hence the per-field log line naming the
++        startup value that lost, and how to drop the row.
++
++        Runs after ``_prepare_data`` (database ready) and before the app is
++        built, so every consumer of ``get_global_config`` sees the final values.
++        Never fatal: a server that cannot read this table must still boot on its
++        startup configuration rather than refuse to start.
++        """
++        from gpustack.schemas.runtime_config import RuntimeConfig
++        from gpustack.utils.config import (
++            WHITELIST_CONFIG_FIELDS,
++            apply_config_side_effects,
++        )
++
++        try:
++            async with async_session() as session:
++                rows = await RuntimeConfig.all(session)
++        except Exception as e:
++            logger.warning(
++                "Could not read persisted runtime config, "
++                "continuing with the startup configuration: %s",
++                e,
++            )
++            return
++
++        applied = []
++        for row in rows:
++            # A field dropped from the whitelist between releases keeps its row
++            # (so a rollback still finds it) but must not be re-applied.
++            if row.key not in WHITELIST_CONFIG_FIELDS:
++                logger.warning(
++                    "Ignoring persisted runtime config %r: no longer a "
++                    "settable field.",
++                    row.key,
++                )
++                continue
++            previous = getattr(self._config, row.key, None)
++            if previous == row.value:
++                continue
++            setattr(self._config, row.key, row.value)
++            applied.append((row.key, previous, row.value))
++
++        if not applied:
++            return
++
++        set_global_config(self._config)
++        # Same process-level effects the request path applies. Without this a
++        # persisted debug=True would restore config.debug but leave the root
++        # logger at INFO — setup_logging() cannot fix it later because
++        # basicConfig is a no-op once handlers exist.
++        apply_config_side_effects({key: value for key, _, value in applied})
++        for key, previous, value in applied:
++            logger.info(
++                "Runtime config from database: %s = %r "
++                "(startup configuration said %r; "
++                "delete from runtime_configs where key='%s' to go back to it)",
++                key,
++                value,
++                previous,
++                key,
++            )
++
+     async def _prepare_data(self):
+         self._setup_data_dir(self._config.data_dir)
+ 
+@@ -549,6 +631,68 @@ class Server:
+ 
+         logger.debug("Worker syncer started.")
+ 
++    def _start_video_task_sweeper(self, app: FastAPI):
++        sweeper = VideoTaskSweeper(
++            lambda: getattr(app.state, "http_client", None),
++            lambda: getattr(app.state, "http_client_no_proxy", None),
++        )
++        self._create_async_task(sweeper.start())
++
++        logger.debug("Video task sweeper started.")
++
++    def _start_video_storage_janitor(self):
++        self._create_async_task(VideoStorageJanitor().start())
++
++        logger.debug("Video storage janitor started.")
++
++    def _probe_lightx2v_nfs(self):
++        """Verify the LightX2V shared NFS root (<output_root>/inputs) is mounted
++        and read/write-able. new-api writes inputs there and the facade reads
++        them, so both sides must mount the SAME absolute path (§6). Fatal only
++        when lightx2v_require_nfs is set (production video deployments); otherwise
++        a loud warning so a vanilla/dev server without NFS still boots."""
++        from gpustack.routes.videos import _output_root
++
++        root = _output_root()
++        inputs_dir = os.path.join(root, "inputs")
++        require = bool(getattr(self._config, "lightx2v_require_nfs", False))
++
++        def _fail(reason: str):
++            msg = (
++                f"LightX2V NFS check failed at {root}: {reason}. Generation "
++                "inputs and results need this shared NFS mounted and writable "
++                "(must match new-api's NFSRoot)."
++            )
++            if require:
++                logger.error(msg + " lightx2v_require_nfs is set — aborting.")
++                raise SystemExit(1)
++            logger.warning(msg + " Continuing (set lightx2v_require_nfs to enforce).")
++
++        # The root itself must ALREADY exist as a mounted directory — we only
++        # auto-create the inputs/ SUBdir. Auto-creating a missing root would let
++        # a server whose NFS failed to mount silently pass on local disk (then
++        # gpustack and new-api are no longer sharing the same filesystem).
++        if not os.path.isdir(root):
++            return _fail("root directory does not exist (NFS not mounted?)")
++        if not os.path.ismount(root):
++            # A leftover local dir at <root> would let the read/write probe below
++            # pass on local disk while the NFS is actually unmounted (split
++            # storage vs new-api). In require mode this is fatal; otherwise warn.
++            # The deployment bind-mounts <root> as a real mountpoint (lx2v-node.sh
++            # ensure_mount /nfs-output), so ismount is the positive check.
++            return _fail("root is not a mount point (NFS not mounted?)")
++        try:
++            os.makedirs(inputs_dir, exist_ok=True)
++            probe = os.path.join(inputs_dir, f".probe-{os.urandom(8).hex()}")
++            with open(probe, "wb") as f:
++                f.write(b"ok")
++            with open(probe, "rb") as f:
++                f.read()
++            os.remove(probe)
++        except Exception as e:
++            return _fail(f"inputs/ not read/write-able: {e}")
++        logger.info(f"LightX2V NFS root OK: {inputs_dir}")
++
+     def _start_worker_status_flusher(self):
+         self._create_async_task(flush_worker_status_to_db())
+ 
+@@ -1595,6 +1739,12 @@ class Server:
+         # Worker Syncer (checks worker reachability and updates states)
+         self._start_worker_syncer(self._app)
+ 
++        # Video task sweeper (LightX2V death-requeue + re-dispatch)
++        self._start_video_task_sweeper(self._app)
++
++        # Video storage janitor (LightX2V NFS TTL + watermark eviction)
++        self._start_video_storage_janitor()
++
+         # Scaling Scheduler (drives model replicas on a cron timetable)
+         self._start_scaling_scheduler()
+ 

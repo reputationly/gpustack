@@ -1,0 +1,15 @@
+diff --git a/.dockerignore b/.dockerignore
+index 793904c8..6ae32803 100644
+--- a/.dockerignore
++++ b/.dockerignore
+@@ -11,6 +11,10 @@ dist/
+ .python-version
+ .data
+ 
++# CI-only staging dirs (pack-acr-overlay checks out gpustack-ui here; keep the
++# docker build context lean)
++gpustack-ui-src/
++
+ # Offline docs are built in their own stage.
+ gpustack/help/
+ mkdocs.offline.generated.yml

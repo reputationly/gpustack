@@ -1,0 +1,109 @@
+diff --git a/.github/workflows/pack-acr-overlay.yml b/.github/workflows/pack-acr-overlay.yml
+index c148b301..ddb5fae0 100644
+--- a/.github/workflows/pack-acr-overlay.yml
++++ b/.github/workflows/pack-acr-overlay.yml
+@@ -21,7 +21,7 @@ on:
+     inputs:
+       base_image:
+         description: 'Base GPUStack image (multi-arch, already in ACR). Pin to the upstream release this repo is merged up to — NOT :latest.'
+-        default: 'crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:v2.2.3'
++        default: 'crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:v2.3.0'
+         required: true
+       dest_tag:
+         description: 'Floating ACR tag to publish'
+diff --git a/hack/upstream-base.env b/hack/upstream-base.env
+index a1928c28..31f5eb88 100644
+--- a/hack/upstream-base.env
++++ b/hack/upstream-base.env
+@@ -9,5 +9,5 @@
+ # re-sync the ACR base image, then update this file and the two BASE_IMAGE
+ # defaults in the same commit.
+ #
+-#   SRC=quay.io/gpustack/gpustack:v2.2.3 ./hack/sync-image-to-acr.sh v2.2.3
+-UPSTREAM_BASE=v2.2.3
++#   SRC=quay.io/gpustack/gpustack:v2.3.0 ./hack/sync-image-to-acr.sh v2.3.0
++UPSTREAM_BASE=v2.3.0
+diff --git a/pack/Dockerfile.acr b/pack/Dockerfile.acr
+index fc53aaa7..a200364b 100644
+--- a/pack/Dockerfile.acr
++++ b/pack/Dockerfile.acr
+@@ -14,7 +14,7 @@
+ #
+ # Build (from repo root) and push to ACR:
+ #   docker build -f pack/Dockerfile.acr \
+-#     --build-arg BASE_IMAGE=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:v2.2.3 \
++#     --build-arg BASE_IMAGE=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:v2.3.0 \
+ #     -t crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:lx2v-dev .
+ #   docker push crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:lx2v-dev
+ #
+@@ -23,12 +23,12 @@
+ # buildx) so the base layers match the target node.
+ #
+ # NOTE on BASE_IMAGE: pin it to the SAME upstream release this repo is merged up
+-# to (currently v2.2.3), never a floating :latest. The overlay whole-file
++# to (currently v2.3.0), never a floating :latest. The overlay whole-file
+ # overwrites ~38 modules; if the base is a different release those files silently
+ # downgrade half the image while the rest stays newer. Sync the base first:
+-#   SRC=quay.io/gpustack/gpustack:v2.2.3 ./hack/sync-image-to-acr.sh v2.2.3
++#   SRC=quay.io/gpustack/gpustack:v2.3.0 ./hack/sync-image-to-acr.sh v2.3.0
+ 
+-ARG BASE_IMAGE=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:v2.2.3
++ARG BASE_IMAGE=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/gpustack:v2.3.0
+ FROM ${BASE_IMAGE}
+ 
+ # Stage the changed files, preserving their package-relative paths.
+@@ -88,6 +88,8 @@ COPY gpustack/schemas/runtime_config.py                                      /tm
+ COPY gpustack/server/init_db.py                                              /tmp/lx2v-overlay/server/init_db.py
+ COPY gpustack/migrations/versions/2026_09_02_1200-a7c3e5d19b42_add_runtime_configs.py       /tmp/lx2v-overlay/migrations/versions/2026_09_02_1200-a7c3e5d19b42_add_runtime_configs.py
+ COPY gpustack/migrations/versions/2026_09_02_1800-b8d4f6a2c1e9_add_video_task_assigned_at.py /tmp/lx2v-overlay/migrations/versions/2026_09_02_1800-b8d4f6a2c1e9_add_video_task_assigned_at.py
++# Merge revision joining the fork chain and the upstream v2.3.0 chain.
++COPY gpustack/migrations/versions/2026_11_10_1200-d9f0a1b2c3e4_merge_fork_and_upstream_v2_3_0.py /tmp/lx2v-overlay/migrations/versions/2026_11_10_1200-d9f0a1b2c3e4_merge_fork_and_upstream_v2_3_0.py
+ COPY gpustack/routes/video_tasks.py                                          /tmp/lx2v-overlay/routes/video_tasks.py
+ COPY gpustack/routes/videos.py                                               /tmp/lx2v-overlay/routes/videos.py
+ COPY gpustack/routes/benchmarks.py                                           /tmp/lx2v-overlay/routes/benchmarks.py
+@@ -112,27 +114,23 @@ COPY pack/ui-dist/ /tmp/lx2v-ui/
+ # Copy them onto the installed gpustack package (path detected at build time),
+ # then byte-compile the new modules to fail fast on any import/syntax error.
+ #
+-# Migration chain fix-up: our repo's FIRST migration declares down_revision =
+-# <fork HEAD's previous migration>, but the BASE image ships only the released
+-# migration chain, which may not contain that revision (upstream-main
+-# migrations that never made the release must NOT be copied in — their code
+-# isn't in the image). So detect the base image's actual alembic head BEFORE
+-# overlaying, then rewrite that migration's down_revision to it, and assert the
+-# resulting chain resolves to our LAST revision as the single head.
++# Migration chain: the fork's migrations and the base image's (upstream) ones
++# both descend from c4d7e8f9a0b1 and are joined by a two-parent merge revision
++# (d9f0a1b2c3e4). Nothing is rewritten at build time: a database already
++# stamped at the fork head must still run every upstream migration.
+ #
+-# Only the chain ROOT (e1f2a3b4c5d6) is rewritten; our later migrations stay
+-# chained to it. Adding one means: COPY it in above, and update the head
+-# assertion below to its revision id.
++# Guard 1: the base image's head must be the upstream parent of the merge
++# revision. Changing BASE_IMAGE to a release with new migrations requires a new
++# merge revision first.
++# Guard 2: after the overlay there is exactly one head, the merge revision.
+ RUN set -eux; \
+     GP_DIR="$(python3 -c 'import gpustack, os; print(os.path.dirname(gpustack.__file__))')"; \
+     BASE_HEAD="$(python3 -c "from alembic.config import Config; from alembic.script import ScriptDirectory; c=Config(); c.set_main_option('script_location', '${GP_DIR}/migrations'); print(ScriptDirectory.from_config(c).get_current_head())")"; \
+     echo "base image alembic head: ${BASE_HEAD}"; \
++    test "${BASE_HEAD}" = "a7e2c9d4f681" || { echo "base image alembic head ${BASE_HEAD} != a7e2c9d4f681: add a new merge revision before changing BASE_IMAGE"; exit 1; }; \
+     cp -rv /tmp/lx2v-overlay/. "${GP_DIR}/"; \
+     rm -rf /tmp/lx2v-overlay; \
+-    MIG_FILE="${GP_DIR}/migrations/versions/2026_07_05_2230-e1f2a3b4c5d6_add_video_generation_tasks.py"; \
+-    sed -i "s/^down_revision: Union\[str, None\] = .*/down_revision: Union[str, None] = '${BASE_HEAD}'/" "${MIG_FILE}"; \
+-    grep -n "^down_revision" "${MIG_FILE}"; \
+-    python3 -c "from alembic.config import Config; from alembic.script import ScriptDirectory; c=Config(); c.set_main_option('script_location', '${GP_DIR}/migrations'); h=ScriptDirectory.from_config(c).get_current_head(); assert h == 'b8d4f6a2c1e9', h; print('migration chain OK, head=' + h)"; \
++    python3 -c "from alembic.config import Config; from alembic.script import ScriptDirectory; c=Config(); c.set_main_option('script_location', '${GP_DIR}/migrations'); h=ScriptDirectory.from_config(c).get_heads(); assert h == ['d9f0a1b2c3e4'], h; print('migration chain OK, head=' + h[0])"; \
+     python3 -m py_compile \
+         "${GP_DIR}/worker/backends/lightx2v.py" \
+         "${GP_DIR}/worker/backends/indextts.py" \
+@@ -165,6 +163,7 @@ RUN set -eux; \
+         "${GP_DIR}/migrations/versions/2026_08_11_1030-f3a1b2c4d5e7_add_video_task_progress.py" \
+         "${GP_DIR}/migrations/versions/2026_09_02_1200-a7c3e5d19b42_add_runtime_configs.py" \
+         "${GP_DIR}/migrations/versions/2026_09_02_1800-b8d4f6a2c1e9_add_video_task_assigned_at.py" \
++        "${GP_DIR}/migrations/versions/2026_11_10_1200-d9f0a1b2c3e4_merge_fork_and_upstream_v2_3_0.py" \
+         "${GP_DIR}/schemas/runtime_config.py" \
+         "${GP_DIR}/routes/config.py" \
+         "${GP_DIR}/server/init_db.py"; \
