@@ -51,7 +51,7 @@ git checkout -b chore/upstream-v2.3.0 origin/main
 git merge --no-ff --no-commit v2.3.0
 ```
 
-本文档和 `ref-patches/` 在后端仓库的分支 `docs/upgrade-v2.3.0-dev-guide` 上，路径 `docs-fork/upstream-sync/`。合并开始之前或提交 merge commit 之后，把那个分支上唯一的文档提交带进升级分支（`git cherry-pick origin/docs/upgrade-v2.3.0-dev-guide`），让文档随升级一起落地。
+本文档和 `ref-patches/` 在后端仓库的分支 `docs/upgrade-v2.3.0-dev-guide` 上，路径 `docs-fork/upstream-sync/`。提交 merge commit 之后，把这个目录带进升级分支单独提交（`git checkout origin/docs/upgrade-v2.3.0-dev-guide -- docs-fork/upstream-sync && git commit -m "文档：v2.3.0 升级开发与自测文档"`），让文档随升级一起落地。
 
 前端同名分支 `chore/upstream-v2.3.0`，见 §7。
 
@@ -400,7 +400,7 @@ grep -c "self.get_worker_allocatable_resource(worker, gpu_type)" gpustack/polici
 grep -rn "ResourceFitSelector(" gpustack --include=*.py | grep -v "resource_view" | grep -v "^gpustack/policies/candidate_selectors/.*class "        # 人工看：不应有漏传 resource_view 的构造
 ```
 
-**新增测试 `tests/policies/test_fork_selectors.py`**（现在 `tests/` 下没有任何我方 7 个选择器的测试）。我已在试合并上写好并跑通（27 passed），文件在 `ref-patches/test_fork_selectors.py`，直接拷进去。覆盖：
+**新增测试 `tests/policies/test_fork_selectors.py`**（现在 `tests/` 下没有任何我方 7 个选择器的测试）。我已在试合并上写好并跑通（27 passed），文件在 `ref-patches/test_fork_selectors.py.ref`，直接拷进去。覆盖：
 
 | 用例 | 断言 |
 |---|---|
@@ -1283,16 +1283,18 @@ pnpm install --frozen-lockfile && pnpm run check:locales && pnpm test && pnpm ru
 | `pack.yaml.vs-v2.3.0.diff` | A3 | 7 行 |
 | `gpustack_scheduler_scheduler.py.vs-v2.3.0.diff` | C1 | 只有新增行 |
 | `fork-files.vs-origin-main.diff` | D1、D2 | `lightx2v_resource_fit_selector.py` 的适配；3 个测试 fixture |
-| `test_fork_selectors.py` | D1 | 新增测试，放到 `tests/policies/`，27 个用例 |
+| `test_fork_selectors.py.ref` | D1 | 新增测试，放到 `tests/policies/`，27 个用例 |
 | `gpustack_server_controllers.py.vs-v2.3.0.diff` | C2 | |
-| `test_builtin_backend_backfill.py` | C2 | 新增测试，放到 `tests/server/`，4 个用例 |
+| `test_builtin_backend_backfill.py.ref` | C2 | 新增测试，放到 `tests/server/`，4 个用例 |
 | `gpustack_server_server.py.vs-v2.3.0.diff` | C3 | |
 | `serve_manager.vs-v2.3.0.diff` | C4 | 85 行增删 |
 | `2026_11_10_1200-d9f0a1b2c3e4_merge_fork_and_upstream_v2_3_0.py` | D2 | merge revision，放到 `gpustack/migrations/versions/` |
-| `test_single_head.py` | D2 | 新增测试，放到 `tests/migrations/`，3 个用例 |
+| `test_single_head.py.ref` | D2 | 新增测试，放到 `tests/migrations/`，3 个用例 |
 | `overlay-files.vs-origin-main.diff` | D3 | `pack/Dockerfile.acr`、`hack/upstream-base.env`、`pack-acr-overlay.yml` |
 | `ui-conflicts.vs-ui-v2.3.0.diff` | §7.1 | 前端 5 个冲突文件解完后的差异 |
 | `ui-task-inputs-test.vs-fork-main.diff` | §7.2 | 视频测试从 Vitest 改到 `node:test` |
+
+三个 `.py.ref` 是完整的测试文件，复制到目标目录时去掉 `.ref` 后缀。加这个后缀是因为仓库的 `pytest.ini` 没有限定 `testpaths`，`make test` 会收集整个仓库里的 `test_*.py`。
 
 D4（文档搬家）没有补丁，按该节的命令执行即可。
 
