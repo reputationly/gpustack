@@ -8,6 +8,47 @@ GPUStack organizes worker nodes into [clusters](../user-guide/cluster-management
 
     2. Upgrade a worker to the **same version** as the server. Do not mix a `main`(dev) or release candidate(rc) worker image with a stable server.
 
+!!! warning "Compare the build, not the `/version` string"
+
+    `/version` returns the version string compiled into the Python package, so a **fork build
+    reports the upstream release it was based on** (e.g. `v2.2.3` / `1cfcbbf`) even though the
+    image is a local rebuild. Concluding "the worker is older, so I may swap in the upstream
+    image" from that string is wrong and can take the cluster down.
+
+    Read the identity of both sides from the image labels instead:
+
+    ```bash
+    # server (on the server host)
+    docker inspect gpustack-server --format \
+      '{{index .Config.Labels "org.opencontainers.image.version"}} {{index .Config.Labels "org.opencontainers.image.revision"}}'
+    # one worker
+    docker inspect gpustack-worker --format \
+      '{{index .Config.Labels "org.opencontainers.image.version"}} {{index .Config.Labels "org.opencontainers.image.revision"}}'
+    ```
+
+    The two must name the **same build** (same `version`/`revision`). If they do, they already
+    match and there is nothing to upgrade — even when `/version` shows a stable release.
+
+    Replacing a fork worker with the upstream image of the same release mixes backend metadata:
+    the worker reports a different set of supported frameworks, the scheduler filters every
+    worker out, and every model instance turns `pending` with
+
+    ```
+    Worker <name> does not support backend version <v> or the backend version not exists.
+    ```
+
+    (2026-11-15 incident on this deployment: server and workers were both
+    `lx2v-20260924-0656-450e453f`; swapping the workers to upstream `v2.2.3` broke scheduling for
+    all 67 replicas until the workers were rolled back.)
+
+    Rollback is cheap when the previous container was kept: rename it back and start it, e.g.
+    `docker rm -f gpustack-worker-new && docker rename gpustack-worker gpustack-worker-new &&
+    docker rename gpustack-worker-prev gpustack-worker && docker start gpustack-worker`.
+
+    To actually move to a newer base, upgrade the **fork** — rebuild both the server and the
+    worker images from the rebased branch, then canary a single worker and confirm model
+    instances schedule before rolling the remaining nodes.
+
 The upgrade procedure mirrors how the cluster was originally deployed (see [Cluster Management](../user-guide/cluster-management.md)): re-run the deployment for a Docker cluster, or re-apply the manifests for a Kubernetes cluster, using the new image.
 
 ## Docker Cluster
