@@ -1743,6 +1743,12 @@ async def fetch_engine_status_updates(
         # should become, and progress without a state would be meaningless.
         return None
     updates: Dict[str, Any] = {"state": new_state}
+    if new_state == VideoTaskStateEnum.DONE:
+        # Billable usage comes from the engine once, at completion. Keep it verbatim:
+        # GPUStack does not know the tariff and must not re-derive token counts.
+        usage = status.get("usage")
+        if isinstance(usage, dict):
+            updates["usage"] = usage
     if new_state == VideoTaskStateEnum.FAILED:
         updates["state_message"] = status.get("error")
         updates["error_type"] = status.get("error_type") or None
@@ -1919,6 +1925,9 @@ def _public(task: VideoGenerationTask) -> Dict[str, Any]:
         "nfs_path": task.nfs_path if done else None,
         "error": task.state_message,
         "error_type": task.error_type,
+        # Billable usage, only meaningful once the task is done (that is the only
+        # point where the engine has produced it).
+        "usage": task.usage if done else None,
         "progress": 100.0 if done else round(task.progress or 0.0, 1),
         "phase": task.phase,
     }

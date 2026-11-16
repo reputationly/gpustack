@@ -100,6 +100,13 @@ class VideoTaskBase(SQLModel):
     # Result location. GPUStack only writes NFS and returns nfs_path (§7.3);
     # new-api reads it and owns OBS upload / delivery URLs.
     nfs_path: Optional[str] = Field(default=None)
+
+    # Billable usage reported by the engine for this task (token/pixel counts in the
+    # vendor-compatible shape, see vllm-omni's ``vllm_omni.metrics.usage``). Stored
+    # verbatim and never interpreted here: GPUStack forwards it, new-api prices it.
+    # Persisted rather than cached because the billing poll can arrive long after the
+    # engine task is gone (instance reaped), and a missing record silently loses money.
+    usage: Optional[Dict[str, Any]] = Field(sa_column=Column(JSON), default=None)
     # The lightx2v_output_root in effect when the task was created. nfs_path is
     # validated against THIS root (not the live config value), so editing the
     # root at runtime doesn't invalidate previously generated results.
