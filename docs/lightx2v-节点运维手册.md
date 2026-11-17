@@ -45,6 +45,8 @@ bash /root/lx2v-node.sh prepare-transfer
 > **要一次接入多台全新节点?** 看 **§1.6 批量扩容** —— `lx2v-fleet.sh` 对全新节点用不了(它从 NFS 拉脚本,而新节点还没挂 NFS),必须先 scp + `setup-base` 把 NFS 挂上再让 fleet 接管。
 >
 > **要做一次现网升级?** 别拼上面这些单条命令 —— 直接整段复制 **§2.5 标准升级流程**,它已按正确顺序串好(打回滚锚 → server → worker → 引擎 → UI 重建),漏一步就可能出事(如回滚锚必须在 `docker pull` 之前打)。
+>
+> **换引擎前必须先做 §2.5 ⑤.0 的"基座一致性判定"**:新旧镜像底层 layer 前缀一致(同一 base)才走在线增量拉;base 变了必须 `--offline` 读整份 tar。分不清就一直 `--offline`,慢但一定对。
 
 - 所有命令须 **root** 执行,脚本放任意路径均可;
 - 全程日志:`/var/log/lx2v-node-<日期>.log`;每步打印 `[step i/N] 时间` 和耗时,长任务(load/pull/save)有进度输出——**长时间无输出再怀疑卡住,先看当前 step 是什么**(toolkit 在线下载 5-8 分钟、引擎 tar load 4-5 分钟都是正常的);
@@ -633,6 +635,38 @@ docker exec gpustack-server su postgres -c \
 bash /root/lx2v-fleet.sh -j 5 upgrade-gpustack
 
 # ⑤ 全 worker 换引擎镜像 —— 只列这次变了的,没变的别动(改这里)
+#
+# ⚠️ 换引擎前**先判基座是否一致**,再决定在线还是 --offline(见下方 ⑤.0)。
+#    基座一致 -> 在线增量拉(快);基座变了 -> 必须 --offline 读整份 tar。
+#
+# ⑤.0 基座一致性判定(必须做,否则可能"拉到了但跑不起来"或"白等 40 分钟")
+#   在线升级只下**增量层**,前提是新旧镜像共享同一 base。基座一旦换了
+#   (如 vllm 0.31 -> 0.33),底层 so/驱动层全变,增量层就没意义;此时在线拉要么慢成
+#   全量、要么被 ACR 限流后**静默回退旧 NFS tar**(坑 #29,FAIL=0 照样全绿)。
+#   判定方法:比新旧镜像的**底层 layer 前缀**,一致即同一基座。
+#
+#   # 在 238 上、② prepare-transfer 之后执行(它已把新 arm64 tag 拉到本机)
+#   OLD_ID=$(docker inspect --format '{{.Image}}' $(docker ps -qf name=gpustack-server))   # gpustack 的旧镜像
+#   NEW_REF=<要升的镜像:tag>            # 例:…/vllm-omni:arm64-a100-latest
+#   old_base=$(docker image inspect --format '{{range .RootFS.Layers}}{{println .}}{{end}}' "$OLD_ID" | head -30 | md5sum)
+#   new_base=$(docker image inspect --format '{{range .RootFS.Layers}}{{println .}}{{end}}' "$NEW_REF" | head -30 | md5sum)
+#   [ "$old_base" = "$new_base" ] && echo "SAME BASE -> 在线升级" || echo "BASE 变了 -> 用 --offline"
+#
+#   引擎镜像(gpu 节点上跑的那几个)同理:拿节点上**当前在跑的镜像 ID** 与本机新 tag 比,
+#   不是拿两个 tag 比(tag 已被 pull 覆盖成新版,比 tag 永远是"一致")。
+#   节点上取旧镜像 ID:
+#   ssh root@<ip> 'RI=$(docker inspect --format "{{.Image}}" gpustack-worker); docker image inspect --format "{{range .RootFS.Layers}}{{println .}}{{end}}" $RI | head -30 | md5sum'
+#
+#   判为"同一基座"时,建议顺序(实测 2026-11-17,base 未变的引擎升级):
+#     bash /root/lx2v-node.sh prepare-transfer          # 先 save:把新镜像同步成 NFS tar 兜底
+#     bash /root/lx2v-fleet.sh -j 5 upgrade-engine --engine vllm-omni   # 在线增量拉
+#   tar 只是 ACR 限流时的兜底,**不要**为了省事直接 --offline:16G tar 逐台读比增量慢得多。
+#
+#   判为"基座变了"时:必须
+#     bash /root/lx2v-node.sh prepare-transfer
+#     bash /root/lx2v-fleet.sh -j 5 upgrade-engine --engine vllm-omni --offline
+#   并复核节点上镜像 label 的 revision 与本次 commit 一致(见 ⑦b)。
+
 bash /root/lx2v-fleet.sh -j 5 upgrade-engine --engine lightx2v
 bash /root/lx2v-fleet.sh -j 5 upgrade-engine --engine vllm-omni
 # 可选:acestep;indextts / bernini 已下线,只在明确需要时手动指定
