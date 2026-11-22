@@ -1,15 +1,19 @@
 from unittest.mock import MagicMock
 
-from gpustack.gateway import transformer_plugin
+from gpustack.config.config import GatewayModeEnum
+from gpustack.gateway import ext_auth_plugin, transformer_plugin
 from gpustack.gateway.client.networking_istio_io_v1alpha3_api import (
+    ApplyToStringEnum,
+    OperationStringEnum,
     get_4xx_5xx_fallback_value,
+    get_fallback_auth_cache_envoyfilter,
     get_ingress_fallback_envoyfilter,
 )
 from gpustack.gateway.utils import (
     gpustack_fallback_path_header,
     gpustack_original_path_header,
 )
-
+from gpustack.security import AUTH_CACHE_HEADER
 
 FALLBACK_PATH_VALUE_EXPR = f"%REQ({gpustack_original_path_header.upper()})%"
 
@@ -119,6 +123,43 @@ def test_get_ingress_fallback_envoyfilter_shape():
     policy = _redirect_policy(patch.patch.value)
     req_keys = [h["header"]["key"] for h in policy["request_headers_to_add"]]
     assert gpustack_fallback_path_header in req_keys
+
+
+def test_fallback_recovers_auth_cache_from_stream_metadata_only():
+    cfg = MagicMock(
+        gateway_mode=GatewayModeEnum.incluster,
+        gateway_namespace="higress-system",
+        gateway_plugin_server_url=None,
+    )
+    cfg.get_namespace.return_value = cfg.gateway_namespace
+    ext_auth_name, _ = ext_auth_plugin(cfg)
+    cache_filter = get_fallback_auth_cache_envoyfilter(
+        cfg.gateway_namespace, ext_auth_name, {}
+    )
+    (patch,) = cache_filter.spec.configPatches
+    assert patch.applyTo == ApplyToStringEnum.HTTP_FILTER
+    assert patch.patch.operation == OperationStringEnum.INSERT_AFTER
+    assert patch.match.listener.filterChain["filter"]["subFilter"]["name"] == (
+        f"higress-system.{ext_auth_name}"
+    )
+    (rule,) = patch.patch.value["typed_config"]["request_rules"]
+    assert rule["header"] == AUTH_CACHE_HEADER
+    metadata = rule["on_header_present"]
+    expression = (
+        f"%DYNAMIC_METADATA({metadata['metadata_namespace']}:{metadata['key']})%"
+    )
+
+    fallback_filter = get_ingress_fallback_envoyfilter(
+        "ai-route-route-1.internal", cfg.gateway_namespace
+    )
+    policy = _redirect_policy(fallback_filter.spec.configPatches[0].patch.value)
+    assert {
+        "append": False,
+        "header": {"key": AUTH_CACHE_HEADER, "value": expression},
+    } in policy["request_headers_to_add"]
+    assert AUTH_CACHE_HEADER not in [
+        header["header"]["key"] for header in policy["response_headers_to_add"]
+    ]
 
 
 def test_transformer_plugin_fallback_path_req_rules():

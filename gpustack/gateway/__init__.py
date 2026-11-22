@@ -30,6 +30,11 @@ from gpustack.gateway.client import (
     WasmPluginSpec,
 )
 from gpustack.gateway.labels_annotations import managed_labels, match_labels
+from gpustack.gateway.client.networking_istio_io_v1alpha3_api import (
+    EnvoyFilter,
+    NetworkingIstioIoV1Alpha3Api,
+    get_fallback_auth_cache_envoyfilter,
+)
 from gpustack.gateway.utils import (
     default_mcp_bridge_name,
     openai_model_prefixes,
@@ -882,6 +887,27 @@ def validate_ai_statistics_plugin_content_types():
             )
 
 
+async def ensure_fallback_auth_cache_filter(
+    api: NetworkingIstioIoV1Alpha3Api, namespace: str, ext_auth_name: str
+):
+    expected = get_fallback_auth_cache_envoyfilter(
+        namespace, ext_auth_name, managed_labels
+    )
+    name = expected.metadata["name"]
+    try:
+        current = EnvoyFilter.model_validate(
+            await api.get_envoyfilter(namespace=namespace, name=name)
+        )
+    except ApiException as exc:
+        if exc.status != 404:
+            raise
+        await api.create_envoyfilter(namespace=namespace, body=expected)
+        return
+    if current.spec != expected.spec:
+        current.spec = expected.spec
+        await api.edit_envoyfilter(namespace=namespace, name=name, body=current)
+
+
 def initialize_gateway(cfg: Config, timeout: int = 60, interval: int = 5):
     if cfg.gateway_mode == GatewayModeEnum.disabled:
         return
@@ -893,8 +919,9 @@ def initialize_gateway(cfg: Config, timeout: int = 60, interval: int = 5):
         GatewayModeEnum.incluster,
     ]:
         validate_ai_statistics_plugin_content_types()
+        ext_auth = ext_auth_plugin(cfg=cfg)
         plugin_list: List[Tuple[str, WasmPluginSpec]] = [
-            ext_auth_plugin(cfg=cfg),
+            ext_auth,
             ai_statistics_plugin(cfg=cfg),
             generic_proxy_router_plugin(cfg=cfg),
             ai_proxy_plugin(cfg=cfg),
@@ -934,6 +961,12 @@ def initialize_gateway(cfg: Config, timeout: int = 60, interval: int = 5):
                     name=plugin_name,
                     namespace=cfg.gateway_namespace,
                     spec_diff=spec_diff_func,
+                )
+            if cfg.server_role() != Config.ServerRole.WORKER:
+                await ensure_fallback_auth_cache_filter(
+                    NetworkingIstioIoV1Alpha3Api(api_client),
+                    cfg.gateway_namespace,
+                    ext_auth[0],
                 )
 
         try:
