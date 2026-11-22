@@ -26,9 +26,15 @@ from gpustack.gateway.client import (
     McpBridge,
     McpBridgeSpec,
     McpBridgeRegistry,
+    WasmPluginMatchRule,
     WasmPluginSpec,
 )
 from gpustack.gateway.labels_annotations import managed_labels, match_labels
+from gpustack.gateway.client.networking_istio_io_v1alpha3_api import (
+    EnvoyFilter,
+    NetworkingIstioIoV1Alpha3Api,
+    get_fallback_auth_cache_envoyfilter,
+)
 from gpustack.gateway.utils import (
     default_mcp_bridge_name,
     openai_model_prefixes,
@@ -536,6 +542,63 @@ def transformer_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
     return resource_name, expected_spec
 
 
+def provider_auth_transformer_plugin(
+    cfg: Config, services: List[str]
+) -> Tuple[str, WasmPluginSpec]:
+    return "gpustack-provider-auth-transformer", WasmPluginSpec(
+        defaultConfigDisable=True,
+        matchRules=(
+            [
+                WasmPluginMatchRule(
+                    service=sorted(set(services)),
+                    configDisable=False,
+                    config={
+                        "reqRules": [
+                            transform_header(
+                                "remove",
+                                *(
+                                    HeaderRule(key=key)
+                                    for key in (
+                                        "authorization",
+                                        "x-api-key",
+                                        AUTH_CACHE_HEADER,
+                                        GATEWAY_AUTH_TOKEN_HEADER,
+                                        "cookie",
+                                    )
+                                ),
+                            ),
+                        ],
+                    },
+                )
+            ]
+            if services
+            else []
+        ),
+        failStrategy="FAIL_CLOSE",
+        phase="AUTHN",
+        priority=80,  # After ext-auth and pre-route, before AI proxy adds upstream auth.
+        url=get_plugin_url_with_name_and_version(
+            name="transformer", version="2.0.0", cfg=cfg
+        ),
+    )
+
+
+async def ensure_provider_auth_transformer(
+    cfg: Config,
+    api: gw_client.ExtensionsHigressIoV1Api,
+    match_rules: List[WasmPluginMatchRule],
+):
+    name, spec = provider_auth_transformer_plugin(
+        cfg, [service for rule in match_rules for service in rule.service or []]
+    )
+    await ensure_wasm_plugin(
+        api=api,
+        name=name,
+        namespace=cfg.gateway_namespace,
+        spec_diff=partial(spec_replace, expected_spec=spec),
+    )
+
+
 def generic_proxy_router_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
     """
     Generic-proxy router. Operates in two complementary modes per request and
@@ -824,6 +887,27 @@ def validate_ai_statistics_plugin_content_types():
             )
 
 
+async def ensure_fallback_auth_cache_filter(
+    api: NetworkingIstioIoV1Alpha3Api, namespace: str, ext_auth_name: str
+):
+    expected = get_fallback_auth_cache_envoyfilter(
+        namespace, ext_auth_name, managed_labels
+    )
+    name = expected.metadata["name"]
+    try:
+        current = EnvoyFilter.model_validate(
+            await api.get_envoyfilter(namespace=namespace, name=name)
+        )
+    except ApiException as exc:
+        if exc.status != 404:
+            raise
+        await api.create_envoyfilter(namespace=namespace, body=expected)
+        return
+    if current.spec != expected.spec:
+        current.spec = expected.spec
+        await api.edit_envoyfilter(namespace=namespace, name=name, body=current)
+
+
 def initialize_gateway(cfg: Config, timeout: int = 60, interval: int = 5):
     if cfg.gateway_mode == GatewayModeEnum.disabled:
         return
@@ -835,8 +919,9 @@ def initialize_gateway(cfg: Config, timeout: int = 60, interval: int = 5):
         GatewayModeEnum.incluster,
     ]:
         validate_ai_statistics_plugin_content_types()
+        ext_auth = ext_auth_plugin(cfg=cfg)
         plugin_list: List[Tuple[str, WasmPluginSpec]] = [
-            ext_auth_plugin(cfg=cfg),
+            ext_auth,
             ai_statistics_plugin(cfg=cfg),
             generic_proxy_router_plugin(cfg=cfg),
             ai_proxy_plugin(cfg=cfg),
@@ -876,6 +961,12 @@ def initialize_gateway(cfg: Config, timeout: int = 60, interval: int = 5):
                     name=plugin_name,
                     namespace=cfg.gateway_namespace,
                     spec_diff=spec_diff_func,
+                )
+            if cfg.server_role() != Config.ServerRole.WORKER:
+                await ensure_fallback_auth_cache_filter(
+                    NetworkingIstioIoV1Alpha3Api(api_client),
+                    cfg.gateway_namespace,
+                    ext_auth[0],
                 )
 
         try:

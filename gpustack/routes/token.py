@@ -62,14 +62,18 @@ async def server_auth(
     if cached and request_model:
         try:
             data = jwt_manager.decode_jwt_data(cached)
-            if data.get("model") == request_model:
+            registration_token = data["token"]
+            if (
+                data.get("model") == request_model
+                and registration_token != "static_token_not_found"
+            ):
                 return Response(
                     status_code=200,
-                    headers={
-                        "X-Mse-Consumer": data["consumer"],
-                        "Authorization": "Bearer " + data["token"],
-                        "cookie": "dummy=dummy",
-                    },
+                    headers=token_auth_headers(
+                        consumer=data["consumer"],
+                        registration_token=registration_token,
+                        cache_token=cached,
+                    ),
                 )
         except Exception:
             pass

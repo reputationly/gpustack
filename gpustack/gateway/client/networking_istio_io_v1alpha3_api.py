@@ -3,13 +3,15 @@ from kubernetes_asyncio import client
 from kubernetes_asyncio.client import V1ObjectMeta
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
-
+from gpustack.security import AUTH_CACHE_HEADER
 
 # --- McpBridge Data Structures (Pydantic) ---
 
 GROUP = "networking.istio.io"
 VERSION = "v1alpha3"
 PLURAL = "envoyfilters"
+FALLBACK_AUTH_METADATA_NAMESPACE = "gpustack.auth"
+FALLBACK_AUTH_METADATA_KEY = "cache"
 
 
 class ApplyToStringEnum(str, Enum):
@@ -332,7 +334,15 @@ def get_ingress_fallback_envoyfilter(
                     patch=Patch(
                         operation=OperationStringEnum.MERGE,
                         value=get_4xx_5xx_fallback_value(
-                            ingress_name, fallback_header, extra_req_headers
+                            ingress_name,
+                            fallback_header,
+                            {
+                                **(extra_req_headers or {}),
+                                AUTH_CACHE_HEADER: (
+                                    f"%DYNAMIC_METADATA({FALLBACK_AUTH_METADATA_NAMESPACE}"
+                                    f":{FALLBACK_AUTH_METADATA_KEY})%"
+                                ),
+                            },
                         ),
                     ),
                 )
@@ -340,3 +350,54 @@ def get_ingress_fallback_envoyfilter(
         ),
     )
     return envoyfilter
+
+
+def get_fallback_auth_cache_envoyfilter(
+    namespace: str, ext_auth_name: str, labels: Dict[str, str]
+) -> EnvoyFilter:
+    return EnvoyFilter(
+        metadata={
+            "name": "gpustack-fallback-auth-cache",
+            "namespace": namespace,
+            "labels": labels,
+        },
+        spec=EnvoyFilterSpec(
+            configPatches=[
+                EnvoyConfigPatchObject(
+                    applyTo=ApplyToStringEnum.HTTP_FILTER,
+                    match=EnvoyConfigObjectMatch(
+                        context=MatchContextEnum.GATEWAY,
+                        listener=ListenerMatch(
+                            filterChain={
+                                "filter": {
+                                    "name": "envoy.filters.network.http_connection_manager",
+                                    "subFilter": {
+                                        "name": f"{namespace}.{ext_auth_name}"
+                                    },
+                                },
+                            },
+                        ),
+                    ),
+                    patch=Patch(
+                        operation=OperationStringEnum.INSERT_AFTER,
+                        value={
+                            "name": "envoy.filters.http.header_to_metadata",
+                            "typed_config": {
+                                "@type": "type.googleapis.com/envoy.extensions.filters.http.header_to_metadata.v3.Config",
+                                "request_rules": [
+                                    {
+                                        "header": AUTH_CACHE_HEADER,
+                                        "on_header_present": {
+                                            "metadata_namespace": FALLBACK_AUTH_METADATA_NAMESPACE,
+                                            "key": FALLBACK_AUTH_METADATA_KEY,
+                                            "type": "STRING",
+                                        },
+                                    }
+                                ],
+                            },
+                        },
+                    ),
+                ),
+            ],
+        ),
+    )

@@ -11,8 +11,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from gpustack.api.auth import GATEWAY_AUTH_TOKEN_HEADER
+from gpustack.gateway import provider_auth_transformer_plugin
 from gpustack.gateway.utils import provider_proxy_plugin_spec
 from gpustack.schemas.model_provider import ModelProviderTypeEnum, OpenAIConfig
+from gpustack.security import AUTH_CACHE_HEADER
 
 
 def _provider(*, provider_id: int, api_tokens, config_extras=None, models=None):
@@ -75,3 +78,25 @@ def test_normal_config_fields_still_come_through():
     )
     spec, _ = provider_proxy_plugin_spec(provider)
     assert spec[0]["openaiCustomUrl"] == "http://10.0.0.9:9000/v1"
+
+
+def test_provider_auth_scrub_matches_only_external_services():
+    provider = _provider(provider_id=1, api_tokens=[])
+    _, proxy_rules = provider_proxy_plugin_spec(provider)
+    cfg = SimpleNamespace(gateway_plugin_server_url=None)
+    _, spec = provider_auth_transformer_plugin(cfg, proxy_rules[0].service)
+    assert spec.defaultConfigDisable is True
+    assert spec.failStrategy == "FAIL_CLOSE"
+    (rule,) = spec.matchRules
+    assert rule.service == ["provider-1.static"]
+    assert not rule.ingress
+    assert rule.configDisable is False
+    (scrub,) = rule.config["reqRules"]
+    assert scrub["operate"] == "remove"
+    assert {header["key"] for header in scrub["headers"]} == {
+        "authorization",
+        "x-api-key",
+        AUTH_CACHE_HEADER,
+        GATEWAY_AUTH_TOKEN_HEADER,
+        "cookie",
+    }

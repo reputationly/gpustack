@@ -130,7 +130,7 @@ from gpustack.gateway.client.networking_istio_io_v1alpha3_api import (
     NetworkingIstioIoV1Alpha3Api,
 )
 from gpustack.gateway import utils as mcp_handler
-from gpustack.gateway import get_async_k8s_config
+from gpustack.gateway import ensure_provider_auth_transformer, get_async_k8s_config
 from gpustack.schemas.model_provider import (
     ModelProvider,
 )
@@ -2868,6 +2868,9 @@ class ModelProviderController:
                 provider_config_list, match_rules = (
                     mcp_handler.provider_proxy_plugin_spec(*providers)
                 )
+                await ensure_provider_auth_transformer(
+                    self._config, self._higress_extension_api, match_rules
+                )
                 await mcp_handler.ensure_wasm_plugin(
                     api=self._higress_extension_api,
                     name=mcp_handler.gpustack_ai_proxy_name,
@@ -2955,8 +2958,8 @@ class ModelProviderController:
             )
             if not model_provider:
                 return
-            await self._ensure_provider_registry(model_provider, event)
             await self._ensure_provider_ai_proxy_config()
+            await self._ensure_provider_registry(model_provider, event)
             await self._notify_provider_model_routes(session, model_provider, event)
 
 

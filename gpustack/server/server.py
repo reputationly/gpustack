@@ -104,9 +104,12 @@ from gpustack.gateway.utils import (
     cleanup_ai_proxy_config,
     cleanup_generic_proxy_router,
     cleanup_mcpbridge_registry,
+    provider_proxy_plugin_spec,
     resolve_instance_address_from_model_header,
 )
-from gpustack.gateway import get_async_k8s_config
+from kubernetes_asyncio.client import ApiClient
+from gpustack.gateway import ensure_provider_auth_transformer, get_async_k8s_config
+from gpustack.gateway.client import ExtensionsHigressIoV1Api
 from gpustack.envs import (
     GATEWAY_PORT_CHECK_INTERVAL,
     GATEWAY_PORT_CHECK_RETRY_COUNT,
@@ -1172,6 +1175,11 @@ class Server:
         ]
 
         k8s_config = get_async_k8s_config(cfg=self.config)
+        _, provider_rules = provider_proxy_plugin_spec(*providers)
+        async with ApiClient(k8s_config) as api_client:
+            await ensure_provider_auth_transformer(
+                self.config, ExtensionsHigressIoV1Api(api_client), provider_rules
+            )
         await cleanup_ingresses(
             namespace=self.config.get_namespace(),
             expected_names=expected_names,
