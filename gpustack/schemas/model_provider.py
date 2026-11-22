@@ -547,10 +547,17 @@ class ModelProviderBase(ModelProviderFields):
 class ModelProviderUpdate(ModelProviderBase):
     """PATCH/PUT body for a provider (write side only).
 
-    ``api_tokens`` deliberately accepts an empty list here: a provider row CAN
-    hold zero tokens (a token was cleared, a row was fixed by hand in SQL, or a
-    provider simply needs none). The "must be non-empty on create" rule lives on
-    ``ModelProviderCreate`` instead, so it can never gate a read.
+    ``api_tokens`` accepts an empty list: **zero credentials is a legitimate
+    state**, not a mistake to reject. A provider can point at a local or intranet
+    OpenAI-compatible endpoint that needs no auth (``hy4-flash-local`` in
+    production does), so refusing it only pushed operators to write the row with a
+    script — or to store a dummy token, which the gateway then sends upstream as
+    ``Authorization: Bearer <dummy>`` and some servers answer 400/401.
+
+    Whatever the caller *does* send must be well formed: each entry is a
+    ``MaskedAPIToken`` with a non-blank input, and a provider with more than one
+    token must declare an ``llm`` model so failover has something to probe
+    (``validate_provider``).
 
     An explicit ``[]`` on update means "clear the tokens"; *omitting* the field
     means "leave them alone" (the route distinguishes the two through
@@ -564,18 +571,14 @@ class ModelProviderUpdate(ModelProviderBase):
 
 
 class ModelProviderCreate(ModelProviderUpdate):
-    clone_from_id: Optional[int] = PydanticField(default=None)
+    """Create body: same shape as update, plus the clone source.
 
-    @model_validator(mode="after")
-    def check_api_tokens(self):
-        # A freshly created provider must be usable immediately, so it needs at
-        # least one credential. Cloning is the exception: the tokens are copied
-        # from the source provider, so an empty body list is correct there.
-        if self.clone_from_id is None and not self.api_tokens:
-            raise ValueError(
-                "api_tokens must be a non-empty list (or set clone_from_id to copy them)"
-            )
-        return self
+    No credential requirement — see ``ModelProviderUpdate``. Cloning still works:
+    an empty body list means "copy the source provider's tokens", which the route
+    resolves through ``parse_api_tokens(existing_tokens=..., api_tokens=[])``.
+    """
+
+    clone_from_id: Optional[int] = PydanticField(default=None)
 
 
 class ModelProvider(ModelProviderBase, BaseModelMixin, table=True):

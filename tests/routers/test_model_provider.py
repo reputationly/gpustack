@@ -202,19 +202,54 @@ def test_convert_to_public_class_masks_tokens_and_survives_empty():
     )
 
 
-def test_create_requires_a_token_unless_cloning():
+def test_create_accepts_a_provider_without_credentials():
+    """Zero tokens is a valid provider, not a validation error.
+
+    Production case: ``hy4-flash-local`` points at a local OpenAI-compatible
+    endpoint that needs no auth. Requiring a token here meant such a provider could
+    only be created by writing the row with a script — or by storing a dummy token,
+    which the gateway then sends upstream as a real Authorization header.
+    """
+    from gpustack.schemas.model_provider import ModelProviderCreate
+
+    for payload in (
+        {"name": "p", "config": {"type": "openai"}, "api_tokens": []},
+        {"name": "p", "config": {"type": "openai"}},  # 连字段都不传
+    ):
+        created = ModelProviderCreate.model_validate(payload)
+        assert created.api_tokens == []
+
+
+def test_create_still_validates_what_the_caller_does_send():
     from pydantic import ValidationError
 
     from gpustack.schemas.model_provider import ModelProviderCreate
 
-    with pytest.raises(ValidationError) as exc:
+    # 给了 token 就必须是合法的:空白会被拒
+    with pytest.raises(ValidationError):
         ModelProviderCreate.model_validate(
-            {"name": "p", "config": {"type": "openai"}, "api_tokens": []}
+            {
+                "name": "p",
+                "config": {"type": "openai"},
+                "api_tokens": [{"input": "   "}],
+            }
         )
-    assert "api_tokens must be a non-empty list" in str(exc.value)
+    # 也不能同时给 input 和 hash
+    with pytest.raises(ValidationError):
+        ModelProviderCreate.model_validate(
+            {
+                "name": "p",
+                "config": {"type": "openai"},
+                "api_tokens": [{"input": "sk-x", "hash": "abc"}],
+            }
+        )
 
-    # Cloning copies the tokens from the source provider, so an empty body list
-    # there is correct rather than a mistake.
+    ok = ModelProviderCreate.model_validate(
+        {"name": "p", "config": {"type": "openai"}, "api_tokens": [{"input": "sk-x"}]}
+    )
+    assert len(ok.api_tokens) == 1
+
+    # 克隆:空列表表示"从源 provider 复制",route 层用 existing_tokens 解析
     clone = ModelProviderCreate.model_validate(
         {
             "name": "p",
@@ -223,12 +258,7 @@ def test_create_requires_a_token_unless_cloning():
             "clone_from_id": 7,
         }
     )
-    assert clone.clone_from_id == 7
-
-    ok = ModelProviderCreate.model_validate(
-        {"name": "p", "config": {"type": "openai"}, "api_tokens": [{"input": "sk-x"}]}
-    )
-    assert len(ok.api_tokens) == 1
+    assert clone.clone_from_id == 7 and clone.api_tokens == []
 
 
 def test_update_distinguishes_omitted_tokens_from_cleared_tokens():
