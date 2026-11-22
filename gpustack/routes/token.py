@@ -1,6 +1,6 @@
 import logging
 from datetime import timedelta
-from typing import Optional, Annotated
+from typing import Annotated, Dict, Optional
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi import APIRouter, Request, Response, Depends
 from gpustack.api.exceptions import (
@@ -142,13 +142,37 @@ async def server_auth(
     )
     return Response(
         status_code=200,
-        headers={
-            "X-Mse-Consumer": consumer,
-            "Authorization": f"Bearer {registration_token}",
-            AUTH_CACHE_HEADER: cache_token,
-            "cookie": "dummy=dummy",
-        },
+        headers=token_auth_headers(
+            consumer=consumer,
+            registration_token=registration_token,
+            cache_token=cache_token,
+        ),
     )
+
+
+def token_auth_headers(
+    consumer: str,
+    registration_token: Optional[str],
+    cache_token: str,
+) -> Dict[str, str]:
+    """Headers ext-auth is allowed to copy onto the upstream request.
+
+    Only attach a credential when this route actually has a local worker to talk to.
+    ext-auth copies every listed upstream header onto the request (see the plugin's
+    ``allowed_upstream_headers``), so anything returned here reaches the backend. A
+    provider-backed (external MaaS) route resolves to no registration token; returning
+    a placeholder made those providers receive a bogus ``Bearer ...`` credential that
+    the AI proxy does not override when the provider has no apiTokens of its own.
+    Their configured credential is added by the AI proxy, not by us.
+    """
+    headers: Dict[str, str] = {
+        "X-Mse-Consumer": consumer,
+        AUTH_CACHE_HEADER: cache_token,
+        "cookie": "dummy=dummy",
+    }
+    if registration_token is not None:
+        headers["Authorization"] = f"Bearer {registration_token}"
+    return headers
 
 
 async def worker_auth(

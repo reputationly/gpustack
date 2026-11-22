@@ -42,7 +42,6 @@ from gpustack.server.cache import (
 from gpustack.server.worker_allocated_cache import invalidate_workers_allocated
 from gpustack.utils.usage_snapshots import propagate_user_rename
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -617,7 +616,7 @@ class ModelRouteService:
     @locked_cached()
     async def get_model_auth_info_by_name(
         self, name: str
-    ) -> Optional[Tuple[AccessPolicyEnum, str]]:
+    ) -> Optional[Tuple[AccessPolicyEnum, Optional[str]]]:
         # Higress's auth callback may hand us either the Org-effective
         # name (`<owner-name>/<route>`) or the raw `route.name`
         # depending on whether `modelMapping` has fired yet. Resolve
@@ -664,11 +663,17 @@ class ModelRouteService:
                 )
             ],
         )
-        # set a default static token to avoid empty token response for public maas model route
-        registration_token = "static_token_not_found"
+        # ``None`` means "this route has no local worker to authenticate to", which is
+        # the normal shape of a provider-backed (external MaaS) route. It must stay
+        # None: a placeholder token used to be returned so the header was never empty
+        # for public routes, but ext-auth writes that header onto the upstream request
+        # and the AI proxy does not override it when a provider has no apiTokens — so
+        # external providers received ``Authorization: Bearer static_token_not_found``,
+        # i.e. a bogus credential, and some answered 400/401.
+        registration_token: Optional[str] = None
         for model in models:
             cluster = await Cluster.one_by_id(self.session, model.cluster_id)
-            if cluster.registration_token is not None:
+            if cluster is not None and cluster.registration_token is not None:
                 registration_token = cluster.registration_token
                 break
 

@@ -231,7 +231,7 @@ def model_prefix(model_id: int) -> str:
 
 
 def model_instance_prefix(
-    model_instance: Union[ModelInstance, ModelInstancePublic]
+    model_instance: Union[ModelInstance, ModelInstancePublic],
 ) -> str:
     return f"{model_prefix(model_instance.model_id)}{model_instance.id}"
 
@@ -411,6 +411,13 @@ def provider_proxy(provider: ModelProvider) -> Optional[McpBridgeProxy]:
     )
 
 
+#: Keys the AI-proxy plugin config derives from the provider row itself. They are not
+#: provider *config*, so a user-editable ``config`` blob must not be able to set them.
+_AI_PROXY_RESERVED_CONFIG_KEYS = frozenset(
+    {"id", "apiTokens", "type", "failover", "retryOnFailure"}
+)
+
+
 def provider_proxy_plugin_spec(
     *providers: ModelProvider,
 ) -> Tuple[List[Dict[str, Any]], List[WasmPluginMatchRule]]:
@@ -422,10 +429,20 @@ def provider_proxy_plugin_spec(
         if registry is None:
             continue
         service_name = registry.get_service_name()
+        # ``config`` is user-editable (the console merges its advanced YAML into it),
+        # so it must not be able to override the fields that identify the provider or
+        # carry its credentials. Spreading it after ``apiTokens`` used to let a
+        # ``config.apiTokens`` entry win over the dedicated column — the UI could clear
+        # a key while the gateway kept using the stale one from YAML.
+        config_data = {
+            key: value
+            for key, value in provider.config.model_dump_with_default_override().items()
+            if key not in _AI_PROXY_RESERVED_CONFIG_KEYS
+        }
         default_config_data = {
             "id": provider_registry_name(provider.id),
-            "apiTokens": provider.api_tokens,
-            **provider.config.model_dump_with_default_override(),
+            "apiTokens": list(provider.api_tokens or []),
+            **config_data,
             "type": provider.config.type.value,
         }
         accessible_llm_model = next(
