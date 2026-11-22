@@ -6,7 +6,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Tuple
 
 import aiohttp
 from fastapi import APIRouter, Request
@@ -532,17 +532,75 @@ def _engine_kind(task_type: str) -> str:
     return "video"
 
 
-def _output_ext(task_type: str) -> str:
+# 语音(TTS)产物容器 → 扩展名。**必须与引擎 vLLM-Omni 的 SUPPORTED_AUDIO_FORMATS 同集合**
+# (vllm_omni/entrypoints/openai/protocol/audio.py):引擎的 response_format 就是这个
+# Literal,多写一种(比如 aac/m4a/ogg)会让请求在引擎侧 422。
+#
+# 这张表的存在意义只有一个:**产物文件名必须和字节容器一致**。门面是产物的命名者
+# (save_result_path 由它独占,请求体改不了),而引擎按 response_format 编码 ——
+# 命名与编码一旦分叉,产出就是"mp3 字节 + .wav 文件",网关按扩展名回 audio/wav,
+# 客户端按 WAV 解一份 MP3。历史实现把音频固定成 .wav,靠网关"只准 wav"才没炸;
+# 现在改为按请求命名,两边口径由这张表统一。
+_AUDIO_OUTPUT_EXTS = {
+    "wav": ".wav",
+    "mp3": ".mp3",
+    "flac": ".flac",
+    "opus": ".opus",
+    "pcm": ".pcm",
+}
+# 产物容器 → Content-Type(供 /videos/{id}/content 直接回源,免得依赖框架按扩展名猜)。
+_OUTPUT_CONTENT_TYPES = {
+    ".png": "image/png",
+    ".mp4": "video/mp4",
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".flac": "audio/flac",
+    ".opus": "audio/opus",
+    ".pcm": "audio/pcm",
+}
+
+
+def _requested_output_format(body: Mapping[str, Any]) -> str:
+    """从提交体里取客户端的 response_format(小写);未传返回空串。"""
+    raw = body.get("response_format")
+    return raw.strip().lower() if isinstance(raw, str) else ""
+
+
+def _output_ext(task_type: str, requested_format: str = "") -> str:
+    """产物的扩展名。语音按请求的 response_format 命名,其余 kind 保持固定。
+
+    - audio(tts):引擎认 wav/mp3/flac/opus/pcm;未知值直接 400 —— 悄悄回落到 .wav
+      会把"命名与字节不一致"重新引回来,而且客户端拿到的还是一份它没要的容器。
+    - audiogen(t2a/v2m/tv2m/svs):引擎走 chat 路径回 base64 WAV,没有容器开关,
+      所以只接受 wav(不传也行),别的值 400 而不是产出坏文件。
+    - music / image / video:本轮不动(music 固定 .mp3 是既有契约,单独评估再改)。
+    """
     kind = _engine_kind(task_type)
+    if kind in ("audio", "audiogen"):
+        allowed = _AUDIO_OUTPUT_EXTS if kind == "audio" else {"wav": ".wav"}
+        if not requested_format:
+            return ".wav"
+        ext = allowed.get(requested_format)
+        if ext is None:
+            raise BadRequestException(
+                message=(
+                    f"task_type '{task_type}' 不支持 response_format="
+                    f"'{requested_format}'(允许:{'/'.join(sorted(allowed))})"
+                ),
+                is_openai_exception=True,
+            )
+        return ext
     if kind == "image":
         return ".png"
-    if kind == "audio":
-        return ".wav"
     if kind == "music":
         return ".mp3"
-    if kind == "audiogen":
-        return ".wav"
     return ".mp4"
+
+
+def _output_content_type(path: str) -> str:
+    """按扩展名给出产物的 Content-Type;认不出时退化为 octet-stream(不谎称)。"""
+    ext = os.path.splitext(path)[1].lower()
+    return _OUTPUT_CONTENT_TYPES.get(ext, "application/octet-stream")
 
 
 def _sanitize(name: str) -> str:
@@ -1020,7 +1078,8 @@ async def create_video_task(request: Request, user: CurrentUserDep):
     body, model_name, task_type, user_id = await _parse_video_request(request)
 
     public_id = uuid.uuid4().hex
-    ext = _output_ext(task_type)
+    # 产物扩展名按请求的容器决定:命名与引擎编码必须同源(见 _output_ext 注释)。
+    ext = _output_ext(task_type, _requested_output_format(body))
     out_root = _output_root()
     out_abs = os.path.join(
         out_root, _rel_path(task_type, model_name, user_id, public_id, ext)
@@ -1835,7 +1894,13 @@ async def get_video_task_content(task_id: str, user: CurrentUserDep):
         raise NotFoundException(
             message="Result file missing on storage", is_openai_exception=True
         )
-    return FileResponse(resolved, filename=os.path.basename(resolved))
+    # 显式给 media_type:Starlette 按扩展名猜的映射表不含 .opus/.pcm/.flac,
+    # 而那些是语音产物现在合法的容器。猜不出来时它会回 text/plain,浏览器不会当成音频播。
+    return FileResponse(
+        resolved,
+        filename=os.path.basename(resolved),
+        media_type=_output_content_type(resolved),
+    )
 
 
 async def _cancel_on_engine(
