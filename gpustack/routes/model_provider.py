@@ -359,13 +359,33 @@ class CustomOAIModel(OAIModel):
 @router.post(
     "/get-models",
 )
+def provider_auth_headers(config, api_token: Optional[str]) -> Dict[str, str]:
+    """Credentials for an outbound provider call.
+
+    A provider without credentials is a supported state (a local or intranet
+    OpenAI-compatible endpoint needs none), so an empty token means "send no auth
+    header". Building ``Authorization: Bearer `` with a trailing space instead is
+    rejected outright by some servers, before they even look at the request.
+    """
+    headers: Dict[str, str] = {}
+    if config.type == ModelProviderTypeEnum.CLAUDE:
+        if api_token:
+            headers["X-API-Key"] = api_token
+        headers["anthropic-version"] = (
+            getattr(config, "claudeVersion", None) or ANTHROPIC_API_VERSION
+        )
+    elif api_token:
+        headers["Authorization"] = f"Bearer {api_token}"
+    return headers
+
+
 async def get_models_from_provider(
     input: ProviderModelsInput,
 ):
-    if input.api_token is None or input.config is None:
-        raise InvalidException(
-            message="api_token and config are required to fetch models from provider"
-        )
+    # Only the config is required: a provider without credentials is supported, and
+    # the request simply goes out without an auth header (see provider_auth_headers).
+    if input.config is None:
+        raise InvalidException(message="config is required to talk to the provider")
 
     result = SyncPage[CustomOAIModel](data=[], object="list")
     try:
@@ -385,14 +405,7 @@ async def get_models_from_provider(
         proxy=input.proxy_url,
         trust_env=True,
     ) as client:
-        headers = {}
-        if input.config.type == ModelProviderTypeEnum.CLAUDE:
-            headers["X-API-Key"] = input.api_token
-            headers["anthropic-version"] = (
-                getattr(input.config, "claudeVersion", None) or ANTHROPIC_API_VERSION
-            )
-        else:
-            headers["Authorization"] = f"Bearer {input.api_token}"
+        headers = provider_auth_headers(input.config, input.api_token)
         try:
             response = await client.get(url=model_uri, headers=headers, timeout=30)
             response.raise_for_status()
@@ -444,16 +457,18 @@ async def get_models_from_specific_provider(
         provider,
         not_found_message=f"provider {id} not found",
     )
-    if provider.api_tokens is None or len(provider.api_tokens) == 0:
-        raise InvalidException(
-            message=f"provider {provider.name} id: {id} has no API tokens configured"
+    stored_token = provider.api_tokens[0] if provider.api_tokens else None
+    if not stored_token and not input.api_token:
+        logger.info(
+            f"provider {provider.name} id: {id} has no API tokens configured; "
+            "calling it without credentials"
         )
     proxy_url = (
         input.proxy_url if 'proxy_url' in input.model_fields_set else provider.proxy_url
     )
     return await get_models_from_provider(
         ProviderModelsInput(
-            api_token=input.api_token or provider.api_tokens[0],
+            api_token=input.api_token or stored_token,
             config=input.config or provider.config,
             proxy_url=proxy_url,
         )
@@ -478,10 +493,10 @@ def _get_model_output_token_dict(model_name: str) -> Dict[str, Any]:
 async def try_model_with_provider(
     input: TestProviderModelInput,
 ):
-    if input.api_token is None or input.config is None:
-        raise InvalidException(
-            message="api_token and config are required to fetch models from provider"
-        )
+    # Only the config is required: a provider without credentials is supported, and
+    # the request simply goes out without an auth header (see provider_auth_headers).
+    if input.config is None:
+        raise InvalidException(message="config is required to talk to the provider")
 
     endpoint, completion_url = input.config.get_chat_url()
     if not endpoint or not completion_url:
@@ -499,14 +514,7 @@ async def try_model_with_provider(
         proxy=input.proxy_url,
         trust_env=True,
     ) as client:
-        headers = {}
-        if input.config.type == ModelProviderTypeEnum.CLAUDE:
-            headers["X-API-Key"] = input.api_token
-            headers["anthropic-version"] = (
-                getattr(input.config, "claudeVersion", None) or ANTHROPIC_API_VERSION
-            )
-        else:
-            headers["Authorization"] = f"Bearer {input.api_token}"
+        headers = provider_auth_headers(input.config, input.api_token)
         try:
             response = await client.post(
                 url=completion_url, json=data, headers=headers, timeout=60
@@ -547,16 +555,18 @@ async def try_model_with_specific_provider(
         provider,
         not_found_message=f"provider {id} not found",
     )
-    if provider.api_tokens is None or len(provider.api_tokens) == 0:
-        raise InvalidException(
-            message=f"provider {provider.name} id: {id} has no API tokens configured"
+    stored_token = provider.api_tokens[0] if provider.api_tokens else None
+    if not stored_token and not input.api_token:
+        logger.info(
+            f"provider {provider.name} id: {id} has no API tokens configured; "
+            "calling it without credentials"
         )
     proxy_url = (
         input.proxy_url if 'proxy_url' in input.model_fields_set else provider.proxy_url
     )
     return await try_model_with_provider(
         TestProviderModelInput(
-            api_token=input.api_token or provider.api_tokens[0],
+            api_token=input.api_token or stored_token,
             config=input.config or provider.config,
             proxy_url=proxy_url,
             model_name=input.model_name,

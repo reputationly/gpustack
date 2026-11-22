@@ -314,3 +314,38 @@ def test_public_model_never_reapplies_write_rules():
             ModelProviderUpdate.model_validate(
                 {"name": "p", "config": {"type": "openai"}, **bad}
             )
+
+
+# --------------------------------------------------------------------------- #
+# Providers without credentials must be usable end to end, not just creatable.
+# --------------------------------------------------------------------------- #
+def test_provider_auth_headers_skips_empty_credentials():
+    """An empty token means "no auth header", not ``Bearer `` with a trailing space.
+
+    Some servers reject the malformed header outright, before looking at the
+    request — which would make a credential-less provider look broken in a way that
+    points at the wrong thing.
+    """
+    from gpustack.routes.model_provider import provider_auth_headers
+    from gpustack.schemas.model_provider import ModelProviderTypeEnum
+
+    class _Config:
+        def __init__(self, provider_type):
+            self.type = provider_type
+            self.claudeVersion = None
+
+    openai = ModelProviderTypeEnum.OPENAI
+    claude = ModelProviderTypeEnum.CLAUDE
+
+    assert provider_auth_headers(_Config(openai), "sk-x") == {
+        "Authorization": "Bearer sk-x"
+    }
+    assert provider_auth_headers(_Config(openai), None) == {}
+    assert provider_auth_headers(_Config(openai), "") == {}
+
+    headers = provider_auth_headers(_Config(claude), "sk-a")
+    assert headers["X-API-Key"] == "sk-a"
+    assert headers["anthropic-version"]
+
+    # No credential → only the version header remains; nothing claims to be a key.
+    assert "X-API-Key" not in provider_auth_headers(_Config(claude), None)
