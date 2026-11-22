@@ -81,12 +81,17 @@ COPY gpustack/http_proxy/strategies.py                                       /tm
 COPY gpustack/migrations/versions/2026_07_05_2230-e1f2a3b4c5d6_add_video_generation_tasks.py /tmp/lx2v-overlay/migrations/versions/2026_07_05_2230-e1f2a3b4c5d6_add_video_generation_tasks.py
 COPY gpustack/migrations/versions/2026_08_11_1030-f3a1b2c4d5e7_add_video_task_progress.py     /tmp/lx2v-overlay/migrations/versions/2026_08_11_1030-f3a1b2c4d5e7_add_video_task_progress.py
 COPY gpustack/routes/routes.py                                               /tmp/lx2v-overlay/routes/routes.py
+COPY gpustack/routes/token.py                                                /tmp/lx2v-overlay/routes/token.py
 COPY gpustack/routes/model_provider.py                                       /tmp/lx2v-overlay/routes/model_provider.py
 # Runtime config persistence: PUT /v2/config now writes to the runtime_configs
 # table and server.py replays it at startup, so UI edits survive an upgrade.
 COPY gpustack/routes/config.py                                               /tmp/lx2v-overlay/routes/config.py
 COPY gpustack/schemas/runtime_config.py                                      /tmp/lx2v-overlay/schemas/runtime_config.py
 COPY gpustack/server/init_db.py                                              /tmp/lx2v-overlay/server/init_db.py
+COPY gpustack/server/services.py                                            /tmp/lx2v-overlay/server/services.py
+COPY gpustack/gateway/utils.py                                              /tmp/lx2v-overlay/gateway/utils.py
+COPY gpustack/gateway/__init__.py                                           /tmp/lx2v-overlay/gateway/__init__.py
+COPY gpustack/gateway/client/networking_istio_io_v1alpha3_api.py            /tmp/lx2v-overlay/gateway/client/networking_istio_io_v1alpha3_api.py
 COPY gpustack/migrations/versions/2026_09_02_1200-a7c3e5d19b42_add_runtime_configs.py       /tmp/lx2v-overlay/migrations/versions/2026_09_02_1200-a7c3e5d19b42_add_runtime_configs.py
 COPY gpustack/migrations/versions/2026_09_02_1800-b8d4f6a2c1e9_add_video_task_assigned_at.py /tmp/lx2v-overlay/migrations/versions/2026_09_02_1800-b8d4f6a2c1e9_add_video_task_assigned_at.py
 COPY gpustack/migrations/versions/2026_11_16_2330-c9e5a7b3d1f4_add_video_task_usage.py /tmp/lx2v-overlay/migrations/versions/2026_11_16_2330-c9e5a7b3d1f4_add_video_task_usage.py
@@ -181,6 +186,11 @@ RUN set -eux; \
         "${GP_DIR}/schemas/model_files.py" \
         "${GP_DIR}/schemas/model_provider.py" \
         "${GP_DIR}/routes/model_provider.py" \
+        "${GP_DIR}/server/services.py" \
+        "${GP_DIR}/gateway/utils.py" \
+        "${GP_DIR}/gateway/__init__.py" \
+        "${GP_DIR}/gateway/client/networking_istio_io_v1alpha3_api.py" \
+        "${GP_DIR}/routes/token.py" \
         "${GP_DIR}/server/init_db.py"; \
     python3 -c "from gpustack.schemas.models import BackendEnum, CategoryEnum; assert BackendEnum.LIGHTX2V and CategoryEnum.VIDEO; print('lx2v backend overlay OK')"; \
     python3 -c "from gpustack.schemas.models import BackendEnum; assert BackendEnum.INDEXTTS; print('indextts backend overlay OK')"; \
