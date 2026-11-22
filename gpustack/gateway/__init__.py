@@ -26,6 +26,7 @@ from gpustack.gateway.client import (
     McpBridge,
     McpBridgeSpec,
     McpBridgeRegistry,
+    WasmPluginMatchRule,
     WasmPluginSpec,
 )
 from gpustack.gateway.labels_annotations import managed_labels, match_labels
@@ -534,6 +535,63 @@ def transformer_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
         ),
     )
     return resource_name, expected_spec
+
+
+def provider_auth_transformer_plugin(
+    cfg: Config, services: List[str]
+) -> Tuple[str, WasmPluginSpec]:
+    return "gpustack-provider-auth-transformer", WasmPluginSpec(
+        defaultConfigDisable=True,
+        matchRules=(
+            [
+                WasmPluginMatchRule(
+                    service=sorted(set(services)),
+                    configDisable=False,
+                    config={
+                        "reqRules": [
+                            transform_header(
+                                "remove",
+                                *(
+                                    HeaderRule(key=key)
+                                    for key in (
+                                        "authorization",
+                                        "x-api-key",
+                                        AUTH_CACHE_HEADER,
+                                        GATEWAY_AUTH_TOKEN_HEADER,
+                                        "cookie",
+                                    )
+                                ),
+                            ),
+                        ],
+                    },
+                )
+            ]
+            if services
+            else []
+        ),
+        failStrategy="FAIL_CLOSE",
+        phase="AUTHN",
+        priority=80,  # After ext-auth and pre-route, before AI proxy adds upstream auth.
+        url=get_plugin_url_with_name_and_version(
+            name="transformer", version="2.0.0", cfg=cfg
+        ),
+    )
+
+
+async def ensure_provider_auth_transformer(
+    cfg: Config,
+    api: gw_client.ExtensionsHigressIoV1Api,
+    match_rules: List[WasmPluginMatchRule],
+):
+    name, spec = provider_auth_transformer_plugin(
+        cfg, [service for rule in match_rules for service in rule.service or []]
+    )
+    await ensure_wasm_plugin(
+        api=api,
+        name=name,
+        namespace=cfg.gateway_namespace,
+        spec_diff=partial(spec_replace, expected_spec=spec),
+    )
 
 
 def generic_proxy_router_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
