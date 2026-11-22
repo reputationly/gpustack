@@ -2,7 +2,7 @@ import re
 import secrets
 from urllib.parse import urlparse
 from enum import Enum
-from typing import ClassVar, Optional, Dict, Any, List
+from typing import ClassVar, Optional, Dict, Any, List, Union
 from pydantic import (
     BaseModel,
     computed_field,
@@ -677,12 +677,52 @@ class ClusterListParams(ListParams):
     ]
 
 
-class ClusterPublic(ClusterBase, PublicFields):
-    workers: int = Field(default=0)
-    ready_workers: int = Field(default=0)
-    gpus: int = Field(default=0)
-    models: int = Field(default=0)
-    worker_config: Optional[PredefinedConfigNoDefaults] = Field(default=None)
+class ClusterPublic(SQLModel, PublicFields):
+    """Read-side view of a cluster — **no input validation at all**.
+
+    It used to inherit ``ClusterBase`` → ``ClusterCreateBase`` → ``ClusterUpdate``,
+    which drags in ``validate_server_url``. A row whose ``server_url`` is stored
+    without a scheme (``10.0.0.5:8080``, written by hand in SQL or by an operator
+    script) then failed to *serialize*, so ``GET /v1/clusters`` answered 500 for
+    the whole list and the cluster page could not even be opened to fix it. Same
+    defect class as ``ModelProviderPublic`` rejecting zero API tokens and
+    ``ModelRoutePublic`` rejecting a stored category.
+
+    Note the validator never protected runtime behaviour: ``server_url`` is used
+    verbatim when provisioning workers and probing ``/healthz``, so a bad value
+    was already a bad value — the only thing the read-side check did was take the
+    page down. Reads describe a stored row; input rules live on
+    ``ClusterUpdate``.
+
+    Field list duplicated on purpose (isolation only holds if this class owns its
+    declarations). ``tests/routers/test_cluster_public_isolation.py`` pins it
+    against the table columns plus the response-only counters.
+
+    ``state``/``provider`` accept a plain string so an unexpected stored value is
+    reported instead of raising; known values serialize to the same JSON as before.
+    """
+
+    name: str
+    description: Optional[str] = None
+    gateway_endpoint: Optional[str] = None
+    server_url: Optional[str] = None
+    system_default_container_registry: Optional[str] = None
+    worker_config: Optional[PredefinedConfigNoDefaults] = None
+    k8s_options: Optional[K8sOptions] = None
+    provider: Union[ClusterProvider, str] = ClusterProvider.Docker
+    credential_id: Optional[int] = None
+    region: Optional[str] = None
+    owner_principal_id: Optional[int] = None
+    state: Union[ClusterStateEnum, str] = ClusterStateEnum.PROVISIONING
+    state_message: Optional[str] = None
+    reported_gateway_endpoint: Optional[str] = None
+    is_default: bool = False
+    system_principal_id: Optional[int] = None
+    # Response-only counters, folded from the cluster's workers/models.
+    workers: int = 0
+    ready_workers: int = 0
+    gpus: int = 0
+    models: int = 0
 
 
 ClustersPublic = PaginatedList[ClusterPublic]

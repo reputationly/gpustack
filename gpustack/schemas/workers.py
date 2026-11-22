@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from enum import Enum
-from typing import ClassVar, Dict, Optional, Any, TYPE_CHECKING
+from typing import ClassVar, Dict, Optional, Any, TYPE_CHECKING, Union
 from typing_extensions import Annotated, deprecated
 from pydantic import ConfigDict, BaseModel, field_validator
 from urllib.parse import urlparse
@@ -543,17 +543,60 @@ class WorkerListParams(ListParams):
     ]
 
 
-class WorkerPublic(
-    WorkerBase,
-):
+class WorkerPublic(SQLModel):
+    """Read-side view of a worker — **no rejecting validation**.
+
+    It used to inherit ``WorkerBase``, whose ``validate_proxy_address`` rejects
+    anything that is not a URL. A row with ``proxy_address = "1.2.3.4:8000"`` (no
+    scheme — exactly what a hand-edit or an older script produces) then failed to
+    serialize, so ``GET /v1/workers`` answered 500 for the whole fleet list. Same
+    defect class as ``ModelProviderPublic`` rejecting zero API tokens.
+
+    Field list duplicated on purpose (isolation only holds if this class owns its
+    declarations); ``tests/routers/test_worker_public_isolation.py`` pins the field
+    set against the table columns.
+
+    ``state``/``proxy_mode``/``provider`` accept a plain string so an unexpected
+    stored value is reported instead of raising; known values serialize to the
+    same JSON as before.
+    """
+
     id: int
     created_at: datetime
     updated_at: datetime
     me: Optional[bool] = None  # Indicates if the worker is the current worker
     provision_progress: Optional[str] = None  # Indicates the provisioning progress
 
+    name: str
+    labels: Dict[str, str] = {}
+    maintenance: Optional[Maintenance] = None
+    advertise_address: Optional[str] = None
+    hostname: str
+    ip: str
+    ifname: str
+    port: int
+    metrics_port: Optional[int] = None
+    system_reserved: Optional[SystemReserved] = None
+    state_message: Optional[str] = None
+    status: Optional[WorkerStatus] = None
     worker_uuid: Optional[str] = Field(default=None, exclude=True)
     machine_id: Optional[str] = Field(default=None, exclude=True)
+    proxy_mode: Union[ModelInstanceProxyModeEnum, str] = (
+        ModelInstanceProxyModeEnum.WORKER
+    )
+    cluster_id: Optional[int] = None
+    owner_principal_id: Optional[int] = None
+    external_id: Optional[str] = None
+    worker_version: Optional[str] = None
+    state: Union[WorkerStateEnum, str] = WorkerStateEnum.NOT_READY
+    heartbeat_time: Optional[datetime] = None
+    unreachable: bool = False
+    system_principal_id: Optional[int] = None
+    provider: Union[ClusterProvider, str] = ClusterProvider.Docker
+    worker_pool_id: Optional[int] = None
+    ssh_key_id: Optional[int] = None
+    provider_config: Optional[Dict[str, Any]] = None
+    proxy_address: Optional[str] = None
 
 
 class WorkerRegistrationPublic(WorkerPublic):

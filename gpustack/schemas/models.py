@@ -131,7 +131,15 @@ class ExtendedKVCacheConfig(BaseModel):
     """ Size for each KV cache chunk (unit: number of tokens). """
 
 
-class ModelSource(BaseModel):
+class ModelSourceFields(BaseModel):
+    """Source fields + derived helpers, **no validation**.
+
+    Split out so read models can embed a source without inheriting
+    ``check_huggingface_fields`` (see ``ModelInstancePublic.draft_model_source``):
+    a stored draft source whose ``source`` disagrees with its columns must be
+    displayed, not rejected. ``ModelSource`` keeps the rule for input.
+    """
+
     source: SourceEnum
     huggingface_repo_id: Optional[str] = None
     huggingface_filename: Optional[str] = None
@@ -179,6 +187,12 @@ class ModelSource(BaseModel):
         source_string = "/".join(filtered_values)
         return hashlib.sha256(source_string.encode()).hexdigest()
 
+    model_config = ConfigDict(protected_namespaces=())
+
+
+class ModelSource(ModelSourceFields):
+    """Write-side source mixin: enforces 'source implies its identifier'."""
+
     @model_validator(mode="after")
     def check_huggingface_fields(self):
         if self.source == SourceEnum.HUGGING_FACE:
@@ -200,8 +214,6 @@ class ModelSource(BaseModel):
                     "local_path must be provided when source is 'local_path'"
                 )
         return self
-
-    model_config = ConfigDict(protected_namespaces=())
 
 
 class SpeculativeConfig(BaseModel):
@@ -359,14 +371,68 @@ class ModelUpdate(ModelBase):
     pass
 
 
-class ModelPublic(
-    ModelBase,
-):
+class ModelPublic(SQLModel):
+    """Read-side view of a model — **no rejecting validation**.
+
+    It used to inherit ``ModelBase``, which reaches ``ModelSource`` and its
+    ``check_huggingface_fields``: a row stored with ``source=huggingface`` and an
+    empty ``huggingface_repo_id`` (hand-edited, or a column nulled by hand) made
+    ``GET /v1/models`` answer 500 for the whole page instead of listing it. Same
+    defect class as ``ModelProviderPublic`` rejecting zero API tokens.
+
+    Field list duplicated on purpose (isolation only holds if this class owns its
+    declarations). ``tests/routers/test_model_public_isolation.py`` pins the field
+    set and the annotations against the table columns so the copy cannot drift.
+
+    Two deliberate differences from the write model:
+    - enum fields accept a plain string, so an unexpected stored value is reported
+      instead of raising (known values serialize to the same JSON as before);
+    - ``distributed_inference_across_workers`` is reported **as stored**. It used
+      to be derived here when NULL, which meant the API could show "on" while the
+      scheduler (which reads the row and treats NULL as false) placed the model as
+      if it were off. Derivation stays on the write side (``ModelSpecBase``), so
+      every row written through the API already carries a value; legacy NULLs were
+      backfilled by migration ``d4b8e2a16c37``.
+    """
+
     id: int
     created_at: datetime
     updated_at: datetime
     # Populated only by the detail endpoint; None on list responses.
     has_stale_lora_instances: Optional[bool] = None
+
+    source: Union[SourceEnum, str]
+    huggingface_repo_id: Optional[str] = None
+    huggingface_filename: Optional[str] = None
+    model_scope_model_id: Optional[str] = None
+    model_scope_file_path: Optional[str] = None
+    local_path: Optional[str] = None
+    name: str
+    description: Optional[str] = None
+    meta: Optional[Dict[str, Any]] = {}
+    replicas: int = 1
+    ready_replicas: int = 0
+    categories: List[str] = []
+    placement_strategy: Union[PlacementStrategyEnum, str] = PlacementStrategyEnum.SPREAD
+    cpu_offloading: Optional[bool] = None
+    distributed_inference_across_workers: Optional[bool] = None
+    worker_selector: Optional[Dict[str, str]] = {}
+    gpu_selector: Optional[GPUSelector] = None
+    backend: Optional[str] = None
+    backend_version: Optional[str] = None
+    backend_parameters: Optional[List[str]] = None
+    image_name: Optional[str] = None
+    run_command: Optional[str] = None
+    env: Optional[Dict[str, str]] = None
+    restart_on_error: Optional[bool] = True
+    distributable: Optional[bool] = False
+    extended_kv_cache: Optional[ExtendedKVCacheConfig] = None
+    speculative_config: Optional[SpeculativeConfig] = None
+    generic_proxy: Optional[bool] = False
+    lora_list: Optional[List[LoraListEntry]] = None
+    cluster_id: Optional[int] = None
+    owner_principal_id: int = Field(default_factory=_platform_principal_id)
+    access_policy: Union[AccessPolicyEnum, str] = AccessPolicyEnum.AUTHED
 
     @field_serializer("lora_list")
     def _strip_lora_prefix(self, lora_list, _info):
@@ -690,12 +756,57 @@ class ModelInstanceUpdate(ModelInstanceBase):
     pass
 
 
-class ModelInstancePublic(
-    ModelInstanceBase,
-):
+class ModelInstancePublic(SQLModel):
+    """Read-side view of a model instance — **no rejecting validation**.
+
+    Same defect class as ``ModelPublic``: inheriting ``ModelInstanceBase`` reached
+    ``ModelSource.check_huggingface_fields``, so an instance row whose source
+    fields were edited out of shape took the whole instance list down.
+    ``tests/routers/test_model_public_isolation.py`` pins the field set.
+    """
+
     id: int
     created_at: datetime
     updated_at: datetime
+
+    source: Union[SourceEnum, str]
+    huggingface_repo_id: Optional[str] = None
+    huggingface_filename: Optional[str] = None
+    model_scope_model_id: Optional[str] = None
+    model_scope_file_path: Optional[str] = None
+    local_path: Optional[str] = None
+    name: str
+    worker_id: Optional[int] = None
+    worker_name: Optional[str] = None
+    worker_advertise_address: Optional[str] = None
+    worker_ip: Optional[str] = None
+    worker_ifname: Optional[str] = None
+    pid: Optional[int] = None
+    port: Optional[int] = None
+    ports: Optional[List[int]] = []
+    download_progress: Optional[float] = None
+    resolved_path: Optional[str] = None
+    draft_model_source: Optional[ModelSourceFields] = None
+    draft_model_download_progress: Optional[float] = None
+    draft_model_resolved_path: Optional[str] = None
+    restart_count: Optional[int] = 0
+    last_restart_time: Optional[datetime] = None
+    state: Union[ModelInstanceStateEnum, str] = ModelInstanceStateEnum.PENDING
+    state_message: Optional[str] = None
+    computed_resource_claim: Optional[ComputedResourceClaim] = None
+    gpu_type: Optional[str] = None
+    gpu_indexes: Optional[List[int]] = []
+    gpu_addresses: Optional[List[str]] = []
+    model_id: Optional[int] = None
+    model_name: str
+    backend: Optional[str] = None
+    backend_version: Optional[str] = None
+    api_detected_backend_version: Optional[str] = None
+    injected_backend_parameters: Optional[List[str]] = None
+    distributed_servers: Optional[DistributedServers] = None
+    cluster_id: Optional[int] = None
+    owner_principal_id: int = Field(default_factory=_platform_principal_id)
+    mounted_loras: Optional[List[LoraListEntry]] = None
 
 
 ModelInstancesPublic = PaginatedList[ModelInstancePublic]

@@ -3,7 +3,6 @@ from gpustack.routes.model_provider import determine_model_category
 from gpustack.schemas.model_provider import ModelProviderTypeEnum
 from gpustack.schemas.models import CategoryEnum
 
-
 doubao_llm_data = {
     "created": 1767587883,
     "domain": "VLM",
@@ -149,3 +148,139 @@ qwen_llm_split_name_data = {
 )
 def test_determine_model_category(provider_type, model, expected):
     assert determine_model_category(provider_type, model) == expected
+
+
+# --------------------------------------------------------------------------- #
+# Provider credentials: read side must tolerate zero tokens, write side keeps
+# its own rule, and an omitted field must never erase tokens.
+#
+# Regression context: a provider row with `api_tokens = []` (cleared in the UI,
+# written by an old PUT that omitted the field, or fixed by hand in SQL) made
+# `GET /v1/model-providers` answer 500 for the whole page —
+# "api_tokens must be a non-empty list" — because the write-side validator lived
+# on `ModelProviderUpdate`, which is also the base of `ModelProviderPublic`.
+# --------------------------------------------------------------------------- #
+def _public_payload(**overrides):
+    payload = {
+        "id": 1,
+        "name": "p",
+        "config": {"type": "openai"},
+        "owner_principal_id": 1,
+        "created_at": "2026-01-01T00:00:00",
+        "updated_at": "2026-01-01T00:00:00",
+        "api_tokens": [],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_public_provider_with_no_tokens_is_serializable():
+    from gpustack.schemas.model_provider import ModelProviderPublic
+
+    assert ModelProviderPublic.model_validate(_public_payload()).api_tokens == []
+    # A row whose api_tokens key is absent (model_dump with exclude) must work too.
+    payload = _public_payload()
+    payload.pop("api_tokens")
+    assert ModelProviderPublic.model_validate(payload).api_tokens == []
+
+
+def test_convert_to_public_class_masks_tokens_and_survives_empty():
+    from gpustack.schemas.model_provider import ModelProvider
+
+    empty = ModelProvider._convert_to_public_class(_public_payload())
+    assert empty.api_tokens == []
+
+    masked = ModelProvider._convert_to_public_class(
+        _public_payload(api_tokens=["sk-secret"])
+    )
+    assert len(masked.api_tokens) == 1
+    # Only the hash is exposed; the secret must never come back out.
+    assert masked.api_tokens[0].input is None
+    assert (
+        masked.api_tokens[0].hash
+        == __import__("hashlib").sha256(b"sk-secret").hexdigest()
+    )
+
+
+def test_create_requires_a_token_unless_cloning():
+    from pydantic import ValidationError
+
+    from gpustack.schemas.model_provider import ModelProviderCreate
+
+    with pytest.raises(ValidationError) as exc:
+        ModelProviderCreate.model_validate(
+            {"name": "p", "config": {"type": "openai"}, "api_tokens": []}
+        )
+    assert "api_tokens must be a non-empty list" in str(exc.value)
+
+    # Cloning copies the tokens from the source provider, so an empty body list
+    # there is correct rather than a mistake.
+    clone = ModelProviderCreate.model_validate(
+        {
+            "name": "p",
+            "config": {"type": "openai"},
+            "api_tokens": [],
+            "clone_from_id": 7,
+        }
+    )
+    assert clone.clone_from_id == 7
+
+    ok = ModelProviderCreate.model_validate(
+        {"name": "p", "config": {"type": "openai"}, "api_tokens": [{"input": "sk-x"}]}
+    )
+    assert len(ok.api_tokens) == 1
+
+
+def test_update_distinguishes_omitted_tokens_from_cleared_tokens():
+    # The PUT route applies tokens only when the field was actually sent.
+    # `api_tokens` defaults to [], so `is not None` is always true — using that
+    # as the guard is what silently wiped credentials on unrelated updates.
+    from gpustack.routes.model_provider import submitted_api_tokens
+    from gpustack.schemas.model_provider import ModelProviderUpdate
+
+    omitted = ModelProviderUpdate.model_validate(
+        {"name": "p", "config": {"type": "openai"}}
+    )
+    assert submitted_api_tokens(omitted) is None, "省略字段不能等于清空"
+
+    cleared = ModelProviderUpdate.model_validate(
+        {"name": "p", "config": {"type": "openai"}, "api_tokens": []}
+    )
+    assert submitted_api_tokens(cleared) == [], "显式 [] 才表示清空"
+
+    replaced = ModelProviderUpdate.model_validate(
+        {
+            "name": "p",
+            "config": {"type": "openai"},
+            "api_tokens": [{"input": "sk-new"}],
+        }
+    )
+    assert len(submitted_api_tokens(replaced)) == 1
+
+
+def test_public_model_never_reapplies_write_rules():
+    """A hand-edited row must still render: the read model carries fields only.
+
+    Same defect class as the empty-token crash — the write rules (timeout > 0,
+    proxy_timeout requires proxy_url) were enforced through inheritance on the
+    public model, so a row that legitimately exists but violates an input rule
+    took the whole list endpoint down instead of being displayed.
+    """
+    from gpustack.schemas.model_provider import ModelProviderPublic, ModelProviderUpdate
+
+    assert ModelProviderPublic.model_validate(_public_payload(timeout=0)).timeout == 0
+    assert (
+        ModelProviderPublic.model_validate(
+            _public_payload(proxy_timeout=5, proxy_url=None)
+        ).proxy_timeout
+        == 5
+    )
+
+    # ...while the write path still refuses to CREATE/UPDATE such a provider.
+    from pydantic import ValidationError
+
+    for bad in ({"timeout": 0}, {"proxy_timeout": 5}):
+        with pytest.raises(ValidationError):
+            ModelProviderUpdate.model_validate(
+                {"name": "p", "config": {"type": "openai"}, **bad}
+            )

@@ -1,6 +1,6 @@
 import re
 from enum import Enum
-from typing import ClassVar, Optional, Dict, Any, List, Set
+from typing import ClassVar, Optional, Dict, Any, List, Set, Union
 from pydantic import (
     BaseModel,
     Field as PydanticField,
@@ -267,8 +267,40 @@ class ModelRouteTarget(ModelRouteTargetBase, BaseModelMixin, table=True):
     )
 
 
-class ModelRouteTargetPublic(ModelRouteTargetBase, PublicFields):
-    pass
+class ModelRouteTargetPublic(SQLModel, PublicFields):
+    """Read-side view of a route target — **no input validation at all**.
+
+    It used to inherit ``ModelRouteTargetBase``, which drags in the write rules:
+    "exactly one of provider_id / model_id", the ``overridden_model_name`` and
+    ``route_name`` character patterns, and the allowed ``fallback_status_codes``
+    set. A row that exists in the table but violates one of them — hand-inserted
+    with SQL, written by an older release, or left by a migration — then failed to
+    *serialize*, so ``GET /model-routes/targets`` answered 500 for the whole page
+    instead of showing the row. Same defect class as ``ModelProviderPublic``
+    accepting zero API tokens.
+
+    The field list is duplicated on purpose: the isolation that matters is "reads
+    do not run write validators", and that only holds if this class has its own
+    field declarations. ``tests/routers/test_model_route_public_isolation.py``
+    pins it against the table's columns so the copy cannot silently drift.
+
+    Deliberate differences from the write model: ``weight`` drops ``ge=0`` and
+    ``state`` accepts a plain string, because a constraint violated in the DB is
+    something to *report*, not to 500 on.
+    """
+
+    overridden_model_name: Optional[str] = None
+    weight: int = 0
+    model_id: Optional[int] = None
+    provider_id: Optional[int] = None
+    fallback_status_codes: Optional[List[str]] = None
+    name: str
+    route_name: str
+    route_id: int
+    # Serializes to the same JSON string for known values; an unexpected stored
+    # value falls back to that raw string instead of raising (an unknown enum must
+    # not take down the whole list).
+    state: Union[TargetStateEnum, str] = TargetStateEnum.ACTIVE
 
 
 ModelRouteTargetsPublic = PaginatedList[ModelRouteTargetPublic]
@@ -376,7 +408,31 @@ class ModelRoute(ModelRouteBase, BaseModelMixin, table=True):
     )
 
 
-class ModelRoutePublic(ModelRouteBase, PublicFields):
+class ModelRoutePublic(SQLModel, PublicFields):
+    """Read-side view of a model route — **no input validation at all**.
+
+    Like ``ModelRouteTargetPublic``, this used to inherit the write chain
+    (``ModelRouteBase`` → ``ModelRouteUpdateBase``), whose ``validate_categories``
+    rejects any category outside ``CategoryEnum`` and whose name rule rejects
+    ``/``. Reads must describe a stored row, not re-litigate it: a hand-edited or
+    legacy row with an unknown category would have taken down the whole routes
+    list. Field list duplicated on purpose — see
+    ``tests/routers/test_model_route_public_isolation.py``.
+    """
+
+    name: str
+    description: Optional[str] = None
+    categories: List[str] = Field(default=[])
+    meta: Optional[Dict[str, Any]] = Field(default={})
+    generic_proxy: Optional[bool] = False
+    created_model_id: Optional[int] = None
+    targets: int = 0
+    ready_targets: int = 0
+    # Same permissive treatment as ``state`` above.
+    access_policy: Union[AccessPolicyEnum, str] = AccessPolicyEnum.AUTHED
+    # Keeps the write model's default so a row that somehow lacks this column
+    # serializes the way it did before (platform Org) instead of 500-ing.
+    owner_principal_id: int = Field(default_factory=_platform_principal_id)
     # The model name clients should send in their request body. Equals
     # `name` for the platform Org (backward compat); for other Orgs it
     # is `<owner-name>/<name>`. Frontends currently derive this

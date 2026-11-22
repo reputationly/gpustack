@@ -116,6 +116,25 @@ def validate_provider(provider: Union[ModelProviderCreate, ModelProviderUpdate])
             )
 
 
+def submitted_api_tokens(input: ModelProviderUpdate) -> Optional[List[MaskedAPIToken]]:
+    """The token list to apply, or None when the caller did not send the field.
+
+    ``api_tokens`` defaults to ``[]``, so ``input.api_tokens is not None`` is
+    ALWAYS true — the old guard therefore rewrote the column on every PUT, and a
+    request that simply omitted ``api_tokens`` (any PATCH-style caller, scripts,
+    the UI when the field is untouched) silently **deleted every token** through
+    ``parse_api_tokens(existing, []) == []``. The provider then had zero
+    credentials, and the read model used to reject that outright, taking down the
+    whole providers page.
+
+    Omitting a field must not mean "erase it". Only an explicit ``[]`` clears,
+    which is a real operation (revoking a leaked key).
+    """
+    if "api_tokens" not in input.model_fields_set:
+        return None
+    return input.api_tokens
+
+
 def parse_api_tokens(
     existing_tokens: List[str], api_tokens: List[MaskedAPIToken]
 ) -> List[str]:
@@ -250,10 +269,11 @@ async def update_model_provider(
     deleted_models = deleted_model_names(provider.models or [], input.models or [])
     try:
         input_dict = input.model_dump(exclude={"api_tokens"})
-        if input.api_tokens is not None:
+        tokens_to_apply = submitted_api_tokens(input)
+        if tokens_to_apply is not None:
             input_dict["api_tokens"] = parse_api_tokens(
                 existing_tokens=provider.api_tokens or [],
-                api_tokens=input.api_tokens,
+                api_tokens=tokens_to_apply,
             )
         await provider.update(
             session=session, source=input_dict, auto_commit=len(deleted_models) == 0

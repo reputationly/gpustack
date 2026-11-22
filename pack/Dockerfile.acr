@@ -81,6 +81,7 @@ COPY gpustack/http_proxy/strategies.py                                       /tm
 COPY gpustack/migrations/versions/2026_07_05_2230-e1f2a3b4c5d6_add_video_generation_tasks.py /tmp/lx2v-overlay/migrations/versions/2026_07_05_2230-e1f2a3b4c5d6_add_video_generation_tasks.py
 COPY gpustack/migrations/versions/2026_08_11_1030-f3a1b2c4d5e7_add_video_task_progress.py     /tmp/lx2v-overlay/migrations/versions/2026_08_11_1030-f3a1b2c4d5e7_add_video_task_progress.py
 COPY gpustack/routes/routes.py                                               /tmp/lx2v-overlay/routes/routes.py
+COPY gpustack/routes/model_provider.py                                       /tmp/lx2v-overlay/routes/model_provider.py
 # Runtime config persistence: PUT /v2/config now writes to the runtime_configs
 # table and server.py replays it at startup, so UI edits survive an upgrade.
 COPY gpustack/routes/config.py                                               /tmp/lx2v-overlay/routes/config.py
@@ -89,6 +90,7 @@ COPY gpustack/server/init_db.py                                              /tm
 COPY gpustack/migrations/versions/2026_09_02_1200-a7c3e5d19b42_add_runtime_configs.py       /tmp/lx2v-overlay/migrations/versions/2026_09_02_1200-a7c3e5d19b42_add_runtime_configs.py
 COPY gpustack/migrations/versions/2026_09_02_1800-b8d4f6a2c1e9_add_video_task_assigned_at.py /tmp/lx2v-overlay/migrations/versions/2026_09_02_1800-b8d4f6a2c1e9_add_video_task_assigned_at.py
 COPY gpustack/migrations/versions/2026_11_16_2330-c9e5a7b3d1f4_add_video_task_usage.py /tmp/lx2v-overlay/migrations/versions/2026_11_16_2330-c9e5a7b3d1f4_add_video_task_usage.py
+COPY gpustack/migrations/versions/2026_11_22_1400-d4b8e2a16c37_backfill_distributed_flag.py /tmp/lx2v-overlay/migrations/versions/2026_11_22_1400-d4b8e2a16c37_backfill_distributed_flag.py
 COPY gpustack/routes/video_tasks.py                                          /tmp/lx2v-overlay/routes/video_tasks.py
 COPY gpustack/routes/videos.py                                               /tmp/lx2v-overlay/routes/videos.py
 COPY gpustack/routes/benchmarks.py                                           /tmp/lx2v-overlay/routes/benchmarks.py
@@ -96,6 +98,10 @@ COPY gpustack/schemas/__init__.py                                            /tm
 COPY gpustack/schemas/model_usage.py                                         /tmp/lx2v-overlay/schemas/model_usage.py
 COPY gpustack/schemas/model_routes.py                                        /tmp/lx2v-overlay/schemas/model_routes.py
 COPY gpustack/schemas/video_generation_task.py                               /tmp/lx2v-overlay/schemas/video_generation_task.py
+COPY gpustack/schemas/clusters.py                                            /tmp/lx2v-overlay/schemas/clusters.py
+COPY gpustack/schemas/workers.py                                             /tmp/lx2v-overlay/schemas/workers.py
+COPY gpustack/schemas/model_files.py                                         /tmp/lx2v-overlay/schemas/model_files.py
+COPY gpustack/schemas/model_provider.py                                      /tmp/lx2v-overlay/schemas/model_provider.py
 COPY gpustack/server/server.py                                               /tmp/lx2v-overlay/server/server.py
 # InferenceBackendController.  Carries the common_parameters backfill added in
 # 2b524710 (LightX2V UI param hints): built-in seeding is create-only, so
@@ -133,7 +139,7 @@ RUN set -eux; \
     MIG_FILE="${GP_DIR}/migrations/versions/2026_07_05_2230-e1f2a3b4c5d6_add_video_generation_tasks.py"; \
     sed -i "s/^down_revision: Union\[str, None\] = .*/down_revision: Union[str, None] = '${BASE_HEAD}'/" "${MIG_FILE}"; \
     grep -n "^down_revision" "${MIG_FILE}"; \
-    python3 -c "from alembic.config import Config; from alembic.script import ScriptDirectory; c=Config(); c.set_main_option('script_location', '${GP_DIR}/migrations'); h=ScriptDirectory.from_config(c).get_current_head(); assert h == 'c9e5a7b3d1f4', h; print('migration chain OK, head=' + h)"; \
+    python3 -c "from alembic.config import Config; from alembic.script import ScriptDirectory; c=Config(); c.set_main_option('script_location', '${GP_DIR}/migrations'); h=ScriptDirectory.from_config(c).get_current_head(); assert h == 'd4b8e2a16c37', h; print('migration chain OK, head=' + h)"; \
     python3 -m py_compile \
         "${GP_DIR}/worker/backends/lightx2v.py" \
         "${GP_DIR}/worker/backends/indextts.py" \
@@ -167,8 +173,14 @@ RUN set -eux; \
         "${GP_DIR}/migrations/versions/2026_09_02_1200-a7c3e5d19b42_add_runtime_configs.py" \
         "${GP_DIR}/migrations/versions/2026_09_02_1800-b8d4f6a2c1e9_add_video_task_assigned_at.py" \
         "${GP_DIR}/migrations/versions/2026_11_16_2330-c9e5a7b3d1f4_add_video_task_usage.py" \
+        "${GP_DIR}/migrations/versions/2026_11_22_1400-d4b8e2a16c37_backfill_distributed_flag.py" \
         "${GP_DIR}/schemas/runtime_config.py" \
         "${GP_DIR}/routes/config.py" \
+        "${GP_DIR}/schemas/clusters.py" \
+        "${GP_DIR}/schemas/workers.py" \
+        "${GP_DIR}/schemas/model_files.py" \
+        "${GP_DIR}/schemas/model_provider.py" \
+        "${GP_DIR}/routes/model_provider.py" \
         "${GP_DIR}/server/init_db.py"; \
     python3 -c "from gpustack.schemas.models import BackendEnum, CategoryEnum; assert BackendEnum.LIGHTX2V and CategoryEnum.VIDEO; print('lx2v backend overlay OK')"; \
     python3 -c "from gpustack.schemas.models import BackendEnum; assert BackendEnum.INDEXTTS; print('indextts backend overlay OK')"; \

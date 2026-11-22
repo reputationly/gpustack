@@ -16,7 +16,6 @@ from typing import (
 from pydantic import (
     BaseModel,
     ConfigDict,
-    field_validator,
     model_validator,
     Field as PydanticField,
 )
@@ -496,7 +495,16 @@ class MaskedAPIToken(BaseModel):
         return self
 
 
-class ModelProviderBase(SQLModel):
+class ModelProviderFields(SQLModel):
+    """Provider fields only — no write-side validation.
+
+    Deliberately separate from :class:`ModelProviderBase`: the public READ model is
+    built from these fields, and a read must never re-run input validation. Rows
+    edited directly in SQL (a cleared credential, ``timeout = 0``, a leftover
+    ``proxy_timeout`` without ``proxy_url``) are exactly the state the write rules
+    forbid and the read path has to describe, not reject.
+    """
+
     name: str = Field(index=True, nullable=False)
     description: Optional[str] = Field(default=None, nullable=True)
     timeout: int = Field(default=120, nullable=False)
@@ -521,6 +529,10 @@ class ModelProviderBase(SQLModel):
     proxy_url: Optional[str] = Field(default=None, nullable=True)
     proxy_timeout: Optional[int] = Field(default=None, nullable=True)
 
+
+class ModelProviderBase(ModelProviderFields):
+    """Write-side base (create/update/table): carries the input rules."""
+
     @model_validator(mode="after")
     def check_all(self):
         if self.timeout <= 0:
@@ -533,20 +545,37 @@ class ModelProviderBase(SQLModel):
 
 
 class ModelProviderUpdate(ModelProviderBase):
+    """PATCH/PUT body for a provider (write side only).
+
+    ``api_tokens`` deliberately accepts an empty list here: a provider row CAN
+    hold zero tokens (a token was cleared, a row was fixed by hand in SQL, or a
+    provider simply needs none). The "must be non-empty on create" rule lives on
+    ``ModelProviderCreate`` instead, so it can never gate a read.
+
+    An explicit ``[]`` on update means "clear the tokens"; *omitting* the field
+    means "leave them alone" (the route distinguishes the two through
+    ``model_fields_set``, because the default ``[]`` makes ``is not None`` true
+    for both — that bug used to wipe tokens on every PUT).
+    """
+
     api_tokens: List[MaskedAPIToken] = PydanticField(
         default=[],
     )
 
-    @field_validator("api_tokens")
-    def check_api_tokens(cls, v):
-        if v is not None:
-            if not isinstance(v, list) or len(v) == 0:
-                raise ValueError("api_tokens must be a non-empty list")
-        return v
-
 
 class ModelProviderCreate(ModelProviderUpdate):
     clone_from_id: Optional[int] = PydanticField(default=None)
+
+    @model_validator(mode="after")
+    def check_api_tokens(self):
+        # A freshly created provider must be usable immediately, so it needs at
+        # least one credential. Cloning is the exception: the tokens are copied
+        # from the source provider, so an empty body list is correct there.
+        if self.clone_from_id is None and not self.api_tokens:
+            raise ValueError(
+                "api_tokens must be a non-empty list (or set clone_from_id to copy them)"
+            )
+        return self
 
 
 class ModelProvider(ModelProviderBase, BaseModelMixin, table=True):
@@ -596,7 +625,13 @@ class ModelProvider(ModelProviderBase, BaseModelMixin, table=True):
         return ModelProviderPublic.model_validate(dict_data)
 
 
-class ModelProviderPublic(ModelProviderUpdate, PublicFields):
+class ModelProviderPublic(ModelProviderFields, PublicFields):
+    # Masked credentials: ``api_tokens`` is re-derived from the stored secrets by
+    # ``ModelProvider._convert_to_public_class`` (hashes only, never the input).
+    # Typed here rather than inherited from the write model, so that reading a
+    # provider cannot be blocked by input validation (see ModelProviderFields).
+    api_tokens: List[MaskedAPIToken] = PydanticField(default=[])
+
     # The owning Org. Server-set on create from the caller's tenant
     # context (the DB column is NOT NULL — providers have no "Global"
     # notion, unlike instance templates / inference backends). Kept
