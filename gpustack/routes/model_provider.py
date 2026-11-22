@@ -86,7 +86,18 @@ async def get_model_providers(
     return provider_list
 
 
-def validate_provider(provider: Union[ModelProviderCreate, ModelProviderUpdate]):
+def validate_provider(
+    provider: Union[ModelProviderCreate, ModelProviderUpdate],
+    effective_token_count: Optional[int] = None,
+):
+    """Validate a provider body.
+
+    ``effective_token_count`` is the number of tokens that will be *stored*, which
+    is not always what the request carries: a PUT that omits ``api_tokens`` keeps
+    the row's existing tokens. Validating the request's default ``[]`` instead let a
+    caller drop every llm model from a multi-token provider and silently disable the
+    gateway's failover config.
+    """
     if provider.config is not None and len(provider.config.model_extra or {}) > 0:
         raise InvalidException(
             message=f"fields {', '.join(provider.config.model_extra.keys())} are not allowed in {provider.config.type.value} config"
@@ -96,7 +107,12 @@ def validate_provider(provider: Union[ModelProviderCreate, ModelProviderUpdate])
     except ValueError as e:
         raise InvalidException(message=f"{e}")
 
-    if len(provider.api_tokens) > 1:
+    token_count = (
+        effective_token_count
+        if effective_token_count is not None
+        else len(provider.api_tokens)
+    )
+    if token_count > 1:
         llm_model = next(
             (model for model in provider.models or [] if model.category == "llm"),
             None,
@@ -133,6 +149,36 @@ def submitted_api_tokens(input: ModelProviderUpdate) -> Optional[List[MaskedAPIT
     if "api_tokens" not in input.model_fields_set:
         return None
     return input.api_tokens
+
+
+def resolve_api_token(
+    input: ProviderModelsInput, stored_token: Optional[str]
+) -> Optional[str]:
+    """The credential to use for a one-off provider call (fetch models / test model).
+
+    ``""`` means "call without credentials" — the caller is previewing a provider
+    whose key was just cleared, and must see exactly what the saved provider will do.
+    Only an *omitted* field falls back to the stored token, which is what the console
+    sends when it did not touch the key (it echoes back the stored hash).
+    """
+    if "api_token" in input.model_fields_set:
+        return input.api_token or None
+    return stored_token
+
+
+def effective_api_tokens(
+    input: ModelProviderUpdate, existing_tokens: List[str]
+) -> List[MaskedAPIToken]:
+    """The token list that will exist after this request.
+
+    ``submitted_api_tokens`` returns None when the caller omitted the field, and in
+    that case the stored tokens survive untouched. Validation has to reason about
+    *this* list, not about the request's default ``[]``.
+    """
+    submitted = submitted_api_tokens(input)
+    if submitted is not None:
+        return submitted
+    return [MaskedAPIToken(hash=token) for token in existing_tokens]
 
 
 def parse_api_tokens(
@@ -248,7 +294,13 @@ async def update_model_provider(
         provider,
         not_found_message=f"provider {id} not found",
     )
-    validate_provider(input)
+    tokens_to_apply = submitted_api_tokens(input)
+    validate_provider(
+        input,
+        effective_token_count=len(
+            effective_api_tokens(input, provider.api_tokens or [])
+        ),
+    )
     # Rename check: if the caller is changing ``name``, make sure the
     # new name doesn't collide with another provider under the same
     # owner. The composite UNIQUE on the table would catch this at
@@ -269,7 +321,6 @@ async def update_model_provider(
     deleted_models = deleted_model_names(provider.models or [], input.models or [])
     try:
         input_dict = input.model_dump(exclude={"api_tokens"})
-        tokens_to_apply = submitted_api_tokens(input)
         if tokens_to_apply is not None:
             input_dict["api_tokens"] = parse_api_tokens(
                 existing_tokens=provider.api_tokens or [],
@@ -356,9 +407,6 @@ class CustomOAIModel(OAIModel):
     categories: Optional[List[str]] = None
 
 
-@router.post(
-    "/get-models",
-)
 def provider_auth_headers(config, api_token: Optional[str]) -> Dict[str, str]:
     """Credentials for an outbound provider call.
 
@@ -379,6 +427,9 @@ def provider_auth_headers(config, api_token: Optional[str]) -> Dict[str, str]:
     return headers
 
 
+@router.post(
+    "/get-models",
+)
 async def get_models_from_provider(
     input: ProviderModelsInput,
 ):
@@ -458,7 +509,8 @@ async def get_models_from_specific_provider(
         not_found_message=f"provider {id} not found",
     )
     stored_token = provider.api_tokens[0] if provider.api_tokens else None
-    if not stored_token and not input.api_token:
+    api_token = resolve_api_token(input, stored_token)
+    if not api_token:
         logger.info(
             f"provider {provider.name} id: {id} has no API tokens configured; "
             "calling it without credentials"
@@ -468,7 +520,7 @@ async def get_models_from_specific_provider(
     )
     return await get_models_from_provider(
         ProviderModelsInput(
-            api_token=input.api_token or stored_token,
+            api_token=api_token,
             config=input.config or provider.config,
             proxy_url=proxy_url,
         )
@@ -556,7 +608,8 @@ async def try_model_with_specific_provider(
         not_found_message=f"provider {id} not found",
     )
     stored_token = provider.api_tokens[0] if provider.api_tokens else None
-    if not stored_token and not input.api_token:
+    api_token = resolve_api_token(input, stored_token)
+    if not api_token:
         logger.info(
             f"provider {provider.name} id: {id} has no API tokens configured; "
             "calling it without credentials"
@@ -566,7 +619,7 @@ async def try_model_with_specific_provider(
     )
     return await try_model_with_provider(
         TestProviderModelInput(
-            api_token=input.api_token or stored_token,
+            api_token=api_token,
             config=input.config or provider.config,
             proxy_url=proxy_url,
             model_name=input.model_name,

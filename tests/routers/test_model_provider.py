@@ -349,3 +349,144 @@ def test_provider_auth_headers_skips_empty_credentials():
 
     # No credential → only the version header remains; nothing claims to be a key.
     assert "X-API-Key" not in provider_auth_headers(_Config(claude), None)
+
+
+# --------------------------------------------------------------------------- #
+# The /get-models route must be wired to the query handler (regression: a helper
+# inserted next to it once stole the decorator, so the endpoint demanded query
+# params and the UI's JSON body got a 422 — the credential-less provider feature
+# was unreachable from the console).
+# --------------------------------------------------------------------------- #
+def _provider_app():
+    from fastapi import FastAPI
+
+    from gpustack.routes.model_provider import router as provider_router
+
+    app = FastAPI()
+    app.include_router(provider_router, prefix="/v1/model-providers")
+    return app
+
+
+def test_get_models_route_is_registered_on_the_query_handler():
+    """The path takes a JSON body; a handler with query params means mis-wiring."""
+    from gpustack.routes.model_provider import router as provider_router
+
+    endpoints = {
+        route.path: route.endpoint.__name__
+        for route in provider_router.routes
+        if getattr(route, "path", "").endswith("get-models")
+    }
+    assert endpoints["/get-models"] == "get_models_from_provider"
+
+    operation = _provider_app().openapi()["paths"]["/v1/model-providers/get-models"][
+        "post"
+    ]
+    assert "requestBody" in operation
+    assert operation.get("parameters") in (None, [])
+
+
+def test_get_models_route_calls_the_provider_without_credentials(monkeypatch):
+    """A provider with no token must reach the upstream with no auth header."""
+    from fastapi.testclient import TestClient
+
+    from gpustack.routes import model_provider as module
+
+    captured = {}
+
+    class _Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"data": [{"id": "hy4-flash"}]}
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, headers=None, timeout=None):
+            captured["url"] = url
+            captured["headers"] = headers
+            return _Response()
+
+    monkeypatch.setattr(module.httpx, "AsyncClient", _Client)
+    client = TestClient(_provider_app())
+    response = client.post(
+        "/v1/model-providers/get-models",
+        json={
+            "config": {"type": "openai", "openaiCustomUrl": "http://10.0.0.5:8000/v1"}
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    # 无凭据 → 不发 Authorization(而不是发 "Bearer ")
+    assert captured["headers"] == {}
+
+
+# --------------------------------------------------------------------------- #
+# Preview calls must use the credentials the saved provider would use.
+# --------------------------------------------------------------------------- #
+def test_resolve_api_token_distinguishes_cleared_from_untouched():
+    """``""`` = call without credentials; omitted = reuse the stored token."""
+    from gpustack.routes.model_provider import resolve_api_token
+    from gpustack.schemas.model_provider import ProviderModelsInput
+
+    cleared = ProviderModelsInput.model_validate({"api_token": ""})
+    assert "api_token" in cleared.model_fields_set
+    assert resolve_api_token(cleared, "sk-stored") is None
+
+    untouched = ProviderModelsInput.model_validate({})
+    assert resolve_api_token(untouched, "sk-stored") == "sk-stored"
+    assert resolve_api_token(untouched, None) is None
+
+    explicit = ProviderModelsInput.model_validate({"api_token": "sk-typed"})
+    assert resolve_api_token(explicit, "sk-stored") == "sk-typed"
+
+
+def test_effective_api_tokens_is_what_validation_must_count():
+    """A PUT that omits api_tokens keeps the row's tokens — validate that count."""
+    from gpustack.routes.model_provider import effective_api_tokens
+    from gpustack.schemas.model_provider import ModelProviderUpdate
+
+    omitted = ModelProviderUpdate.model_validate(
+        {"name": "p", "config": {"type": "openai"}}
+    )
+    assert len(effective_api_tokens(omitted, ["a", "b"])) == 2
+
+    cleared = ModelProviderUpdate.model_validate(
+        {"name": "p", "config": {"type": "openai"}, "api_tokens": []}
+    )
+    assert effective_api_tokens(cleared, ["a", "b"]) == []
+
+    replaced = ModelProviderUpdate.model_validate(
+        {"name": "p", "config": {"type": "openai"}, "api_tokens": [{"input": "sk-new"}]}
+    )
+    assert len(effective_api_tokens(replaced, ["a", "b"])) == 1
+
+
+def test_validate_provider_uses_the_effective_token_count():
+    """Dropping the llm model is only legal if the stored tokens drop to one too."""
+    from gpustack.api.exceptions import InvalidException
+    from gpustack.routes.model_provider import validate_provider
+    from gpustack.schemas.model_provider import ModelProviderUpdate
+
+    body = ModelProviderUpdate.model_validate(
+        {
+            "name": "p",
+            "config": {"type": "openai"},
+            "models": [{"name": "m1", "category": "embedding"}],
+        }
+    )
+    # 省略 api_tokens + 库里有两个 → 仍然有 failover,必须要求 llm 模型
+    with pytest.raises(InvalidException) as exc:
+        validate_provider(body, effective_token_count=2)
+    assert "llm model" in str(exc.value) or "llm model" in exc.value.message
+
+    # 同一份请求,但实际只留一个 token → 不需要 llm 模型
+    validate_provider(body, effective_token_count=1)

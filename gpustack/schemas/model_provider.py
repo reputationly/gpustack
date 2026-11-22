@@ -573,9 +573,12 @@ class ModelProviderUpdate(ModelProviderBase):
 class ModelProviderCreate(ModelProviderUpdate):
     """Create body: same shape as update, plus the clone source.
 
-    No credential requirement — see ``ModelProviderUpdate``. Cloning still works:
-    an empty body list means "copy the source provider's tokens", which the route
-    resolves through ``parse_api_tokens(existing_tokens=..., api_tokens=[])``.
+    No credential requirement — see ``ModelProviderUpdate``.
+
+    Cloning copies only the keys the caller explicitly re-sends (as ``hash``
+    entries); it does not copy every token from the source. The console sends back
+    the hashes it renders, so "copy" means "the keys you kept in the form", which is
+    the behaviour it had before this change too.
     """
 
     clone_from_id: Optional[int] = PydanticField(default=None)

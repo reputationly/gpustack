@@ -72,3 +72,30 @@ def test_every_audio_ext_has_content_type(fmt, ext):
 
 def test_unknown_ext_degrades_to_octet_stream():
     assert _output_content_type("task.bin") == "application/octet-stream"
+
+
+def test_normalised_format_is_what_reaches_the_engine():
+    """The name we pick and the value we forward must be the same string.
+
+    Forwarding the raw body value while naming the artifact from the normalised one
+    is how " MP3 " produced a ``.mp3`` path and an engine-side 422, and how an empty
+    string produced a ``.wav`` path with an invalid ``response_format``.
+    """
+    from gpustack.routes.videos import _apply_output_format, _requested_output_format
+
+    for raw, expected in (
+        ("  MP3 ", "mp3"),
+        ("FLAC", "flac"),
+        ("", ""),
+        (None, ""),
+        (123, ""),
+    ):
+        body = {"response_format": raw}
+        normalised = _requested_output_format(body)
+        assert normalised == expected
+        _apply_output_format(body, normalised)
+        if expected:
+            assert body["response_format"] == expected
+        else:
+            # 空/非法值不能原样下发:引擎的 response_format 是 Literal
+            assert "response_format" not in body

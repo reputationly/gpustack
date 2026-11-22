@@ -566,6 +566,20 @@ def _requested_output_format(body: Mapping[str, Any]) -> str:
     return raw.strip().lower() if isinstance(raw, str) else ""
 
 
+def _apply_output_format(body: Dict[str, Any], requested_format: str) -> None:
+    """把归一化后的 response_format 写回提交体(空值则删除该键)。
+
+    产物名用的是归一化后的值(``.mp3``),所以转发给引擎的必须同一个值:直接把
+    ``" MP3 "`` / 空串原样传下去,引擎的 Literal 会 422,而门面已经按 ``.mp3``
+    占好了路径 —— 命名与编码再次分叉。解析不出合法容器的值由 ``_output_ext`` 拒
+    掉(400),这里只负责让两边看到同一个字符串。
+    """
+    if requested_format:
+        body["response_format"] = requested_format
+    else:
+        body.pop("response_format", None)
+
+
 def _output_ext(task_type: str, requested_format: str = "") -> str:
     """产物的扩展名。语音按请求的 response_format 命名,其余 kind 保持固定。
 
@@ -1079,7 +1093,10 @@ async def create_video_task(request: Request, user: CurrentUserDep):
 
     public_id = uuid.uuid4().hex
     # 产物扩展名按请求的容器决定:命名与引擎编码必须同源(见 _output_ext 注释)。
-    ext = _output_ext(task_type, _requested_output_format(body))
+    # 归一化后的值同时写回 body,引擎收到的就是同一个字符串(不是 " MP3 " / 空串)。
+    requested_format = _requested_output_format(body)
+    ext = _output_ext(task_type, requested_format)
+    _apply_output_format(body, requested_format)
     out_root = _output_root()
     out_abs = os.path.join(
         out_root, _rel_path(task_type, model_name, user_id, public_id, ext)
