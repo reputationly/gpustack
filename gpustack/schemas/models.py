@@ -580,6 +580,63 @@ class ModelInstanceDeploymentMetadata:
     """
 
 
+def instance_deployment_metadata(
+    instance: "ModelInstanceBase | ModelInstancePublic",
+    worker_id: int,
+) -> Optional[ModelInstanceDeploymentMetadata]:
+    """
+    Get the deployment metadata for the model instance.
+
+    Module-level on purpose: the persisted model *and* the read-only ``Public`` view
+    need it. The worker fetches instances back through the API, which deserializes
+    into ``ModelInstancePublic``, and its state-sync loop calls this on every fetched
+    instance — when the read view was left without the method, that loop raised
+    ``AttributeError`` every few seconds and no instance ever left ``starting``.
+
+    Args:
+        worker_id:
+            The ID of the worker to get the deployment metadata for.
+
+    Returns:
+        The deployment metadata,
+        or None if the model instance is not handling by the given `worker_id` worker.
+    """
+
+    dservers = instance.distributed_servers
+    subworkers = (
+        dservers.subordinate_workers
+        if dservers and dservers.subordinate_workers
+        else []
+    )
+
+    name = instance.name
+    distributed = bool(subworkers)
+    distributed_leader = distributed and instance.worker_id == worker_id
+    distributed_follower = distributed and not distributed_leader
+    distributed_follower_index = None
+    if distributed_follower:
+        for idx, subworker in enumerate(subworkers):
+            if subworker.worker_id == worker_id:
+                distributed_follower_index = idx
+                break
+        if distributed_follower_index is not None:
+            # Mutate the name to include the follower index,
+            # so that each follower has a unique name.
+            name += f"-f{distributed_follower_index}"
+
+    if instance.worker_id != worker_id and distributed_follower_index is None:
+        # This model instance is not handling by the given worker.
+        return None
+
+    return ModelInstanceDeploymentMetadata(
+        name=name,
+        distributed=distributed,
+        distributed_leader=distributed_leader,
+        distributed_follower=distributed_follower,
+        distributed_follower_index=distributed_follower_index,
+    )
+
+
 class ModelInstanceBase(SQLModel, ModelSource):
     name: str = Field(index=True, unique=True)
     worker_id: Optional[int] = None
@@ -649,51 +706,8 @@ class ModelInstanceBase(SQLModel, ModelSource):
         self,
         worker_id: int,
     ) -> Optional[ModelInstanceDeploymentMetadata]:
-        """
-        Get the deployment metadata for the model instance.
-
-        Args:
-            worker_id:
-                The ID of the worker to get the deployment metadata for.
-
-        Returns:
-            The deployment metadata,
-            or None if the model instance is not handling by the given `worker_id` worker.
-        """
-
-        dservers = self.distributed_servers
-        subworkers = (
-            dservers.subordinate_workers
-            if dservers and dservers.subordinate_workers
-            else []
-        )
-
-        name = self.name
-        distributed = bool(subworkers)
-        distributed_leader = distributed and self.worker_id == worker_id
-        distributed_follower = distributed and not distributed_leader
-        distributed_follower_index = None
-        if distributed_follower:
-            for idx, subworker in enumerate(subworkers):
-                if subworker.worker_id == worker_id:
-                    distributed_follower_index = idx
-                    break
-            if distributed_follower_index is not None:
-                # Mutate the name to include the follower index,
-                # so that each follower has a unique name.
-                name += f"-f{distributed_follower_index}"
-
-        if self.worker_id != worker_id and distributed_follower_index is None:
-            # This model instance is not handling by the given worker.
-            return None
-
-        return ModelInstanceDeploymentMetadata(
-            name=name,
-            distributed=distributed,
-            distributed_leader=distributed_leader,
-            distributed_follower=distributed_follower,
-            distributed_follower_index=distributed_follower_index,
-        )
+        """See :func:`instance_deployment_metadata`."""
+        return instance_deployment_metadata(self, worker_id)
 
 
 class ModelInstance(ModelInstanceBase, BaseModelMixin, table=True):
@@ -807,6 +821,14 @@ class ModelInstancePublic(SQLModel):
     cluster_id: Optional[int] = None
     owner_principal_id: int = Field(default_factory=_platform_principal_id)
     mounted_loras: Optional[List[LoraListEntry]] = None
+
+    def get_deployment_metadata(
+        self,
+        worker_id: int,
+    ) -> Optional[ModelInstanceDeploymentMetadata]:
+        """See :func:`instance_deployment_metadata` — the worker's state sync calls
+        this on instances it reads back through the API, which are this view."""
+        return instance_deployment_metadata(self, worker_id)
 
 
 ModelInstancesPublic = PaginatedList[ModelInstancePublic]

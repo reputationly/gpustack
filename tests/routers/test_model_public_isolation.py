@@ -150,3 +150,32 @@ def test_write_side_still_enforces_the_source_rule():
 
     with pytest.raises(ValidationError):
         ModelCreate.model_validate({"name": "m1", "source": "huggingface"})
+
+
+def test_public_instance_can_report_deployment_metadata():
+    """The worker's state-sync loop calls ``get_deployment_metadata`` on instances it
+    reads back through the API — i.e. on ``ModelInstancePublic``.
+
+    Dropping the method with the read/write split killed that loop with
+    ``AttributeError: 'ModelInstancePublic' object has no attribute
+    'get_deployment_metadata'`` every few seconds, so no instance ever left
+    ``starting`` after a redeploy. Pin the contract on the public view itself.
+    """
+    from gpustack.schemas.models import ModelInstancePublic
+
+    instance = ModelInstancePublic.model_validate(
+        {
+            "id": 1,
+            "created_at": "2026-01-01T00:00:00",
+            "updated_at": "2026-01-01T00:00:00",
+            "source": "local_path",
+            "name": "tts2-abc",
+            "model_id": 158,
+            "model_name": "tts2",
+            "worker_id": 7,
+        }
+    )
+    own = instance.get_deployment_metadata(7)
+    assert own is not None and own.name == "tts2-abc"
+    # 不归这台 worker 管的实例必须返回 None(worker 用它判断"该不该回收")
+    assert instance.get_deployment_metadata(8) is None
