@@ -1,4 +1,4 @@
-name: Sync GPUStack image to ACR
+name: Sync an official image to ACR
 
 # 把 GPUStack 镜像(多架构 amd64+arm64)同步到内网阿里云 ACR,供 server/worker 快速拉取。
 #
@@ -26,6 +26,10 @@ on:
         description: 'ACR 目标 tag'
         default: 'latest'
         required: true
+      dest_repo:
+        description: 'ACR 目标仓库名(默认 gpustack;同步别的官方镜像时改这里,如 vllm-openai)'
+        default: 'gpustack'
+        required: true
 
 jobs:
   sync:
@@ -40,5 +44,5 @@ jobs:
           skopeo copy --all --retry-times 5 \
             --dest-creds "${{ secrets.ACR_USERNAME }}:${{ secrets.ACR_PASSWORD }}" \
             "docker://${{ github.event.inputs.source }}" \
-            "docker://${{ secrets.ACR_REGISTRY }}/reputationly/gpustack:${{ github.event.inputs.dest_tag }}"
-          echo "Synced to ${{ secrets.ACR_REGISTRY }}/reputationly/gpustack:${{ github.event.inputs.dest_tag }}"
+            "docker://${{ secrets.ACR_REGISTRY }}/reputationly/${{ github.event.inputs.dest_repo }}:${{ github.event.inputs.dest_tag }}"
+          echo "Synced to ${{ secrets.ACR_REGISTRY }}/reputationly/${{ github.event.inputs.dest_repo }}:${{ github.event.inputs.dest_tag }}"
