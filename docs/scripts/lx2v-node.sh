@@ -7,7 +7,7 @@
 #   ./lx2v-node.sh upgrade-gpustack [--offline]     # 换 gpustack:lx2v-dev 并原参数重启 worker
 #   ./lx2v-node.sh mount-nfs                         # 只补 NFS 挂载(含 prod 模型 /root/Models,只读),不碰容器
 #   ./lx2v-node.sh rebuild-worker                    # 不换镜像,原参数重建 worker(用于新增挂载)
-#   ./lx2v-node.sh upgrade-engine   [--engine lightx2v|acestep|vllm-omni|breeze|yue2|vllm-backport] [--offline]
+#   ./lx2v-node.sh upgrade-engine   [--engine lightx2v|acestep|vllm-omni|breeze|yue2|vllm-backport] [--offline]   # 均支持 --verify-rev <commit>
 #       vllm-backport(DeepSeek-V4-Flash 引擎)的 tag 必须与 GPUStack 模型配置一致,用
 #       VLLM_BACKPORT_IMAGE=<完整镜像:tag> 显式指定;默认 latest 拉了也用不上
 #                                                    # 换引擎镜像(默认 lightx2v;实例需重建才生效)
@@ -24,6 +24,10 @@
 #   clean 加 --kill-gpu-procs 才会 kill -9。
 #
 # --offline:不走 ACR,直接从 NFS 的 _transfer/ tar docker load(全新节点/网络受限时用)。
+# --verify-rev <commit>:升级后断言镜像 label 里的 revision(200 只证明进程活着,
+#   不证明代码换了)。退出码:0=成功 1=失败 **76=未验证**(pull 失败且无法证明 NFS tar
+#   是最新版:tar 已 load、节点可用,但 fleet 会单列成 ⏸ 而不是 ✅)。
+#   撞上这个码的正确处理:`prepare-transfer` 刷新 tar,再 `--offline` 重跑。
 # 进度可视:每步打印 [step i/N] 开始时间与耗时;长任务(load/pull/save)原生输出直通;
 # 全程 tee 到 /var/log/lx2v-node-<日期>.log。任何失败都会打印原因分析与操作建议。
 #
