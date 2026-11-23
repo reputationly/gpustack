@@ -102,11 +102,17 @@ run_one() { # run_one <ip> —— 后台任务,继承本 shell 的 SSH_OPTS/REMO
   local log="$LOG_DIR/$ip.log" st="$LOG_DIR/$ip.status"
   # REMOTE_CMD 是在 manager 上拼好、要在远端整体执行的命令串,故意远端展开(非本地)
   # shellcheck disable=SC2029
-  if ssh "${SSH_OPTS[@]}" "root@$ip" "$REMOTE_CMD" > "$log" 2>&1; then
-    echo OK > "$st";   echo "  ✅ $ip"
-  else
-    echo FAIL > "$st"; echo "  ❌ $ip — $(tail -n1 "$log" 2>/dev/null)"
-  fi
+  # 退出码要和状态分开:76 是节点脚本的"装上了但无法证明是最新版"(见 lx2v-node.sh
+  # 的 EXIT_UNVERIFIED)。以前只看 0/非 0,于是 ACR 抖一下、节点 load 了旧 NFS tar 的
+  # 那批也被记成 ✅,汇总一片绿而实际是旧镜像。
+  local rc=0
+  # shellcheck disable=SC2029  # 故意远端展开(见上面 REMOTE_CMD 的注释)
+  ssh "${SSH_OPTS[@]}" "root@$ip" "$REMOTE_CMD" > "$log" 2>&1 || rc=$?
+  case "$rc" in
+    0)  echo OK > "$st";         echo "  ✅ $ip" ;;
+    76) echo UNVERIFIED > "$st"; echo "  ⏸ $ip — 未验证:$(tail -n1 "$log" 2>/dev/null)" ;;
+    *)  echo FAIL > "$st";       echo "  ❌ $ip — $(tail -n1 "$log" 2>/dev/null)" ;;
+  esac
 }
 
 # 并发调度:最多 JOBS 个同时在跑
@@ -118,19 +124,32 @@ for ip in "${NODES[@]}"; do
 done
 wait
 
-# 汇总
-ok=0; fail=0; failed=()
+# 汇总:三档。UNVERIFIED 既不是成功也不是失败 —— 节点可用,但装的可能不是这次构建。
+ok=0; fail=0; unverified=0; failed=(); unverified_nodes=()
 for ip in "${NODES[@]}"; do
-  if [ "$(cat "$LOG_DIR/$ip.status" 2>/dev/null)" = OK ]; then
-    ok=$((ok + 1))
-  else
-    fail=$((fail + 1)); failed+=("$ip")
-  fi
+  case "$(cat "$LOG_DIR/$ip.status" 2>/dev/null)" in
+    OK)         ok=$((ok + 1)) ;;
+    UNVERIFIED) unverified=$((unverified + 1)); unverified_nodes+=("$ip") ;;
+    *)          fail=$((fail + 1)); failed+=("$ip") ;;
+  esac
 done
-echo "==> 完成: OK=${ok}  FAIL=${fail}  (共 ${#NODES[@]})"
+echo "==> 完成: OK=${ok}  UNVERIFIED=${unverified}  FAIL=${fail}  (共 ${#NODES[@]})"
+# 每台实际装上的镜像 ID(节点脚本打的 LX2V_IMAGE_ID)。同一次批量里出现多个 ID 就是版本分裂。
+echo "==> 各节点镜像 ID(去重计数):"
+grep -h "LX2V_IMAGE_ID=" "$LOG_DIR"/*.log 2>/dev/null \
+  | sed 's/.*LX2V_IMAGE_ID=//' | sort | uniq -c | sed 's/^/    /' || true
+if [ "$unverified" -ne 0 ]; then
+  echo "    未验证节点: ${unverified_nodes[*]}"
+  echo "    处理:在 manager 上跑 prepare-transfer 刷新 NFS tar,再 --offline 重跑这些节点"
+fi
 if [ "$fail" -ne 0 ]; then
   echo "    失败节点: ${failed[*]}"
   echo "    排查: for ip in ${failed[*]}; do echo \"=== \$ip ===\"; tail -n20 $LOG_DIR/\$ip.log; done"
   exit 1
 fi
-echo "    全部成功。"
+if [ "$unverified" -ne 0 ]; then
+  echo "    没有失败,但有 ${unverified} 台「未验证」(节点可用,但装的可能不是这次构建)。"
+  echo "    以非 0 退出(76),别把它当成功:CI/流水线里这一档必须被看见。"
+  exit 76
+fi
+echo "    全部成功(每台都打出了镜像 ID,可对着上表核)。"

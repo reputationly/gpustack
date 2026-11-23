@@ -150,6 +150,24 @@ die() {
   exit 1
 }
 
+# 升级"装上了,但无法证明是新版本"时用的专用退出码。
+# 0=成功 1=失败 76=未验证(load 了 NFS tar,但远端指纹查不到,不能断言它是最新版)。
+# fleet 必须把 76 单列:以前这种情况也走 exit 0,于是「55 台全绿」里混着整批装旧镜像的节点。
+EXIT_UNVERIFIED=76
+
+# declare_unverified "原因" ["建议行"...] —— 与 die 同样的可读性,但退出码不同
+declare_unverified() {
+  local msg=$1; shift || true
+  echo "" >&2
+  echo "!! 未验证(step: ${CURRENT_STEP}): ${msg}" >&2
+  if [ $# -gt 0 ]; then
+    echo "!! 建议:" >&2
+    local line; for line in "$@"; do echo "     - ${line}" >&2; done
+  fi
+  echo "!! 完整日志: ${LOG_FILE}" >&2
+  exit "${EXIT_UNVERIFIED}"
+}
+
 # 未被 die 捕获的命令失败:打印通用坑速查(全记录 §4 / 部署实录 §17.4/§17.7)
 on_error() {
   local rc=$? line=$1
@@ -299,6 +317,7 @@ parse_flags() {
   PURGE_DATA=0
   KILL_GPU_PROCS=0
   FORCE=0
+  VERIFY_REV=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --token) TOKEN="$2"; shift 2 ;;
@@ -309,6 +328,7 @@ parse_flags() {
       --purge-data) PURGE_DATA=1; shift ;;
       --kill-gpu-procs) KILL_GPU_PROCS=1; shift ;;
       --force) FORCE=1; shift ;;
+      --verify-rev) VERIFY_REV="$2"; shift 2 ;;
       *) die "未知参数: $1" "用法见: $0(不带参数)" ;;
     esac
   done
@@ -424,19 +444,49 @@ fetch_image() { # fetch_image <image> <tar>
           "确实要装这个旧版本 → 显式用 --offline(语义上就是「用 NFS 上的那一版」)"
       fi
       if [ -z "$fp" ]; then
-        # pull 刚失败,查指纹大概率也查不到 —— 无法证明 tar 新旧。不阻塞恢复,
-        # 但必须让日志里这件事无法被忽略:fleet 汇总只看退出码,OK 会掩盖一切。
+        # pull 刚失败,查指纹大概率也查不到 —— 无法证明 tar 新旧。
+        #
+        # 这条分支以前只是打印 ⚠️ 然后照常 load、照常 exit 0,于是 ACR TLS 超时的那批
+        # 节点装上了旧 tar 却全被 fleet 记成 ✅(2026-11-22 实测:55 台"全绿"里大部分
+        # 还是升级前的镜像,直到实例重建才发现)。恢复可以继续做,但**不能算成功**:
+        # 先把 tar 装上保证节点可用,再以 76 退出让 fleet 单列成"未验证"。
         echo "    ⚠️⚠️ 无法校验 NFS tar 是否为当前版本(远端指纹查不到,网络不通?)"
         echo "    ⚠️⚠️ 即将 load 的 tar 修改时间: $(date -r "$tar" '+%F %T' 2>/dev/null || echo 未知)"
-        echo "    ⚠️⚠️ 若它早于最近一次构建,本次升级实际是**降级**,请事后核对镜像 ID"
-      else
-        echo "    NFS tar 指纹与远端一致(${fp:0:12}),回退安全"
+        echo "    pull 失败,回退 NFS tar(仅供节点可用,结果记为未验证)..."
+        docker load -i "$tar"
+        echo "    实际装上的镜像: $(docker images --format '{{.ID}}  {{.Repository}}:{{.Tag}}' | grep -F "${image#*/}" | head -1)"
+        declare_unverified "pull 失败且无法校验 NFS tar 是否为最新: $tar" \
+          "在 manager 上跑 prepare-transfer 刷新 tar,再用 --offline 重跑(语义明确、可核对)" \
+          "或等 ACR 恢复后重跑本命令(在线增量拉)" \
+          "若确认要装 NFS 上这一版,显式加 --offline"
       fi
+      echo "    NFS tar 指纹与远端一致(${fp:0:12}),回退安全"
       echo "    pull 失败,回退 NFS tar ..."
       docker load -i "$tar"
     fi
   fi
   echo "    当前镜像: $(docker images --format '{{.ID}}  {{.Repository}}:{{.Tag}}' | grep -F "${image#*/}" | head -1)"
+  # 机器可读的一行,fleet 汇总会把它摘出来当"这台到底装上了哪个镜像"的证据。
+  echo "    LX2V_IMAGE_ID=$(docker images --format '{{.ID}}' "$image" | head -1)"
+  verify_image_rev "$image"
+}
+
+# 升级完的版本自证:镜像 label 里的 revision 必须与本次构建的 commit 一致。
+# 200 只证明容器活着,退出码只证明命令没报错 —— 都不证明代码换了。
+verify_image_rev() { # verify_image_rev <image>
+  [ -n "${VERIFY_REV:-}" ] || return 0
+  local rev
+  rev="$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$1" 2>/dev/null || true)"
+  if [ -z "$rev" ]; then
+    declare_unverified "镜像没有 org.opencontainers.image.revision label,无法校验是否为 ${VERIFY_REV}" \
+      "该镜像可能是 2026-09-03 之前构建的(那时还没有 label),用镜像 ID/构建时间人工核对"
+  fi
+  case "$rev" in
+    "${VERIFY_REV}"*) echo "    版本自证: revision=${rev}(匹配 --verify-rev ${VERIFY_REV})" ;;
+    *) die "镜像 revision=${rev} 与期望 ${VERIFY_REV} 不匹配" \
+           "说明节点上跑的不是这次构建的包(在线被限流后 load 了旧 tar?)" \
+           "在 manager 上跑 prepare-transfer 后 --offline 重跑,或重试在线拉取" ;;
+  esac
 }
 
 # 升级成功后回收悬空镜像。放在验证之后:失败时旧镜像还在,能回退。
@@ -942,8 +992,13 @@ cmd_upgrade_engine() {
     echo "    镜像未变化(已是最新)"
   else
     echo "    ${old_id:-<无>} -> ${new_id}"
-    echo "    ⚠️ 正在运行的实例仍用旧镜像;到 UI 逐个删除实例让其自动重建即可生效"
-    echo "       (先删一个、等 Running 再删下一个,保持服务不断)"
+    echo "    ⚠️ 正在运行的实例仍锁旧镜像 ID。让新镜像生效按这个顺序做(2026-11-22 实测):"
+    echo "       1) 先确认本机 tag 已指向新 ID(上面这行就够);tag 没变时重建回来的还是旧镜像"
+    echo "       2) 在该实例所在节点把旧容器停掉:docker stop <instance>-run-0 && docker rm <instance>-run-0"
+    echo "          —— 只删 GPUStack 里的实例**不会**停容器(worker 重启后不接管既有容器),"
+    echo "          旧容器继续占显存,新实例会 CUDA OOM"
+    echo "       3) 再到 UI/API 删除该实例,让调度器重建;等新实例 /v1/models 返回 200 再动下一个"
+    echo "       4) 同一台机器上的多个实例必须串行重建(共享显存);不同机器可并行"
   fi
 
   step "回收悬空镜像"

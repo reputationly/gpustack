@@ -17,7 +17,7 @@ bash /root/lx2v-node.sh install --token <GPUSTACK_TOKEN>
 # 升级本节点的 gpustack worker 镜像(token/卷/IP/server-url 全自动继承):
 bash /root/lx2v-node.sh upgrade-gpustack
 
-# 升级本节点的引擎镜像(之后到 UI 逐个删实例重建生效):
+# 升级本节点的引擎镜像(生效顺序见 §2.2:先停旧容器 → 再删实例 → 等 /v1/models 200):
 bash /root/lx2v-node.sh upgrade-engine                       # lightx2v(默认)
 bash /root/lx2v-node.sh upgrade-engine --engine acestep      # ACE-Step 文生音乐引擎
 bash /root/lx2v-node.sh upgrade-engine --engine vllm-omni    # vLLM-Omni 全模型语音/音频引擎
@@ -520,7 +520,15 @@ bash /root/lx2v-node.sh upgrade-engine --engine yue2         # YuE2 文生音乐
 
 各引擎镜像 tag 必须与 gpustack 内置后端注册表(`schemas/inference_backend.py` 的 image_name)完全一致——worker 按名匹配本地镜像。全 worker 批量:`bash /root/lx2v-fleet.sh -j 3 upgrade-engine --engine <名> --offline`(大 tar 降并发。**看 tar 体积不是镜像体积**——tar 存压缩层约为镜像三分之一,breeze 镜像 25.9G 但 tar 只有 8.9G,用常规 `-j 3`)。
 
-**⚠️ 关键**:换镜像**不影响正在运行的实例**(它们锁旧镜像 ID)。生效方式:UI → Instance List → **逐个删除实例**让其自动重建(先删一个、等新的 Running 再删下一个,服务不断)。
+**⚠️ 关键**:换镜像**不影响正在运行的实例**(它们锁旧镜像 ID)。要让新镜像生效,按 **2026-11-22 实测过的顺序**做(手册旧版只写"UI 删实例重建",在现网**不成立**):
+
+1. **先确认本机 tag 已指向新 ID**——`upgrade-engine` 打印的 `old -> new` 那行变过了才算。tag 没变时重建回来的容器仍是旧镜像(实测:节点 pull 被限流后 load 了旧 tar,重建几次都拿旧 ID)。
+2. **在该实例所在节点停掉旧容器**:`docker stop <instance-name>-run-0 && docker rm <instance-name>-run-0`
+   ——**只删 GPUStack 里的实例不会停容器**:worker 重启(升级 gpustack)后不再"接管"它没亲手启的容器,旧容器继续占显存(实测一个 tts2 旧容器占 22.8 GiB),新实例必定 `CUDA out of memory`。
+3. 再到 UI/API 删实例,让调度器重建;等新实例 `/v1/models` 返回 200 再动下一个。
+4. **同一台机器上的多个实例必须串行**(共享显存);不同机器可以并行(实测 4 台并行、22 个实例约 1 小时)。
+
+> 顺带一条判据:**删完重建后如果实例一直 `Starting`,先看 worker 日志**有没有 `sync_model_instances_state` 报错——那是 worker 侧状态同步挂了(2026-11-22 出现过一次 `ModelInstancePublic` 缺 `get_deployment_metadata` 的回归),此时容器其实是健康的,只是永不上报 Running。
 
 ### 2.3 出新包后 238 侧的配套动作(prepare-transfer)
 
@@ -555,7 +563,7 @@ bash /root/lx2v-fleet.sh upgrade-gpustack --offline
 bash /root/lx2v-fleet.sh -j 10 upgrade-engine --engine vllm-omni --offline
 ```
 
-**⑤ UI 重建实例**:vLLMOmni 系(audiox/soulx/indextts-2/qwen3-tts/moss-*)逐个删实例重建到新引擎镜像;ACE-Step(ACEStep 后端,镜像没变)不用动。**server 必须先于 worker**(版本校验软 + DB/API 方向 server ≥ worker)。
+**⑤ 重建实例**:vLLMOmni 系逐个重建到新引擎镜像(顺序见 §2.2:先停旧容器 → 再删实例 → 等 `/v1/models` 200;同机串行、跨机并行);ACE-Step(ACEStep 后端,镜像没变)不用动。**server 必须先于 worker**(版本校验软 + DB/API 方向 server ≥ worker)。
 
 ### 2.5 标准升级流程(通用模板,直接复制)
 
@@ -821,6 +829,41 @@ docker run -d --name gpustack-server --restart unless-stopped -p 80:80 \
 
 ---
 
+### 2.6 升级结果的「可信判据」(2026-11-22 起)
+
+以前唯一能证明"升上了"的东西是 `✅` / `FAIL=0`,而它们只反映**退出码**。2026-11-22 实测:
+`-j 4` 在线拉引擎镜像时阿里云 ACR 限流(TLS handshake timeout / `too many requests`),
+节点脚本回退到 NFS 上的**旧 tar**,仍然 `exit 0` → fleet 汇总 **OK=55 FAIL=0**,而大多数节点
+上根本还是升级前的镜像。直到删实例重建,才发现容器 ID 没变。
+
+现在脚本自带三层证据,升级完照这三样核:
+
+| 证据 | 从哪看 | 通过标准 |
+|---|---|---|
+| 机器可读镜像 ID | 节点日志 `LX2V_IMAGE_ID=<id>`;fleet 汇总最后会按 ID 去重计数 | 全批量只有一个 ID(多个 ID = 版本分裂) |
+| 三档汇总 | `==> 完成: OK=… UNVERIFIED=… FAIL=…` | **UNVERIFIED 必须是 0** |
+| 版本自证(可选) | `upgrade-* --verify-rev <commit前8位>` | 镜像 label `org.opencontainers.image.revision` 与之一致 |
+
+**退出码语义**:`0` 成功;`1` 失败;`76` **未验证**——节点可用,但装上的东西无法证明是最新版
+(pull 失败且远端指纹查不到、或镜像没有 revision label)。fleet 把 76 单列成 `⏸` 并以 76 退出,
+**它不算成功**,别在流水线里当成通过。
+
+撞上限流时的正确做法(实测一次过):
+
+```bash
+# ① manager 上刷新 tar(只有变了的镜像会重存,2026-11-22 只多花 1m27s)
+bash /root/lx2v-node.sh prepare-transfer
+# ② 走离线,不依赖 ACR
+bash /root/lx2v-fleet.sh -j 3 upgrade-engine --engine vllm-omni --offline
+# ③ 复核:逐台对 ID(或看 fleet 的 ID 去重计数)
+```
+
+> **并发经验**:在线拉 `-j 4` 就有 21/55 被限流;离线从 NFS 读 tar 时 `-j 3~4` 稳。
+> 在线路径被限流时**失败是好事**(脚本比对指纹后拒绝降级),这时不要急着提高重试次数,
+> 直接换 `--offline` 更快。
+
+---
+
 ## 3. 清理与巡检
 
 ```bash
@@ -957,6 +1000,9 @@ curl -s -X POST http://10.0.0.238/v1/videos -H "Authorization: Bearer $KEY" \
 | 12 | `docker save -o` | 失败留下隐藏半截文件,load 报 unexpected EOF | 用 `>` 重定向;脚本已用 `.tmp`+`mv` |
 | 13 | toolkit 不在 Ubuntu 源 | `Unable to locate package nvidia-container-toolkit` | 源两件套在 NFS `_transfer/nvidia-repo/`,脚本自动使用 |
 | 14 | 引擎升级后实例没变化 | 换了镜像但行为还是旧的 | 实例锁旧镜像 ID,UI 逐个删实例重建才生效 |
+| 15a | **升级全绿但装的是旧镜像(ACR 限流)** | `FAIL=0` 全绿,节点上 `docker images` 的 tag 仍指旧 ID;实例重建后还是旧镜像 | 在线拉被限流后回退旧 NFS tar 且旧版脚本 `exit 0`。现已改为 **退出码 76 / `⏸ UNVERIFIED`**,并逐台打 `LX2V_IMAGE_ID`;处理:`prepare-transfer` → `--offline` 重跑 |
+| 15b | **实例卡 `Starting` 永不 Running** | 容器健康、`/health` + `/v1/models` 都是 200,但 UI 显示 `0/5` | 先看 worker 日志:若每分钟刷 `sync_model_instances_state: 'ModelInstancePublic' object has no attribute ...`,是 worker 状态同步回归(2026-11-22 已修 `04b7f6bc`),升级 gpustack 镜像即可;不是实例问题,别去删实例 |
+| 15c | **删实例后新实例 CUDA OOM** | 删除重建后新容器 `torch.OutOfMemoryError`,旧容器仍 `Up N days` | 删 GPUStack 实例**不会停容器**(worker 重启后不接管既有容器)。必须先在节点 `docker stop/rm <name>-run-0` 再删实例,见 §2.2 |
 | 15 | **新节点默认 `hcso` 安全组** | 同坑1(脚本全绿但 UI 不 Ready,238 curl 10150 超时) | 华为云控制台把新节点安全组从 `hcso` 改成 **`newapi`**(既有 GPU 节点同组);改完 238 下一轮探测即转 Ready,无需重装 |
 | 16 | **new-api 拿不到全部模型** | 渠道"智能获取"少模型;server 日志 `Invalid category: music` @ `/v2/model-routes` | ACE-Step 的 `music` category 撞旧校验白名单。**升级到 2026-07-20 gpustack 包**(`model_routes.py` 改对 `CategoryEnum` 校验);临时可在渠道**手填 `ace-step`**(推理走门面不经此接口) |
 | 17 | **AudioX/SoulX 报 `Field required: model`(400)** | new-api 文生音效等 audiogen 玩法提交即 400 | 门面 strip 掉 `model`,旧引擎 `AudioGenTaskRequest.model` 必填。**升级到 2026-07-20 vllm-omni 包**(引擎兜底填 served model)+ 重建 audiox/soulx 实例 |
