@@ -520,7 +520,16 @@ bash /root/lx2v-node.sh upgrade-engine --engine yue2         # YuE2 文生音乐
 
 各引擎镜像 tag 必须与 gpustack 内置后端注册表(`schemas/inference_backend.py` 的 image_name)完全一致——worker 按名匹配本地镜像。全 worker 批量:`bash /root/lx2v-fleet.sh -j 3 upgrade-engine --engine <名> --offline`(大 tar 降并发。**看 tar 体积不是镜像体积**——tar 存压缩层约为镜像三分之一,breeze 镜像 25.9G 但 tar 只有 8.9G,用常规 `-j 3`)。
 
-**⚠️ 关键**:换镜像**不影响正在运行的实例**(它们锁旧镜像 ID)。要让新镜像生效,按 **2026-11-22 实测过的顺序**做(手册旧版只写"UI 删实例重建",在现网**不成立**):
+**⚠️ 关键**:换镜像**不影响正在运行的实例**(它们锁旧镜像 ID)。要让新镜像生效,**用脚本**(manager 上,`docs/scripts/lx2v-rebuild-instances.py`):
+
+```bash
+# 先看计划(不动任何实例)
+python3 /root/lx2v-rebuild-instances.py --backend vLLMOmni --dry-run
+# 执行跨机并行 4,同机自动串行;已是新镜像的实例会被 SKIP,可重复执行
+python3 /root/lx2v-rebuild-instances.py --backend vLLMOmni --max-parallel 4
+```
+
+它做的事就是下面四步(手工做时别漏第 2 步):
 
 1. **先确认本机 tag 已指向新 ID**——`upgrade-engine` 打印的 `old -> new` 那行变过了才算。tag 没变时重建回来的容器仍是旧镜像(实测:节点 pull 被限流后 load 了旧 tar,重建几次都拿旧 ID)。
 2. **在该实例所在节点停掉旧容器**:`docker stop <instance-name>-run-0 && docker rm <instance-name>-run-0`
@@ -528,6 +537,8 @@ bash /root/lx2v-node.sh upgrade-engine --engine yue2         # YuE2 文生音乐
 3. 再到 UI/API 删实例,让调度器重建;等新实例 `/v1/models` 返回 200 再动下一个。
 4. **同一台机器上的多个实例必须串行**(共享显存);不同机器可以并行(实测 4 台并行、22 个实例约 1 小时)。
 
+> 脚本的退出码:0=全部已是新镜像;1=有实例没滚成功(逐条打印原因);2=没给 `--backend`/`--models`。
+>
 > 顺带一条判据:**删完重建后如果实例一直 `Starting`,先看 worker 日志**有没有 `sync_model_instances_state` 报错——那是 worker 侧状态同步挂了(2026-11-22 出现过一次 `ModelInstancePublic` 缺 `get_deployment_metadata` 的回归),此时容器其实是健康的,只是永不上报 Running。
 
 ### 2.3 出新包后 238 侧的配套动作(prepare-transfer)

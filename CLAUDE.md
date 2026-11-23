@@ -60,6 +60,49 @@ Base images `FROM`'d in `pack/Dockerfile` (runtime control-plane components): `g
 
 Sibling PyPI packages (in `pyproject.toml` deps): `gpustack-runner` (inference engine runner), `gpustack-runtime` (runtime/accelerator detection), `gpustack-higress-plugins` (gateway plugins).
 
+## Fork overlay image (`pack/Dockerfile.acr`)
+
+Deployed clusters do **not** run `make package` output. They run an overlay image: upstream
+`gpustack:v2.2.3` + this fork's changed files + the `gpustack-ui` `main` build, produced by the
+"Pack GPUStack overlay to ACR" workflow.
+
+- **Every `gpustack/**/*.py` you change must be added to the overlay's COPY list.** Anything not
+  listed ships as the *base image's* version — silently, with a green build.
+  `hack/check-overlay-list.sh` is the gate (CI runs it first; it fails on both missing and stale
+  entries). Run it locally before pushing: `git fetch --no-tags https://github.com/gpustack/gpustack.git refs/tags/v2.2.3:refs/tags/v2.2.3 && bash hack/check-overlay-list.sh`.
+- A new migration must be listed there too, and the Dockerfile's head assertion updated to the new
+  `alembic head` (otherwise the running server's `alembic upgrade` goes the wrong way).
+- `pack/Dockerfile.acr` keeps a `py_compile` fail-fast list — add new modules there as well.
+
+## Fleet operations (upgrading a live cluster)
+
+Runbook: [`docs/lightx2v-节点运维手册.md`](docs/lightx2v-节点运维手册.md) — §2.5 is the standard
+copy-paste flow, §2.6 defines what actually counts as proof an upgrade landed. Operator scripts
+live in [`docs/scripts/`](docs/scripts); on the manager they are `/root/lx2v-node.sh`,
+`/root/lx2v-fleet.sh`, `/root/lx2v-rebuild-instances.py` (workers fetch `lx2v-node.sh` from
+`/nfs-models/_transfer/` on each fleet run).
+
+Order: **manager server → workers → engine images → instances**. Server must not be older than
+workers (DB/API direction), and pulling an engine image never changes running instances — they pin
+the image ID they were created with.
+
+Rules learned the hard way (details in the runbook):
+
+- **A green tick is not proof.** `lx2v-fleet.sh` once reported `OK=55 FAIL=0` while most nodes
+  still ran the previous image: ACR rate-limited the pull, the node fell back to a stale NFS tar,
+  and the script still exited 0. Check the per-node `LX2V_IMAGE_ID` / three-tier summary /
+  `--verify-rev <commit>`; **exit 76 = unverified, not success**.
+- **ACR rate-limits parallel pulls** (`-j 4` online already hit 21/55 `too many requests`). The fix
+  is `lx2v-node.sh prepare-transfer` (refresh NFS tars) + `--offline`, not more retries.
+- **Deleting an instance does not stop its container** after a worker image upgrade (the worker no
+  longer adopts containers it did not start). The old container keeps the GPU and the replacement
+  dies with CUDA OOM — use `lx2v-rebuild-instances.py`, which stops the container first, serialises
+  per node and verifies the resulting image ID.
+- **Instances stuck in `Starting`** are a worker-side state-sync failure (`sync_model_instances_state`
+  in the worker log), not a broken instance — don't delete them in a loop.
+- Delete any credential you mint for inspection (admin JWT from `jwt_secret_key`, temporary API
+  keys) before you finish.
+
 ## Architecture
 
 ### Server / worker split
